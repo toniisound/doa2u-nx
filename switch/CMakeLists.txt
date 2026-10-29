@@ -20,7 +20,7 @@ if(NOT NINTENDO_SWITCH)
     message(FATAL_ERROR "Configure with -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake")
 endif()
 
-set(DOA2U_NX_VERSION "0.1.0" CACHE STRING "Version shown in the homebrew menu")
+set(DOA2U_NX_VERSION "0.1.1" CACHE STRING "Version shown in the homebrew menu")
 set(DOA2U_NX_ICON "" CACHE FILEPATH "Optional 256x256 JPEG icon for the .nro")
 
 set(CMAKE_C_STANDARD 11)
@@ -206,6 +206,12 @@ add_executable(doa2u-nx
 target_compile_definitions(doa2u-nx PRIVATE
     RECOMP_XBE_SHA256="${_xbe_sha256}"
     DOA2U_NX_VERSION="${DOA2U_NX_VERSION}")
+# DirectSound drops audio spans after a longer gap between the game's pumps.
+# Bring-up frames still take 100-150 ms, so keep their audio instead of
+# dropping nearly all of it. Set on the one file that reads it, so changing it
+# never recompiles the generated program.
+set_source_files_properties("${RUNTIME}/dsound_buffer_model.c" PROPERTIES
+    COMPILE_DEFINITIONS "RECOMP_DSOUND_STALL_MS=250u")
 # switch/include comes first: it supplies the POSIX headers newlib lacks.
 target_include_directories(doa2u-nx BEFORE PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

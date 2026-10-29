@@ -1,5 +1,9 @@
 #include "dsound_buffer_model.h"
 
+#ifndef RECOMP_DSOUND_STALL_MS
+#define RECOMP_DSOUND_STALL_MS 100u
+#endif
+
 #include <stddef.h>
 
 static int buffer_configured(const RecompDsoundBufferModel *model)
@@ -92,9 +96,11 @@ uint32_t recomp_dsound_buffer_consume(
     uint32_t position = recomp_dsound_buffer_cursor(model, model->last_ms);
     uint32_t remainder = model->frame_remainder;
     recomp_dsound_buffer_cursor(model, now_ms);
-    /* shortcut: discard stalls over 100 ms instead of replaying stale ring data;
-       use a device-driven producer when continuous output across stalls matters. */
-    if (elapsed > 100u) {
+    /* shortcut: discard stalls over RECOMP_DSOUND_STALL_MS (100 ms) instead of
+       replaying stale ring data; use a device-driven producer when continuous
+       output across stalls matters. The Switch build raises the limit while
+       its frames still take longer than 100 ms. */
+    if (elapsed > RECOMP_DSOUND_STALL_MS) {
         return 0u;
     }
     uint64_t frames = (elapsed * model->sample_rate + remainder) / 1000u;

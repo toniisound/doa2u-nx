@@ -504,10 +504,16 @@ int main(int argc, char **argv)
     // game's own 16:9 mode; Y skips the intro movies. There is no CPU boost:
     // boost mode would drop the GPU to 76.8 MHz. Clock the console with
     // sys-clk instead.
+    // The first padUpdate after init can come back empty (Eden does), so
+    // sample for a short while and keep every button seen held.
     PadState pad;
     padInitializeDefault(&pad);
-    padUpdate(&pad);
-    const u64 held = padGetButtons(&pad);
+    u64 held = 0;
+    for (int i = 0; i < 20; ++i) {
+        padUpdate(&pad);
+        held |= padGetButtons(&pad);
+        svcSleepThread(10'000'000);
+    }
     const bool unpaced = (held & HidNpadButton_R) != 0;
     const bool narrow = (held & HidNpadButton_L) != 0;
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
@@ -519,6 +525,8 @@ int main(int argc, char **argv)
     // launcher sets them on PC. The console outputs stereo.
     setenv("RECOMP_D3D_WIDESCREEN", narrow ? "0" : "1", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
+    std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d (buttons 0x%llx)\n",
+        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, (unsigned long long)held);
     std::printf("\nModo: %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
         narrow ? "4:3" : "16:9", skip_intro ? ", sin videos de intro" : "");
     std::printf("Arrancando...\n");
