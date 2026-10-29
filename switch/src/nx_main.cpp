@@ -499,21 +499,41 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Held at boot: R runs unpaced (as fast as the CPU allows, to measure
-    // headroom above 60 fps); L keeps the original 4:3 picture instead of the
-    // game's own 16:9 mode; Y skips the intro movies. There is no CPU boost:
-    // boost mode would drop the GPU to 76.8 MHz. Clock the console with
-    // sys-clk instead.
-    // The first padUpdate after init can come back empty (Eden does), so
-    // sample for a short while and keep every button seen held.
+    // R runs unpaced (as fast as the CPU allows, to measure headroom above
+    // 60 fps); L keeps the original 4:3 picture instead of the game's own
+    // 16:9 mode; Y skips the intro movies. There is no CPU boost: boost mode
+    // would drop the GPU to 76.8 MHz. Clock the console with sys-clk instead.
+    // Boot options: a 2 s window in which pressing (or holding) a button
+    // turns its option on. Reading only the buttons held at launch is not
+    // reliable: Eden delivers no pad state for the first moments.
     PadState pad;
     padInitializeDefault(&pad);
+    std::printf("\nOpciones (pulsa ahora):\n");
+    std::printf("  Y  saltar los videos de intro\n");
+    std::printf("  L  imagen 4:3 en vez de 16:9\n");
+    std::printf("  R  sin limite de FPS (unpaced)\n");
+    std::printf("  A  empezar ya\n");
+    consoleUpdate(nullptr);
     u64 held = 0;
-    for (int i = 0; i < 20; ++i) {
+    const u64 start = armGetSystemTick();
+    int shown = -1;
+    for (;;) {
         padUpdate(&pad);
-        held |= padGetButtons(&pad);
-        svcSleepThread(10'000'000);
+        held |= padGetButtons(&pad) | padGetButtonsDown(&pad);
+        const double elapsed = armTicksToNs(armGetSystemTick() - start) / 1e9;
+        if (elapsed >= 2.0 || (held & HidNpadButton_A) || !appletMainLoop()) break;
+        const int tenths = static_cast<int>((2.0 - elapsed) * 10.0);
+        if (tenths != shown) {
+            shown = tenths;
+            std::printf("\r  %.1f s   %s%s%s\x1b[K", tenths / 10.0,
+                (held & HidNpadButton_Y) ? "[sin intro] " : "",
+                (held & HidNpadButton_L) ? "[4:3] " : "",
+                (held & HidNpadButton_R) ? "[unpaced] " : "");
+            consoleUpdate(nullptr);
+        }
+        svcSleepThread(16'000'000);
     }
+    std::printf("\n");
     const bool unpaced = (held & HidNpadButton_R) != 0;
     const bool narrow = (held & HidNpadButton_L) != 0;
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
