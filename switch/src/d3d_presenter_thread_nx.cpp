@@ -334,9 +334,11 @@ void notePresent(PresenterThread &thread)
         static_cast<unsigned long long>(guest_pacing.presents), frames * 1000.0 / elapsed_ms, elapsed_ms / frames);
     const D3dCaptureStats capture = d3d_capture_take_stats();
     const double per_frame_mb = 1.0 / (1048576.0 * frames);
-    std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB compared=%.2fMB trusted=%.2fMB\n",
+    std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB (geometry %.2fMB)"
+        " compared=%.2fMB trusted=%.2fMB add=%.2fms\n",
         double(capture.commands) / frames, capture.copied_bytes * per_frame_mb,
-        capture.compared_bytes * per_frame_mb, capture.trusted_bytes * per_frame_mb);
+        capture.copied_geometry_bytes * per_frame_mb, capture.compared_bytes * per_frame_mb,
+        capture.trusted_bytes * per_frame_mb, capture.add_ms / frames);
 #ifdef __SWITCH__
     doa2u_nx_profile_report(frames, elapsed_ms, -1);
 #endif

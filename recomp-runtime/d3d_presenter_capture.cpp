@@ -1,6 +1,7 @@
 #include "d3d_presenter_capture.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <new>
@@ -77,9 +78,20 @@ void D3dCapturePacket::setTrustTextures(bool trust)
     trust_textures = trust;
 }
 
+namespace {
+struct AddTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~AddTimer()
+    {
+        stats.add_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+};
+} // namespace
+
 RecompD3dPresenterError D3dCapturePacket::add(
     const RecompD3dPresenterCommand &command)
 {
+    const AddTimer timer;
     if (sealed_ || static_cast<unsigned>(command.type) >
         RECOMP_D3D_PRESENTER_COMMAND_COPY_MAIN_COLOR) {
         return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
@@ -146,6 +158,7 @@ RecompD3dPresenterError D3dCapturePacket::add(
                 payload_[offset + words - 1u] = 0u;
                 if (size != 0u) std::memcpy(payload_.data() + offset, source, size);
                 stats.copied_bytes += size;
+                if (i < 2u) stats.copied_geometry_bytes += size;
                 spans_.emplace(key, Span{size, offset, source, epoch_});
                 inserted_keys[inserted_count++] = key;
                 captured.offsets[i] = offset;
