@@ -19,23 +19,25 @@ host layer this port started from.
 
 ## Status
 
-**Stage 1 of 3: CPU bring-up.** The whole game runs as a libnx homebrew with
-audio, input and saves, but draws nothing yet: the presenter is a probe that
-counts frames and shows on screen how fast the lifted game runs on the
-console's CPU (target: 60 fps). This build has not been run on hardware or in
-an emulator yet.
+**Stage 2 of 3: renderer.** The game runs as a libnx homebrew with an
+OpenGL 4.3 renderer on its own core, audio, input and saves. Stage 1 (the
+CPU probe) ran the intro, menus and the attract-mode fights in Eden at
+60 fps in menus and 42–58 fps in fights, without a picture. The renderer has
+been verified on Mesa's llvmpipe on a PC through the same presenter API the
+game uses, but has not yet run on the console or in Eden.
 
 | Stage | Goal | State |
 |---|---|---|
-| 1. CPU bring-up | Boot, audio, input, saves, frame-rate probe | **Code complete, untested** |
-| 2. Renderer | OpenGL 4.3 backend on its own core; upstream's runtime-generated HLSL shaders compiled to GLSL with glslang + SPIRV-Cross, cached on the SD card | Not started |
-| 3. Performance | Real hardware tuning | Not started |
+| 1. CPU bring-up | Boot, audio, input, saves, frame-rate probe | Done (Eden) |
+| 2. Renderer | OpenGL 4.3 backend on core 1; upstream's run-time HLSL shaders compiled to GLSL with glslang + SPIRV-Cross, cached on the SD card | **Code complete, host-tested** |
+| 3. Performance | Real hardware tuning (3D audio off the guest core, Sofdec movies) | Not started |
 
 | Area | Switch host layer | State |
 |---|---|---|
 | Lifted program + runtime | shared with doa2u-re (`recomp-runtime/`) | builds for AArch64 |
 | Fibers | `fiber_switch_arm64.S` (shared) | — |
-| Video | `switch/src/d3d_backend_probe.cpp` under upstream's `d3d_presenter_inline.cpp` | probe only (no picture) |
+| Video | `switch/src/d3d_backend_gl.cpp` behind `switch/src/d3d_presenter_thread_nx.cpp` (render thread on core 1) | OpenGL 4.3 |
+| Shaders | `recomp-runtime/d3d_shader_compiler.cpp` (GLSL target), glslang 16.2.0 + SPIRV-Cross 1.4.341 built from source | cached in `shader-cache/` |
 | Audio | `switch/src/audio_output_switch.cpp` (audout, mixer on core 2, dry/wet routing, I3DL2 reverb) | on |
 | Input | `switch/src/input_host_switch.c` (libnx pads, rumble) | 4 ports |
 | Files and saves | `win32_compat.c` + `switch/include` shims | SD card |
@@ -50,8 +52,13 @@ an emulator yet.
 - Audio voices carry XAudio2-style dry and wet output matrices; the wet sends
   feed the same portable I3DL2 reverb and crosstalk canceller as upstream's
   SDL backend.
-- Visibility tests (occlusion queries) exist; the probe answers them as
-  visible.
+- Visibility tests (occlusion queries) exist; the renderer answers them with
+  `GL_SAMPLES_PASSED` queries.
+- The renderer follows upstream's SDL_GPU backend decision for decision. Two
+  GL details were measured on llvmpipe rather than assumed: with
+  `glClipControl(UPPER_LEFT)` GL's winding matches D3D's screen winding, and
+  GL breaks pixel-centre ties on rows the other way from D3D, which a
+  1/256-pixel viewport lift corrects.
 
 ## Building
 
@@ -83,6 +90,10 @@ cd doa2u-nx
    ./switch/build_switch.sh            # JOBS=3 for more parallel jobs
    ```
 
+   The first configure downloads glslang and SPIRV-Cross (pinned commits)
+   from GitHub. `PRESENTER=probe ./switch/build_switch.sh` builds the stage 1
+   CPU probe instead of the renderer.
+
    Each generated chunk needs about 3 GB of RAM to compile. A 256x256 JPEG in
    `private/icon.jpg` becomes the homebrew menu icon (optional, not included).
 
@@ -99,6 +110,9 @@ the game installs to its hard disk (about 700 MB) into
 `disc/.recomp-storage/partition5`, as upstream's launcher does; later launches
 skip it. Saves go to `disc/.recomp-storage`, every character and costume
 starts unlocked, and each boot rewrites `sdmc:/switch/doa2u-nx/doa2u-nx.log`.
+Compiled shaders are kept in `sdmc:/switch/doa2u-nx/shader-cache`, so the
+first boot (and the first sight of each new effect) compiles a little; later
+boots only link.
 
 Options: for 2 seconds after launch the screen lists them; press a button to
 turn its option on (A starts at once).
@@ -108,6 +122,7 @@ turn its option on (A starts at once).
 | R | Run unpaced (as fast as the CPU allows) |
 | L | Original 4:3 picture instead of the game's own 16:9 mode |
 | Y | Skip the intro movies |
+| X | Render at 480p instead of 720p (lighter GPU load) |
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.

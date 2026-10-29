@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${DEVKITPRO:=/opt/devkitpro}"
 JOBS="${JOBS:-2}"
-PRESENTER="${PRESENTER:-probe}"
+PRESENTER="${PRESENTER:-gl}"
 
 if [[ ! -f "${DEVKITPRO}/cmake/Switch.cmake" ]]; then
     echo "devkitPro not found at ${DEVKITPRO} (install switch-dev: sudo dkp-pacman -S switch-dev)" >&2
