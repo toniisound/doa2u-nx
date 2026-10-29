@@ -55,6 +55,7 @@ const char kLog[] = "sdmc:/switch/doa2u-nx/doa2u-nx.log";
 // default device): win32_compat.c resolves guest file names case-insensitively
 // one "/" component at a time, which needs the path to start at "/".
 const char kRunnerDisc[] = "/switch/doa2u-nx/disc";
+const char kShaderCache[] = "sdmc:/switch/doa2u-nx/shader-cache";
 
 // The disc archives the game installs to its hard-disk cache (Z:) on first
 // boot, as tools/run_game.py's seed_hdd_cache copies them: the game's own
@@ -512,6 +513,7 @@ int main(int argc, char **argv)
     std::printf("  Y  saltar los videos de intro\n");
     std::printf("  L  imagen 4:3 en vez de 16:9\n");
     std::printf("  R  sin limite de FPS (unpaced)\n");
+    std::printf("  X  render a 480p (menos carga de GPU) en vez de 720p\n");
     std::printf("  A  empezar ya\n");
     consoleUpdate(nullptr);
     u64 held = 0;
@@ -525,10 +527,11 @@ int main(int argc, char **argv)
         const int tenths = static_cast<int>((2.0 - elapsed) * 10.0);
         if (tenths != shown) {
             shown = tenths;
-            std::printf("\r  %.1f s   %s%s%s\x1b[K", tenths / 10.0,
+            std::printf("\r  %.1f s   %s%s%s%s\x1b[K", tenths / 10.0,
                 (held & HidNpadButton_Y) ? "[sin intro] " : "",
                 (held & HidNpadButton_L) ? "[4:3] " : "",
-                (held & HidNpadButton_R) ? "[unpaced] " : "");
+                (held & HidNpadButton_R) ? "[unpaced] " : "",
+                (held & HidNpadButton_X) ? "[480p] " : "");
             consoleUpdate(nullptr);
         }
         svcSleepThread(16'000'000);
@@ -537,6 +540,7 @@ int main(int argc, char **argv)
     const bool unpaced = (held & HidNpadButton_R) != 0;
     const bool narrow = (held & HidNpadButton_L) != 0;
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
+    const bool low_resolution = (held & HidNpadButton_X) != 0;
     if (unpaced) {
         setenv("RECOMP_UNPACED", "1", 1);
         std::fprintf(stderr, "[nx] RECOMP_UNPACED=1 (R held at boot)\n");
@@ -545,10 +549,17 @@ int main(int argc, char **argv)
     // launcher sets them on PC. The console outputs stereo.
     setenv("RECOMP_D3D_WIDESCREEN", narrow ? "0" : "1", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
-    std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d (buttons 0x%llx)\n",
-        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, (unsigned long long)held);
-    std::printf("\nModo: %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
-        narrow ? "4:3" : "16:9", skip_intro ? ", sin videos de intro" : "");
+    // The game renders 480 lines; 1.5x is the 720p of the handheld screen.
+    setenv("RECOMP_D3D_SCALE", low_resolution ? "1" : "1.5", 1);
+    // Compiled draw shaders persist on the SD card, so later boots skip
+    // glslang and SPIRV-Cross and only link them.
+    mkdir(kShaderCache, 0777);
+    setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
+    std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d scale=%s (buttons 0x%llx)\n",
+        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, low_resolution ? "1" : "1.5",
+        (unsigned long long)held);
+    std::printf("\nModo: %s, %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
+        narrow ? "4:3" : "16:9", low_resolution ? "480p" : "720p", skip_intro ? ", sin videos de intro" : "");
     std::printf("Arrancando...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);

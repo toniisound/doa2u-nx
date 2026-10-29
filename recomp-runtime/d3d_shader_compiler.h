@@ -12,10 +12,16 @@
    set 2 (each texture shares its sampler's binding), fragment uniform buffers
    in set 3. */
 
-enum class RecompShaderTarget { Spirv, Msl };
+/* Glsl is GLSL 4.30 core for an OpenGL backend (the Switch port), built
+   with glslang and SPIRV-Cross linked in (RECOMP_SHADER_GLSLANG). There,
+   uniform buffers take GL binding = slot in the vertex stage and slot + 2 in
+   the fragment stage (each block renamed per stage, so a program links), each
+   texture and its sampler become one combined sampler on the texture's slot,
+   and stage interfaces keep their [[vk::location]] numbers. */
+enum class RecompShaderTarget { Spirv, Msl, Glsl };
 
 struct RecompCompiledShader {
-    std::vector<uint8_t> code;  // SPIR-V words, or MSL text without a terminator
+    std::vector<uint8_t> code;  // SPIR-V words, or MSL/GLSL text without a terminator
     std::string entry_point;
 };
 

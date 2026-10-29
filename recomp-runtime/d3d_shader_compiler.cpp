@@ -10,7 +10,12 @@
 #include <mutex>
 #include <type_traits>
 
-#ifdef RECOMP_SHADERC_LINKED
+#if defined(RECOMP_SHADER_GLSLANG)
+#include <glslang/Public/ResourceLimits.h>
+#include <glslang/Public/ShaderLang.h>
+#include <glslang/SPIRV/GlslangToSpv.h>
+#include <spirv_cross/spirv_glsl.hpp>
+#elif defined(RECOMP_SHADERC_LINKED)
 #include <shaderc/shaderc.h>
 #else
 #include <dlfcn.h>
@@ -21,6 +26,118 @@
 
 namespace {
 
+#if defined(RECOMP_SHADER_GLSLANG)
+/* glslang linked in: its HLSL front end with the options shaderc is given
+   above (HLSL offsets, auto-mapped locations), without spirv-opt. */
+std::mutex shaderc_lock;
+bool shaderc_ready;
+
+bool loadShaderc()
+{
+    if (!shaderc_ready) shaderc_ready = glslang::InitializeProcess();
+    return shaderc_ready;
+}
+
+bool compileSpirv(const std::string &hlsl, const char *entry_point, bool vertex,
+    const std::vector<std::string> &defines, std::vector<uint8_t> &spirv, std::string &error)
+{
+    std::lock_guard<std::mutex> lock(shaderc_lock);
+    if (!loadShaderc()) {
+        error = "glslang initialization failed";
+        return false;
+    }
+    std::string preamble = std::string("#define RECOMP_UNIFORM_SET ") + (vertex ? "1" : "3") + "\n";
+    bool samples = false;
+    for (const std::string &define : defines) samples |= define.rfind("RECOMP_SAMPLE_COUNT", 0) == 0;
+    if (!samples) preamble += "#define RECOMP_SAMPLE_COUNT 4\n";
+    for (const std::string &define : defines) {
+        const size_t equals = define.find('=');
+        preamble += "#define " + define.substr(0, equals) + " " +
+            (equals == std::string::npos ? std::string("1") : define.substr(equals + 1u)) + "\n";
+    }
+    const EShLanguage stage = vertex ? EShLangVertex : EShLangFragment;
+    glslang::TShader shader(stage);
+    const char *source = hlsl.c_str();
+    const int length = static_cast<int>(hlsl.size());
+    const char *name = "presenter.hlsl";
+    shader.setStringsWithLengthsAndNames(&source, &length, &name, 1);
+    shader.setPreamble(preamble.c_str());
+    shader.setEntryPoint(entry_point);
+    shader.setSourceEntryPoint(entry_point);
+    shader.setEnvInput(glslang::EShSourceHlsl, stage, glslang::EShClientVulkan, 100);
+    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
+    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+    shader.setAutoMapLocations(true);
+    const EShMessages messages = static_cast<EShMessages>(
+        EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl | EShMsgHlslOffsets);
+    if (!shader.parse(GetDefaultResources(), 100, false, messages)) {
+        error = shader.getInfoLog();
+        return false;
+    }
+    glslang::TProgram program;
+    program.addShader(&shader);
+    if (!program.link(messages) || !program.mapIO()) {
+        error = program.getInfoLog();
+        return false;
+    }
+    std::vector<unsigned int> words;
+    glslang::SpvOptions options;
+    options.validate = false;
+    glslang::GlslangToSpv(*program.getIntermediate(stage), words, &options);
+    if (words.empty()) {
+        error = "glslang produced no SPIR-V";
+        return false;
+    }
+    spirv.resize(words.size() * sizeof(unsigned int));
+    std::memcpy(spirv.data(), words.data(), spirv.size());
+    return true;
+}
+
+/* GLSL 4.30 core for the OpenGL backend (see RecompShaderTarget::Glsl). */
+bool translateGlsl(const std::vector<uint8_t> &spirv, bool vertex, RecompCompiledShader &out,
+    std::string &error)
+{
+    try {
+        std::vector<uint32_t> words(spirv.size() / sizeof(uint32_t));
+        std::memcpy(words.data(), spirv.data(), words.size() * sizeof(uint32_t));
+        spirv_cross::CompilerGLSL glsl(std::move(words));
+        spirv_cross::CompilerGLSL::Options options = glsl.get_common_options();
+        options.version = 430;
+        options.es = false;
+        options.vulkan_semantics = false;
+        options.enable_420pack_extension = false;
+        glsl.set_common_options(options);
+        const char *prefix = vertex ? "vs_" : "fs_";
+        const spirv_cross::ShaderResources resources = glsl.get_shader_resources();
+        for (const spirv_cross::Resource &buffer : resources.uniform_buffers) {
+            const uint32_t slot = glsl.get_decoration(buffer.id, spv::DecorationBinding);
+            glsl.unset_decoration(buffer.id, spv::DecorationDescriptorSet);
+            glsl.set_decoration(buffer.id, spv::DecorationBinding, vertex ? slot : slot + 2u);
+            glsl.set_name(buffer.base_type_id, prefix + glsl.get_name(buffer.base_type_id));
+        }
+        // Texture.Load has no sampler; GLSL's texelFetch still needs one.
+        glsl.build_dummy_sampler_for_combined_images();
+        glsl.build_combined_image_samplers();
+        for (const spirv_cross::CombinedImageSampler &combined : glsl.get_combined_image_samplers()) {
+            const uint32_t slot = glsl.get_decoration(combined.image_id, spv::DecorationBinding);
+            glsl.set_decoration(combined.combined_id, spv::DecorationBinding, slot);
+            glsl.set_name(combined.combined_id, glsl.get_name(combined.image_id) + "_" +
+                glsl.get_name(combined.sampler_id));
+        }
+        for (const spirv_cross::Resource &image : resources.separate_images)
+            glsl.unset_decoration(image.id, spv::DecorationDescriptorSet);
+        for (const spirv_cross::Resource &sampler : resources.separate_samplers)
+            glsl.unset_decoration(sampler.id, spv::DecorationDescriptorSet);
+        const std::string source = glsl.compile();
+        out.code.assign(source.begin(), source.end());
+        out.entry_point = "main";
+        return true;
+    } catch (const std::exception &failure) {
+        error = std::string("spirv-cross: ") + failure.what();
+        return false;
+    }
+}
+#else
 /* shaderc's C API, which has been stable since its first release. Linux loads
    it at run time, so one build runs on distributions that name the library
    differently; macOS links Homebrew's. */
@@ -163,6 +280,8 @@ bool compileSpirv(const std::string &hlsl, const char *entry_point, bool vertex,
     shaderc.result_release(result);
     return compiled;
 }
+
+#endif
 
 #ifdef __APPLE__
 /* SDL_GPU's Metal slots: [[buffer(n)]] for uniform buffer n, and
@@ -397,7 +516,7 @@ std::string cachePath(const std::string &hlsl, const char *entry_point, bool ver
     for (const std::string &define : defines) mix(define);
     char name[48];
     std::snprintf(name, sizeof name, "/%016llx.%s", static_cast<unsigned long long>(hash),
-        target == RecompShaderTarget::Msl ? "msl" : "spv");
+        target == RecompShaderTarget::Msl ? "msl" : target == RecompShaderTarget::Glsl ? "glsl" : "spv");
     return std::string(folder) + name;
 }
 
@@ -450,10 +569,12 @@ static bool compileUncached(const std::string &hlsl, const char *entry_point, bo
         out.entry_point = entry_point;
         return true;
     }
-#ifdef __APPLE__
-    return translateMsl(spirv, vertex, out, error);
-#else
-    error = "MSL output needs SPIRV-Cross, built only for Apple hosts";
-    return false;
+#if defined(RECOMP_SHADER_GLSLANG)
+    if (target == RecompShaderTarget::Glsl) return translateGlsl(spirv, vertex, out, error);
 #endif
+#ifdef __APPLE__
+    if (target == RecompShaderTarget::Msl) return translateMsl(spirv, vertex, out, error);
+#endif
+    error = "this build cannot translate SPIR-V to the requested shader target";
+    return false;
 }

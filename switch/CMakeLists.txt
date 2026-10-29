@@ -20,7 +20,7 @@ if(NOT NINTENDO_SWITCH)
     message(FATAL_ERROR "Configure with -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake")
 endif()
 
-set(DOA2U_NX_VERSION "0.1.1" CACHE STRING "Version shown in the homebrew menu")
+set(DOA2U_NX_VERSION "0.2.0" CACHE STRING "Version shown in the homebrew menu")
 set(DOA2U_NX_ICON "" CACHE FILEPATH "Optional 256x256 JPEG icon for the .nro")
 
 set(CMAKE_C_STANDARD 11)
@@ -173,17 +173,107 @@ set(_runtime_sources
     runner_load.cpp
     # recomp_audio (SDL backend minus SDL: audio_output_switch.cpp replaces it)
     audio_reverb.cpp dsound_hrtf.c
-    # recomp_d3d_presenter: the presenter API driver and shared draw pieces;
-    # the backend comes from switch/src
-    d3d_presenter_inline.cpp d3d_draw_model.c d3d_texture_model.c d3d_vblank.cpp)
+    # recomp_d3d_presenter's shared draw pieces; the presenter driver and
+    # backend come with DOA2U_NX_PRESENTER below
+    d3d_draw_model.c d3d_texture_model.c d3d_vblank.cpp)
 list(TRANSFORM _runtime_sources PREPEND "${RUNTIME}/")
 
-# probe: no rendering, the CPU-only measuring backend of stage 1. The
-# OpenGL backend (stage 2) is added here as "gl".
-set(DOA2U_NX_PRESENTER "probe" CACHE STRING "Presenter backend: probe")
+# gl: the OpenGL 4.3 renderer (stage 2) on its own thread on core 1, behind
+# a portable copy of upstream's threaded presenter driver. probe: no
+# rendering, the CPU-only measuring backend of stage 1, on the guest thread.
+set(DOA2U_NX_PRESENTER "gl" CACHE STRING "Presenter backend: gl or probe")
 if(DOA2U_NX_PRESENTER STREQUAL "probe")
-    set(DOA2U_NX_PRESENTER_SOURCES "${NX_SRC}/d3d_backend_probe.cpp")
+    set(DOA2U_NX_PRESENTER_SOURCES
+        "${NX_SRC}/d3d_backend_probe.cpp"
+        "${RUNTIME}/d3d_presenter_inline.cpp")
     set(DOA2U_NX_PRESENTER_LIBS)
+elseif(DOA2U_NX_PRESENTER STREQUAL "gl")
+    # The draw shaders are HLSL generated at run time (d3d_draw_shader.cpp);
+    # glslang and SPIRV-Cross, built here from pinned sources, turn them into
+    # GLSL on the console (d3d_shader_compiler.cpp, RECOMP_SHADER_GLSLANG).
+    # Their own build systems are not used: only their sources are fetched.
+    include(FetchContent)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    FetchContent_Declare(nx_glslang
+        GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+        GIT_TAG f0bd0257c308b9a26562c1a30c4748a0219cc951  # 16.2.0
+        GIT_SHALLOW FALSE
+        SOURCE_SUBDIR doa2u-nx-sources-only)
+    FetchContent_Declare(nx_spirv_cross
+        GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+        GIT_TAG a0fba56c34a6700f1724bf9b751da5b488a3775c  # vulkan-sdk-1.4.341.0
+        GIT_SHALLOW FALSE
+        SOURCE_SUBDIR doa2u-nx-sources-only)
+    FetchContent_MakeAvailable(nx_glslang nx_spirv_cross)
+    set(_glslang "${nx_glslang_SOURCE_DIR}")
+    set(_spvc "${nx_spirv_cross_SOURCE_DIR}")
+    # The installed include layout the compiler expects: glslang/SPIRV/*.h,
+    # glslang/build_info.h and spirv_cross/*.hpp next to the source tree's glslang/.
+    set(_shader_include "${CMAKE_CURRENT_BINARY_DIR}/shader-include")
+    file(GLOB _glslang_spirv_headers "${_glslang}/SPIRV/*.h" "${_glslang}/SPIRV/*.hpp")
+    file(COPY ${_glslang_spirv_headers} DESTINATION "${_shader_include}/glslang/SPIRV")
+    file(GLOB _spvc_headers "${_spvc}/*.h" "${_spvc}/*.hpp")
+    file(COPY ${_spvc_headers} DESTINATION "${_shader_include}/spirv_cross")
+    file(WRITE "${_shader_include}/glslang/build_info.h.in"
+        "#ifndef GLSLANG_BUILD_INFO\n#define GLSLANG_BUILD_INFO\n"
+        "#define GLSLANG_VERSION_MAJOR 16\n#define GLSLANG_VERSION_MINOR 2\n"
+        "#define GLSLANG_VERSION_PATCH 0\n#define GLSLANG_VERSION_FLAVOR \"\"\n"
+        "#define GLSLANG_VERSION_GREATER_THAN(major, minor, patch) ((GLSLANG_VERSION_MAJOR) > (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) > (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH) > (patch)))))\n"
+        "#define GLSLANG_VERSION_GREATER_OR_EQUAL_TO(major, minor, patch) ((GLSLANG_VERSION_MAJOR) > (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) > (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH >= (patch))))))\n"
+        "#define GLSLANG_VERSION_LESS_THAN(major, minor, patch) ((GLSLANG_VERSION_MAJOR) < (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) < (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH) < (patch)))))\n"
+        "#define GLSLANG_VERSION_LESS_OR_EQUAL_TO(major, minor, patch) ((GLSLANG_VERSION_MAJOR) < (major) || ((major) == GLSLANG_VERSION_MAJOR && ((GLSLANG_VERSION_MINOR) < (minor) || ((minor) == GLSLANG_VERSION_MINOR && (GLSLANG_VERSION_PATCH <= (patch))))))\n"
+        "#endif\n")
+    configure_file("${_shader_include}/glslang/build_info.h.in" "${_shader_include}/glslang/build_info.h" COPYONLY)
+
+    set(_glslang_sources
+        SPIRV/GlslangToSpv.cpp SPIRV/InReadableOrder.cpp SPIRV/Logger.cpp SPIRV/SpvBuilder.cpp
+        SPIRV/SpvPostProcess.cpp SPIRV/SpvTools.cpp SPIRV/disassemble.cpp SPIRV/doc.cpp
+        glslang/GenericCodeGen/CodeGen.cpp glslang/GenericCodeGen/Link.cpp
+        glslang/HLSL/hlslAttributes.cpp glslang/HLSL/hlslGrammar.cpp glslang/HLSL/hlslOpMap.cpp
+        glslang/HLSL/hlslParseHelper.cpp glslang/HLSL/hlslParseables.cpp glslang/HLSL/hlslScanContext.cpp
+        glslang/HLSL/hlslTokenStream.cpp
+        glslang/MachineIndependent/Constant.cpp glslang/MachineIndependent/InfoSink.cpp
+        glslang/MachineIndependent/Initialize.cpp glslang/MachineIndependent/IntermTraverse.cpp
+        glslang/MachineIndependent/Intermediate.cpp glslang/MachineIndependent/ParseContextBase.cpp
+        glslang/MachineIndependent/ParseHelper.cpp glslang/MachineIndependent/PoolAlloc.cpp
+        glslang/MachineIndependent/RemoveTree.cpp glslang/MachineIndependent/Scan.cpp
+        glslang/MachineIndependent/ShaderLang.cpp glslang/MachineIndependent/SpirvIntrinsics.cpp
+        glslang/MachineIndependent/SymbolTable.cpp glslang/MachineIndependent/Versions.cpp
+        glslang/MachineIndependent/attribute.cpp glslang/MachineIndependent/glslang_tab.cpp
+        glslang/MachineIndependent/intermOut.cpp glslang/MachineIndependent/iomapper.cpp
+        glslang/MachineIndependent/limits.cpp glslang/MachineIndependent/linkValidate.cpp
+        glslang/MachineIndependent/parseConst.cpp glslang/MachineIndependent/preprocessor/Pp.cpp
+        glslang/MachineIndependent/preprocessor/PpAtom.cpp glslang/MachineIndependent/preprocessor/PpContext.cpp
+        glslang/MachineIndependent/preprocessor/PpScanner.cpp glslang/MachineIndependent/preprocessor/PpTokens.cpp
+        glslang/MachineIndependent/propagateNoContraction.cpp glslang/MachineIndependent/reflection.cpp
+        glslang/OSDependent/Unix/ossource.cpp glslang/ResourceLimits/ResourceLimits.cpp)
+    list(TRANSFORM _glslang_sources PREPEND "${_glslang}/")
+    add_library(nx_glslang STATIC ${_glslang_sources})
+    # PRIVATE throughout: anything these libraries exported to doa2u-nx would
+    # change every generated chunk's command line and recompile them all.
+    target_compile_definitions(nx_glslang PRIVATE ENABLE_HLSL ENABLE_OPT=0 ENABLE_SPIRV GLSLANG_OSINCLUDE_UNIX)
+    target_include_directories(nx_glslang PRIVATE "${_shader_include}" "${_glslang}")
+    target_compile_options(nx_glslang PRIVATE -O2 -w)
+    add_library(nx_spirv_cross STATIC
+        "${_spvc}/spirv_cfg.cpp" "${_spvc}/spirv_cross.cpp" "${_spvc}/spirv_cross_parsed_ir.cpp"
+        "${_spvc}/spirv_glsl.cpp" "${_spvc}/spirv_parser.cpp")
+    target_include_directories(nx_spirv_cross PRIVATE "${_shader_include}")
+    target_compile_options(nx_spirv_cross PRIVATE -O2 -w)
+
+    set(DOA2U_NX_PRESENTER_SOURCES
+        "${NX_SRC}/d3d_backend_gl.cpp"
+        "${NX_SRC}/d3d_presenter_thread_nx.cpp"
+        "${RUNTIME}/d3d_presenter_capture.cpp"
+        "${RUNTIME}/d3d_shader_compiler.cpp"
+        "${RUNTIME}/d3d_draw_shader.cpp"
+        "${RUNTIME}/d3d_vertex_program.cpp")
+    set_source_files_properties("${RUNTIME}/d3d_shader_compiler.cpp" PROPERTIES
+        COMPILE_DEFINITIONS RECOMP_SHADER_GLSLANG
+        INCLUDE_DIRECTORIES "${_shader_include};${_glslang}")
+    # devkitPro switch-mesa and switch-glad (switch-portlibs).
+    set(DOA2U_NX_PRESENTER_LIBS nx_spirv_cross nx_glslang glad EGL glapi drm_nouveau)
 else()
     message(FATAL_ERROR "Unknown DOA2U_NX_PRESENTER '${DOA2U_NX_PRESENTER}'")
 endif()
