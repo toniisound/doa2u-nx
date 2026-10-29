@@ -10,14 +10,23 @@ enum { FADE_STEPS = 32 };
    Whole positions return a source sample exactly. */
 static float resample(const RecompHrtfVoice *voice)
 {
-    const double t = (RECOMP_HRTF_LAGRANGE_TAPS / 2 - 1) + voice->phase;
+    /* Lagrange weight j is prod_{m != j} (t - m) / (j - m). The denominators
+       are fixed, so each weight is one product of the shared (t - m) terms
+       (prefix and suffix products) and one division; a whole t still gives
+       exactly one weight of 1 and the rest 0. */
+    enum { N = RECOMP_HRTF_LAGRANGE_TAPS };
+    _Static_assert(RECOMP_HRTF_LAGRANGE_TAPS == 8, "denominators are for 8 points");
+    static const double denominators[N] = {-5040.0, 720.0, -240.0, 144.0, -144.0, 240.0, -720.0, 5040.0};
+    const double t = (N / 2 - 1) + voice->phase;
+    double before[N], after[N];
+    before[0] = 1.0;
+    for (int m = 1; m < N; ++m) before[m] = before[m - 1] * (t - (m - 1));
+    after[N - 1] = 1.0;
+    for (int m = N - 2; m >= 0; --m) after[m] = after[m + 1] * (t - (m + 1));
     double sum = 0.0;
-    for (int j = 0; j < RECOMP_HRTF_LAGRANGE_TAPS; ++j) {
-        double weight = 1.0;
-        for (int m = 0; m < RECOMP_HRTF_LAGRANGE_TAPS; ++m)
-            if (m != j) weight *= (t - m) / (j - m);
-        sum += weight * voice->source[(voice->source_head + 1u + (uint32_t)j) % RECOMP_HRTF_LAGRANGE_TAPS];
-    }
+    for (int j = 0; j < N; ++j)
+        sum += before[j] * after[j] / denominators[j] *
+            voice->source[(voice->source_head + 1u + (uint32_t)j) % N];
     return (float)sum;
 }
 
@@ -78,18 +87,35 @@ RecompHrtfFilter recomp_hrtf_lookup(const uint8_t *bank, const uint8_t *map,
    frequencies. Taps apply unnormalized; the absolute scale is unconfirmed. */
 static float tap_gain(int8_t tap)
 {
-    const uint8_t t = (uint8_t)tap;
-    const int e = (t >> 4) & 7, m = t & 15;
-    const float v = (float)(e ? (16 + m) << (e - 1) : m) / 2048.0f;
-    return t & 0x80u ? -v : v;
+    /* (e ? (16 + m) << (e - 1) : m), negated when the sign bit is set, for
+       every byte: decoding per tap per sample was most of the 3D voice cost. */
+    static const float numerators[256] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 17.0f, 18.0f, 19.0f, 20.0f, 21.0f, 22.0f, 23.0f, 24.0f, 25.0f, 26.0f, 27.0f, 28.0f, 29.0f, 30.0f, 31.0f,
+    32.0f, 34.0f, 36.0f, 38.0f, 40.0f, 42.0f, 44.0f, 46.0f, 48.0f, 50.0f, 52.0f, 54.0f, 56.0f, 58.0f, 60.0f, 62.0f,
+    64.0f, 68.0f, 72.0f, 76.0f, 80.0f, 84.0f, 88.0f, 92.0f, 96.0f, 100.0f, 104.0f, 108.0f, 112.0f, 116.0f, 120.0f, 124.0f,
+    128.0f, 136.0f, 144.0f, 152.0f, 160.0f, 168.0f, 176.0f, 184.0f, 192.0f, 200.0f, 208.0f, 216.0f, 224.0f, 232.0f, 240.0f, 248.0f,
+    256.0f, 272.0f, 288.0f, 304.0f, 320.0f, 336.0f, 352.0f, 368.0f, 384.0f, 400.0f, 416.0f, 432.0f, 448.0f, 464.0f, 480.0f, 496.0f,
+    512.0f, 544.0f, 576.0f, 608.0f, 640.0f, 672.0f, 704.0f, 736.0f, 768.0f, 800.0f, 832.0f, 864.0f, 896.0f, 928.0f, 960.0f, 992.0f,
+    1024.0f, 1088.0f, 1152.0f, 1216.0f, 1280.0f, 1344.0f, 1408.0f, 1472.0f, 1536.0f, 1600.0f, 1664.0f, 1728.0f, 1792.0f, 1856.0f, 1920.0f, 1984.0f,
+    -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f, -7.0f, -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,
+    -16.0f, -17.0f, -18.0f, -19.0f, -20.0f, -21.0f, -22.0f, -23.0f, -24.0f, -25.0f, -26.0f, -27.0f, -28.0f, -29.0f, -30.0f, -31.0f,
+    -32.0f, -34.0f, -36.0f, -38.0f, -40.0f, -42.0f, -44.0f, -46.0f, -48.0f, -50.0f, -52.0f, -54.0f, -56.0f, -58.0f, -60.0f, -62.0f,
+    -64.0f, -68.0f, -72.0f, -76.0f, -80.0f, -84.0f, -88.0f, -92.0f, -96.0f, -100.0f, -104.0f, -108.0f, -112.0f, -116.0f, -120.0f, -124.0f,
+    -128.0f, -136.0f, -144.0f, -152.0f, -160.0f, -168.0f, -176.0f, -184.0f, -192.0f, -200.0f, -208.0f, -216.0f, -224.0f, -232.0f, -240.0f, -248.0f,
+    -256.0f, -272.0f, -288.0f, -304.0f, -320.0f, -336.0f, -352.0f, -368.0f, -384.0f, -400.0f, -416.0f, -432.0f, -448.0f, -464.0f, -480.0f, -496.0f,
+    -512.0f, -544.0f, -576.0f, -608.0f, -640.0f, -672.0f, -704.0f, -736.0f, -768.0f, -800.0f, -832.0f, -864.0f, -896.0f, -928.0f, -960.0f, -992.0f,
+    -1024.0f, -1088.0f, -1152.0f, -1216.0f, -1280.0f, -1344.0f, -1408.0f, -1472.0f, -1536.0f, -1600.0f, -1664.0f, -1728.0f, -1792.0f, -1856.0f, -1920.0f, -1984.0f};
+    return numerators[(uint8_t)tap] / 2048.0f;
 }
 
 static float tap(const RecompHrtfVoice *voice, const int8_t *ear, int delay)
 {
     float sum = 0.0f;
     if (ear == NULL) return 0.0f;
+    const uint32_t start = voice->head - (uint32_t)delay;
     for (int k = 0; k < RECOMP_HRTF_TAPS; ++k)
-        sum += tap_gain(ear[k]) * voice->history[(voice->head - (uint32_t)(k + delay)) % RECOMP_HRTF_HISTORY];
+        sum += tap_gain(ear[k]) * voice->history[(start - (uint32_t)k) % RECOMP_HRTF_HISTORY];
     return sum;
 }
 

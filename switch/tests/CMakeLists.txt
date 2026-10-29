@@ -4,6 +4,7 @@
 #
 #   cmake -S switch/tests -B build/switch-tests -G Ninja && cmake --build build/switch-tests
 #   build/switch-tests/shader_glsl_test && build/switch-tests/gl_backend_test
+#   build/switch-tests/capture_trust_test
 #   RECOMP_D3D_SCALE=1.5 build/switch-tests/gl_backend_test
 cmake_minimum_required(VERSION 3.20)
 project(doa2u_nx_host_tests C CXX)
@@ -58,3 +59,6 @@ target_include_directories(gl_backend_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/
     "${egl_registry_SOURCE_DIR}/api" "${gl_registry_SOURCE_DIR}/api")
 find_package(Threads REQUIRED)
 target_link_libraries(gl_backend_test PRIVATE shader_path ${EGL_LIBRARY} ${GL_LIBRARY} Threads::Threads)
+
+add_executable(capture_trust_test capture_trust_test.cpp "${RUNTIME}/d3d_presenter_capture.cpp")
+target_include_directories(capture_trust_test PRIVATE "${RUNTIME}")

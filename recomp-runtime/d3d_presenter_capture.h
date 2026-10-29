@@ -9,8 +9,22 @@
 #include <utility>
 #include <vector>
 
+// Guest-side capture work since the last take, for the performance log.
+struct D3dCaptureStats {
+    uint64_t copied_bytes = 0u;     // payload copied out of guest memory
+    uint64_t compared_bytes = 0u;   // memcmp against an earlier copy in the packet
+    uint64_t trusted_bytes = 0u;    // texture reuse accepted without a compare
+    uint64_t commands = 0u;
+};
+D3dCaptureStats d3d_capture_take_stats();
+
 class D3dCapturePacket {
 public:
+    // Texture spans (not vertices or indices) seen earlier in the same packet
+    // at the same address, with no texture invalidation or memory release
+    // since, are reused without comparing their bytes again. Off by default.
+    static void setTrustTextures(bool trust);
+
     enum Kind : uint32_t { COMMAND, RELEASE, REPORT, INVALIDATE };
     struct Record { Kind kind; uint32_t base; uint32_t size; };
 
@@ -59,7 +73,7 @@ private:
         alignas(8) RecompD3dPresenterCommand value;
         size_t offsets[8];
     };
-    struct Span { size_t size; size_t offset; };
+    struct Span { size_t size; size_t offset; const void *source; uint32_t epoch; };
 
     RecompD3dPresenterError addRecord(Kind kind, uint32_t base, uint32_t size);
 
@@ -71,6 +85,8 @@ private:
     // Keyed by source, size and sampled bytes; memcmp still confirms each reuse.
     std::unordered_multimap<uint64_t, Span> spans_;
     bool sealed_ = false;
+    // Bumped by addInvalidate and addRelease: older spans need a compare.
+    uint32_t epoch_ = 0u;
 };
 
 #endif

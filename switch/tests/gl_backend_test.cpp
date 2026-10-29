@@ -456,6 +456,25 @@ int main()
         }
         std::printf("       visible pixels %u\n", pixels);
         expect(complete && pixels == 100u * 50u, "100x50 rectangle counts 5000 pixels");
+
+        // A pending index that already has a count answers with that count
+        // at once; the new count replaces it once the GPU resolves it.
+        submit(begin);
+        const RhwDiffuse small[4] = {{10, 10, 0.5f, 1, 0xffffffffu}, {30, 10, 0.5f, 1, 0xffffffffu},
+            {10, 20, 0.5f, 1, 0xffffffffu}, {30, 20, 0.5f, 1, 0xffffffffu}};
+        draw.vertex_bytes = small;
+        drawCommand(draw);
+        submit(end);
+        present();
+        complete = false;
+        recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels);
+        expect(complete && (pixels == 100u * 50u || pixels == 20u * 10u), "pending index answers at once");
+        for (int i = 0; i < 200 && pixels != 20u * 10u; ++i) {
+            recomp_d3d_presenter_flush(presenter, true);
+            recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels);
+        }
+        std::printf("       then %u\n", pixels);
+        expect(pixels == 20u * 10u, "20x10 rectangle replaces the count");
     }
 
     std::printf("coverage probe\n");

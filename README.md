@@ -19,18 +19,16 @@ host layer this port started from.
 
 ## Status
 
-**Stage 2 of 3: renderer.** The game runs as a libnx homebrew with an
-OpenGL 4.3 renderer on its own core, audio, input and saves. Stage 1 (the
-CPU probe) ran the intro, menus and the attract-mode fights in Eden at
-60 fps in menus and 42–58 fps in fights, without a picture. The renderer has
-been verified on Mesa's llvmpipe on a PC through the same presenter API the
-game uses, but has not yet run on the console or in Eden.
+**Stage 3 of 3: performance.** The game runs as a libnx homebrew with an
+OpenGL 4.3 renderer on its own core, audio, input and saves. In Eden it shows
+a correct picture at 35–57 fps in menus and about 20–25 fps in fights; it has
+not yet been measured on the console.
 
 | Stage | Goal | State |
 |---|---|---|
 | 1. CPU bring-up | Boot, audio, input, saves, frame-rate probe | Done (Eden) |
-| 2. Renderer | OpenGL 4.3 backend on core 1; upstream's run-time HLSL shaders compiled to GLSL with glslang + SPIRV-Cross, cached on the SD card | **Code complete, host-tested** |
-| 3. Performance | Real hardware tuning (3D audio off the guest core, Sofdec movies) | Not started |
+| 2. Renderer | OpenGL 4.3 backend on core 1; upstream's run-time HLSL shaders compiled to GLSL with glslang + SPIRV-Cross, cached on the SD card | Done (Eden) |
+| 3. Performance | Guest-thread costs (visibility waits, 3D audio, draw capture), then real hardware tuning and Sofdec movies | **In progress** |
 
 | Area | Switch host layer | State |
 |---|---|---|
@@ -53,7 +51,18 @@ game uses, but has not yet run on the console or in Eden.
   feed the same portable I3DL2 reverb and crosstalk canceller as upstream's
   SDL backend.
 - Visibility tests (occlusion queries) exist; the renderer answers them with
-  `GL_SAMPLES_PASSED` queries.
+  `GL_SAMPLES_PASSED` queries. The game reads each one right after issuing it
+  and spins until it completes, so once an index has a result, a pending read
+  returns the previous one (the lens flare it drives lags one result) instead
+  of stalling the game on the GPU. `RECOMP_VISIBILITY_WAIT=1` restores waiting.
+- Within one frame, a texture already captured from the same address (with no
+  re-registration or release since) is reused without comparing its bytes
+  again; vertices and indices are always compared.
+  `RECOMP_CAPTURE_COMPARE_TEXTURES=1` compares every reuse. Each second the
+  log prints the capture's copied, compared and reused megabytes per frame.
+- The 3D voices' HRTF filter decodes its taps from a table and computes the
+  resampler's Lagrange weights with fixed denominators: the same samples,
+  bit for bit, at about half the cost.
 - The renderer follows upstream's SDL_GPU backend decision for decision. Two
   GL details were measured on llvmpipe rather than assumed: with
   `glClipControl(UPPER_LEFT)` GL's winding matches D3D's screen winding, and

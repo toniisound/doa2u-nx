@@ -20,7 +20,7 @@ if(NOT NINTENDO_SWITCH)
     message(FATAL_ERROR "Configure with -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake")
 endif()
 
-set(DOA2U_NX_VERSION "0.2.0" CACHE STRING "Version shown in the homebrew menu")
+set(DOA2U_NX_VERSION "0.2.1" CACHE STRING "Version shown in the homebrew menu")
 set(DOA2U_NX_ICON "" CACHE FILEPATH "Optional 256x256 JPEG icon for the .nro")
 
 set(CMAKE_C_STANDARD 11)
