@@ -14,8 +14,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 #endif
 
@@ -67,6 +70,18 @@ void require(bool condition)
 {
     if (!condition) throw std::runtime_error("invalid save journal or path");
 }
+#ifdef __SWITCH__
+/* Name the failing check: the console cannot attach a debugger to find it. */
+void require_at(bool condition, int line, const char *text)
+{
+    if (!condition) {
+        std::fprintf(stderr, "save check failed at save_transaction.cpp:%d: %s (errno %d)\n",
+            line, text, errno);
+        throw std::runtime_error("invalid save journal or path");
+    }
+}
+#define require(condition) require_at((condition), __LINE__, #condition)
+#endif
 
 bool exists_plain(const fs::path &path)
 {
@@ -79,6 +94,31 @@ bool exists_plain(const fs::path &path)
     }
     require((attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0);
     return true;
+#elif defined(__SWITCH__)
+    /* The SD card's FAT has no links; plain stat, since lstat is not wired up.
+       The console's SD driver fails stat on the volume root with EIO (the
+       emulators accept it), so the root counts as present. */
+    if (path == path.root_path()) return true;
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) return true;
+    if (errno == ENOENT || errno == ENOTDIR) return false;
+    /* The driver reports EIO for some paths stat cannot classify; probe them
+       by opening instead, and log which path it was. */
+    const int stat_errno = errno;
+    bool present = false;
+    if (DIR *dir = opendir(path.c_str())) {
+        closedir(dir);
+        present = true;
+    } else {
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            present = true;
+        }
+    }
+    std::fprintf(stderr, "save path stat errno %d: '%s' (%s by open)\n",
+        stat_errno, path.c_str(), present ? "present" : "absent");
+    return present;
 #else
     std::error_code ec;
     auto status = fs::symlink_status(path, ec);
@@ -99,6 +139,9 @@ void check_parents(const fs::path &path)
     fs::path part;
     for (const auto &component : path) {
         part /= component;
+#ifdef __SWITCH__
+        if (part == part.root_path()) continue; // see exists_plain
+#endif
         if (exists_plain(part)) require(fs::is_directory(part));
     }
 }
@@ -180,7 +223,18 @@ void write_file(const fs::path &path, std::string_view data)
    with no rollback. */
 void sync_to_disk(const fs::path &path)
 {
-#ifndef _WIN32
+#if defined(__SWITCH__)
+    // The console's SD filesystem cannot open a directory as a file; sync
+    // files only and leave directory entries to the FAT driver.
+    struct stat st;
+    require(stat(path.c_str(), &st) == 0);
+    if (S_ISDIR(st.st_mode)) return;
+    const int fd = open(path.c_str(), O_RDONLY);
+    require(fd >= 0);
+    const bool synced = fsync(fd) == 0 || errno == ENOSYS || errno == EINVAL;
+    close(fd);
+    require(synced);
+#elif !defined(_WIN32)
     for (const fs::path &target : {path, path.parent_path()}) {
         const int fd = open(target.c_str(), O_RDONLY | O_CLOEXEC);
         require(fd >= 0);

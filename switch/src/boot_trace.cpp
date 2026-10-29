@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Boot tracing for the Switch bring-up. The runner's startup calls below are
+// wrapped at link time (-Wl,--wrap=...), so each step lands in the log and
+// on the boot screen without touching runner.cpp. The guest kernel-call
+// counter shows whether the lifted game is still making progress.
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+
+struct RecompMemoryRegion;
+struct RecompMemoryAccess;
+struct RecompFunctionEntry;
+
+namespace {
+std::atomic<uint64_t> kernel_calls{0};
+}
+
+extern "C" {
+
+uint64_t doa2u_nx_kernel_calls(void)
+{
+    return kernel_calls.load(std::memory_order_relaxed);
+}
+
+// The desktop version gives stderr a 64 KiB buffer and starts a thread that
+// flushes it. On the console stderr is line-buffered instead (nx_main.cpp),
+// so the flush thread is not needed: skip it, it never returned here.
+void __wrap_recomp_install_host_diagnostics(void)
+{
+    std::setvbuf(stderr, nullptr, _IOLBF, 1 << 12);
+    std::fprintf(stderr, "[boot] host diagnostics (Switch: line-buffered stderr)\n");
+}
+
+bool __real_recomp_save_initialize(const char *disc_root);
+bool __wrap_recomp_save_initialize(const char *disc_root)
+{
+    std::fprintf(stderr, "[boot] save init: %s\n", disc_root ? disc_root : "(null)");
+    const bool ok = __real_recomp_save_initialize(disc_root);
+    std::fprintf(stderr, "[boot] save init %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+void __real_recomp_runtime_init(const RecompMemoryRegion *regions, size_t region_count,
+    RecompMemoryAccess *accesses, size_t access_capacity,
+    const RecompFunctionEntry *functions, size_t function_count);
+void __wrap_recomp_runtime_init(const RecompMemoryRegion *regions, size_t region_count,
+    RecompMemoryAccess *accesses, size_t access_capacity,
+    const RecompFunctionEntry *functions, size_t function_count)
+{
+    std::fprintf(stderr, "[boot] xbe mapped; runtime init\n");
+    __real_recomp_runtime_init(regions, region_count, accesses, access_capacity,
+        functions, function_count);
+}
+
+bool __real_recomp_dispatch(uint32_t guest_address);
+bool __wrap_recomp_dispatch(uint32_t guest_address)
+{
+    static bool first = true;
+    if (first) {
+        first = false;
+        std::fprintf(stderr, "[boot] guest entry 0x%08x\n", (unsigned)guest_address);
+    }
+    return __real_recomp_dispatch(guest_address);
+}
+
+void __real_recomp_stop_note_kernel_call(void);
+void __wrap_recomp_stop_note_kernel_call(void)
+{
+    kernel_calls.fetch_add(1, std::memory_order_relaxed);
+    __real_recomp_stop_note_kernel_call();
+}
+
+}
