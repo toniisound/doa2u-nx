@@ -17,6 +17,8 @@ constexpr const void *Draw::*pointer_fields[] = {
 // No readable guest span can exceed the runner's entire 64 MiB RAM region.
 constexpr uint64_t max_span_bytes = 64u * 1024u * 1024u;
 constexpr size_t null_offset = SIZE_MAX;
+bool trust_textures = false;
+D3dCaptureStats stats;
 
 // One pointer reused for thousands of small draws (rain) made a pointer-only key quadratic.
 uint64_t spanKey(const void *source, size_t size)
@@ -62,6 +64,18 @@ void copyCommand(RecompD3dPresenterCommand &to, const RecompD3dPresenterCommand 
 }
 
 } // namespace
+
+D3dCaptureStats d3d_capture_take_stats()
+{
+    const D3dCaptureStats taken = stats;
+    stats = {};
+    return taken;
+}
+
+void D3dCapturePacket::setTrustTextures(bool trust)
+{
+    trust_textures = trust;
+}
 
 RecompD3dPresenterError D3dCapturePacket::add(
     const RecompD3dPresenterCommand &command)
@@ -109,8 +123,14 @@ RecompD3dPresenterError D3dCapturePacket::add(
                 const uint64_t key = spanKey(source, size);
                 const auto range = spans_.equal_range(key);
                 for (auto it = range.first; it != range.second; ++it) {
-                    if (it->second.size == size && (size == 0u ||
-                        std::memcmp(source, payload_.data() + it->second.offset, size) == 0)) {
+                    if (it->second.size != size) continue;
+                    if (trust_textures && i >= 2u && it->second.source == source && it->second.epoch == epoch_) {
+                        stats.trusted_bytes += size;
+                        captured.offsets[i] = it->second.offset;
+                        break;
+                    }
+                    stats.compared_bytes += size;
+                    if (size == 0u || std::memcmp(source, payload_.data() + it->second.offset, size) == 0) {
                         captured.offsets[i] = it->second.offset;
                         break;
                     }
@@ -125,12 +145,14 @@ RecompD3dPresenterError D3dCapturePacket::add(
                 // The allocator leaves new words uninitialized; define the tail before it can be relocated.
                 payload_[offset + words - 1u] = 0u;
                 if (size != 0u) std::memcpy(payload_.data() + offset, source, size);
-                spans_.emplace(key, Span{size, offset});
+                stats.copied_bytes += size;
+                spans_.emplace(key, Span{size, offset, source, epoch_});
                 inserted_keys[inserted_count++] = key;
                 captured.offsets[i] = offset;
             }
         }
         entries_.push_back({{COMMAND, 0u, 0u}, old_command_count});
+        ++stats.commands;
         return RECOMP_D3D_PRESENTER_OK;
     } catch (const std::bad_alloc &) {
     } catch (const std::length_error &) {
@@ -164,11 +186,13 @@ RecompD3dPresenterError D3dCapturePacket::addRecord(
 
 RecompD3dPresenterError D3dCapturePacket::addRelease(uint32_t base, uint32_t size)
 {
+    ++epoch_;
     return addRecord(RELEASE, base, size);
 }
 
 RecompD3dPresenterError D3dCapturePacket::addInvalidate(uint32_t base, uint32_t size)
 {
+    ++epoch_;
     return addRecord(INVALIDATE, base, size);
 }
 

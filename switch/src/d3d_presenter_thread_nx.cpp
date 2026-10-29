@@ -45,7 +45,10 @@ struct PresenterThread {
     unsigned draw_declines = 0;
     bool covered = true;
     // Guest visibility indices: ENDs submitted but unresolved, and the latest count.
-    struct Visibility { unsigned pending = 0; uint32_t pixels = 0; };
+    // resolved: a count exists, so a pending index can answer with the last one.
+    struct Visibility { unsigned pending = 0; uint32_t pixels = 0; bool resolved = false; };
+    // RECOMP_VISIBILITY_WAIT=1 makes the guest wait for every result again.
+    bool visibility_wait = false;
     std::unordered_map<uint32_t, Visibility> visibility;
     // RECOMP_PERF_COUNTER pacing on the game side, reported once per second.
     bool pacing = false;
@@ -180,6 +183,7 @@ bool resolveVisibility(PresenterThread &thread, RecompD3dPresenter *backend)
         const auto found = thread.visibility.find(index);
         if (found != thread.visibility.end() && found->second.pending != 0u) {
             found->second.pixels = pixels;
+            found->second.resolved = true;
             --found->second.pending;
         }
     }
@@ -328,6 +332,11 @@ void notePresent(PresenterThread &thread)
     const uint32_t frames = guest_pacing.frames - 1u;
     std::fprintf(stderr, "recomp performance: present=%llu fps=%.2f frame_ms=%.3f\n",
         static_cast<unsigned long long>(guest_pacing.presents), frames * 1000.0 / elapsed_ms, elapsed_ms / frames);
+    const D3dCaptureStats capture = d3d_capture_take_stats();
+    const double per_frame_mb = 1.0 / (1048576.0 * frames);
+    std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB compared=%.2fMB trusted=%.2fMB\n",
+        double(capture.commands) / frames, capture.copied_bytes * per_frame_mb,
+        capture.compared_bytes * per_frame_mb, capture.trusted_bytes * per_frame_mb);
 #ifdef __SWITCH__
     doa2u_nx_profile_report(frames, elapsed_ms, -1);
 #endif
@@ -354,6 +363,11 @@ RecompD3dPresenterError recomp_d3d_presenter_create(
         thread = std::make_unique<PresenterThread>();
         const char *performance = std::getenv("RECOMP_PERF_COUNTER");
         thread->pacing = performance != nullptr && std::strcmp(performance, "1") == 0;
+        const char *wait = std::getenv("RECOMP_VISIBILITY_WAIT");
+        thread->visibility_wait = wait != nullptr && std::strcmp(wait, "1") == 0;
+        // RECOMP_CAPTURE_COMPARE_TEXTURES=1 compares every texture reuse again.
+        const char *compare = std::getenv("RECOMP_CAPTURE_COMPARE_TEXTURES");
+        D3dCapturePacket::setTrustTextures(compare == nullptr || std::strcmp(compare, "1") != 0);
 #ifdef __SWITCH__
         doa2u_nx_set_next_thread_core(1);  // the renderer gets core 1 to itself
 #endif
@@ -480,7 +494,11 @@ RecompD3dPresenterError recomp_d3d_presenter_visibility_result(
     if (thread.status != RECOMP_D3D_PRESENTER_OK) return thread.status;
     const auto found = thread.visibility.find(index);
     if (found == thread.visibility.end()) return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
-    *complete = found->second.pending == 0u;
+    /* DOA2U reads each test right after ending it and spins until it
+       completes, which costs the GPU round trip every frame (and up to the
+       query timeout in emulators). Once an index has a count, a pending read
+       returns the previous one: the flare it drives lags one result. */
+    *complete = found->second.pending == 0u || (!thread.visibility_wait && found->second.resolved);
     *pixels = found->second.pixels;
     return RECOMP_D3D_PRESENTER_OK;
 }
