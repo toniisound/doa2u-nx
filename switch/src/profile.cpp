@@ -249,6 +249,8 @@ int __wrap_nanosleep(const struct timespec *request, struct timespec *remaining)
 }
 
 uint64_t doa2u_nx_kernel_calls(void); // boot_trace.cpp
+// d3d_backend_gl.cpp; absent from the probe build.
+__attribute__((weak)) const char *doa2u_nx_render_stage(uint64_t *since_ms, uint64_t *count);
 
 // The presenter calls this at each present: the stall watcher's clock and
 // the start of a new window of indirect-call targets.
@@ -340,6 +342,14 @@ static void stallWatcher(void *)
             }
         }
 
+        if (doa2u_nx_render_stage != nullptr) {
+            uint64_t since_ms = 0u, count = 0u;
+            const char *name = doa2u_nx_render_stage(&since_ms, &count);
+            const uint64_t now_ms = static_cast<uint64_t>(armTicksToNs(armGetSystemTick()) / 1000000u);
+            (void)now_ms;
+            std::fprintf(stderr, "[stall] render thread: %s (step %llu)\n", name ? name : "?",
+                (unsigned long long)count);
+        }
         std::fprintf(stderr,
             "[stall] no frame for %.1f s: kernel_calls+%llu lookups=%llu idle=%.0fms "
             "fiber=%p open:%s top:%s hot:%s%s\n",
