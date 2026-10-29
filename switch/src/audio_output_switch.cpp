@@ -102,6 +102,13 @@ std::vector<float> wet_scratch(kPeriodFrames * 2);
 unsigned long long dropped = 0, underruns = 0, submitted_buffers = 0;
 unsigned long long reverb_updates = 0, routing_updates = 0, voice_resets = 0;
 unsigned long long nonzero_buffers = 0;
+// Mixer statistics, logged every 5 s from the mixer thread: what actually
+// reaches the device, so silence can be told apart from a missing device.
+uint32_t stats_periods = 0;
+float stats_peak = 0.0f, stats_input_peak = 0.0f;
+unsigned long long stats_starved_frames = 0, stats_mixed_frames = 0;
+uint32_t stats_voices = 0;
+unsigned long long stats_last_submitted = 0, stats_last_nonzero = 0;
 bool reported_nonzero[kVoiceCount];
 
 void drop(uint32_t slot, const char *reason)
@@ -179,13 +186,19 @@ void mixPeriod(int16_t *out)
     std::memset(wet, 0, sizeof(float) * kPeriodFrames * 2u);
     {
         std::lock_guard<std::mutex> lock(mutex);
+        uint32_t active = 0;
         for (Voice &voice : voices) {
             if (!voice.active || voice.capacity == 0) continue;
+            ++active;
             const double step = static_cast<double>(voice.sample_rate) * voice.ratio / kDeviceRate;
             const float gain = voice.gain;
             const bool voice_wet = voice.wet;
             for (uint32_t f = 0; f < kPeriodFrames; ++f) {
-                if (voice.read + 1.0 >= static_cast<double>(voice.write)) break; // starved
+                if (voice.read + 1.0 >= static_cast<double>(voice.write)) { // starved
+                    stats_starved_frames += kPeriodFrames - f;
+                    break;
+                }
+                ++stats_mixed_frames;
                 const uint64_t base = static_cast<uint64_t>(voice.read);
                 const float frac = static_cast<float>(voice.read - static_cast<double>(base));
                 const float *a = &voice.ring[(base % voice.capacity) * kFrameFloats];
@@ -199,6 +212,11 @@ void mixPeriod(int16_t *out)
                 voice.read += step;
             }
         }
+        if (active > stats_voices) stats_voices = active;
+    }
+    for (uint32_t i = 0; i < kPeriodFrames * 2u; ++i) {
+        const float a = std::fabs(mix[i]);
+        if (a > stats_input_peak) stats_input_peak = a;
     }
     {
         // Once configured the reverb runs every period, so its tail decays
@@ -215,6 +233,30 @@ void mixPeriod(int16_t *out)
         if (s > 1.0f) s = 1.0f;
         if (s < -1.0f) s = -1.0f;
         out[i] = static_cast<int16_t>(s * 32767.0f);
+        const float a = std::fabs(s);
+        if (a > stats_peak) stats_peak = a;
+    }
+    if (++stats_periods >= 5u * kDeviceRate / kPeriodFrames) { // every ~5 s
+        unsigned long long submitted, nonzero, lost, starved_events;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            submitted = submitted_buffers - stats_last_submitted;
+            nonzero = nonzero_buffers - stats_last_nonzero;
+            stats_last_submitted = submitted_buffers;
+            stats_last_nonzero = nonzero_buffers;
+            lost = dropped;
+            starved_events = underruns;
+        }
+        std::fprintf(stderr,
+            "[audio-output] stats 5s: peak_out=%.4f peak_mix=%.4f max_voices=%u "
+            "mixed_frames=%llu starved_frames=%llu submitted=%llu nonzero=%llu "
+            "dropped_total=%llu underruns_total=%llu\n",
+            static_cast<double>(stats_peak), static_cast<double>(stats_input_peak), stats_voices,
+            stats_mixed_frames, stats_starved_frames, submitted, nonzero, lost, starved_events);
+        stats_periods = 0;
+        stats_peak = stats_input_peak = 0.0f;
+        stats_starved_frames = stats_mixed_frames = 0;
+        stats_voices = 0;
     }
 }
 
