@@ -12,9 +12,11 @@
 // Guest-side capture work since the last take, for the performance log.
 struct D3dCaptureStats {
     uint64_t copied_bytes = 0u;     // payload copied out of guest memory
+    uint64_t copied_geometry_bytes = 0u; // the vertex and index part of copied_bytes
     uint64_t compared_bytes = 0u;   // memcmp against an earlier copy in the packet
     uint64_t trusted_bytes = 0u;    // texture reuse accepted without a compare
     uint64_t commands = 0u;
+    double add_ms = 0.0;            // time inside add()
 };
 D3dCaptureStats d3d_capture_take_stats();
 
