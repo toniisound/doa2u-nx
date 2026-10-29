@@ -40,7 +40,10 @@ constexpr uint32_t kMaxBufferBytes = 160000;
 constexpr uint32_t kMinSampleRate = 1000;
 constexpr uint32_t kMaxSampleRate = 200000;
 constexpr float kMaxVolumeLevel = 16777216.0f; // XAUDIO2_MAX_VOLUME_LEVEL
-constexpr uint32_t kPrerollMs = 50;
+// Upstream cushions 50 ms. During bring-up the game pumps DirectSound once a
+// frame and frames still take 100-150 ms, so each voice arrives in bursts that
+// long: a deeper cushion bridges them instead of starving between bursts.
+constexpr uint32_t kPrerollMs = 160;
 constexpr float kRateTrim = 0.01f;
 constexpr uint32_t kDeviceRate = 48000;
 constexpr uint32_t kSpeakers = 2;
@@ -98,6 +101,8 @@ std::vector<float> mix_scratch(kPeriodFrames * 2);
 std::vector<float> wet_scratch(kPeriodFrames * 2);
 unsigned long long dropped = 0, underruns = 0, submitted_buffers = 0;
 unsigned long long reverb_updates = 0, routing_updates = 0, voice_resets = 0;
+unsigned long long nonzero_buffers = 0;
+bool reported_nonzero[kVoiceCount];
 
 void drop(uint32_t slot, const char *reason)
 {
@@ -344,8 +349,9 @@ extern "C" void recomp_audio_output_shutdown(void)
     }
     std::fprintf(stderr,
         "[audio-output] summary submitted_buffers=%llu dropped=%llu underruns=%llu "
-        "voice_resets=%llu reverb_updates=%llu routing_updates=%llu\n",
-        submitted_buffers, dropped, underruns, voice_resets, reverb_updates, routing_updates);
+        "voice_resets=%llu reverb_updates=%llu routing_updates=%llu nonzero=%llu\n",
+        submitted_buffers, dropped, underruns, voice_resets, reverb_updates, routing_updates,
+        nonzero_buffers);
 }
 
 extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
@@ -514,4 +520,27 @@ extern "C" void recomp_audio_output_submit(
     }
     voice.submitted += frames;
     ++submitted_buffers;
+
+    // As audio_output_sdl.cpp: name the first submission and each voice's
+    // first audible one, so the log shows whether the game produces sound.
+    bool nonzero = false;
+    if (bits_per_sample == 32) {
+        for (uint32_t i = 0; i < bytes && !nonzero; i += 4u) {
+            float sample;
+            std::memcpy(&sample, pcm + i, sizeof sample);
+            nonzero = sample != 0.0f;
+        }
+    } else {
+        const uint8_t silence = bits_per_sample == 8 ? 0x80 : 0;
+        for (uint32_t i = 0; i < bytes && !nonzero; ++i) nonzero = pcm[i] != silence;
+    }
+    if (nonzero) ++nonzero_buffers;
+    if (submitted_buffers == 1 || (nonzero && !reported_nonzero[slot])) {
+        std::fprintf(stderr,
+            "[audio-output] submitted slot=%u bytes=%u rate=%u channels=%u bits=%u "
+            "nonzero=%u gain=%.6f routed=%u wet=%u\n",
+            slot, bytes, sample_rate, channels, bits_per_sample, nonzero ? 1u : 0u,
+            static_cast<double>(voice.gain), voice.routed ? 1u : 0u, voice.wet ? 1u : 0u);
+    }
+    if (nonzero) reported_nonzero[slot] = true;
 }
