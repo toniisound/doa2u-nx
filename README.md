@@ -100,7 +100,8 @@ the game installs to its hard disk (about 700 MB) into
 skip it. Saves go to `disc/.recomp-storage`, every character and costume
 starts unlocked, and each boot rewrites `sdmc:/switch/doa2u-nx/doa2u-nx.log`.
 
-Buttons held at launch:
+Options: for 2 seconds after launch the screen lists them; press a button to
+turn its option on (A starts at once).
 
 | Button | Effect |
 |---|---|
