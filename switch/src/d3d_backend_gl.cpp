@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -66,6 +67,29 @@
 #ifdef __SWITCH__
 extern "C" void doa2u_nx_release_console(void); // nx_main.cpp
 #endif
+
+/* What the render thread is doing, for the Switch stall watcher (profile.cpp):
+   a stuck GL call shows up by name. Set without locks; read racily. */
+namespace {
+std::atomic<const char *> render_stage{"idle"};
+std::atomic<uint64_t> render_stage_since_ms{0};
+std::atomic<uint64_t> render_stage_count{0};
+
+void stage(const char *name)
+{
+    render_stage.store(name, std::memory_order_relaxed);
+    render_stage_since_ms.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()), std::memory_order_relaxed);
+    render_stage_count.fetch_add(1u, std::memory_order_relaxed);
+}
+} // namespace
+
+extern "C" const char *doa2u_nx_render_stage(uint64_t *since_ms, uint64_t *count)
+{
+    if (since_ms) *since_ms = render_stage_since_ms.load(std::memory_order_relaxed);
+    if (count) *count = render_stage_count.load(std::memory_order_relaxed);
+    return render_stage.load(std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -955,7 +979,9 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
             desc.height > kMaxTextureSize || texel_bytes == 0u ||
             texels * texel_bytes > draw.texture_byte_count) return 0u;
     }
+    stage("texture upload");
     const GLuint texture = uploadTexture(presenter, desc, draw, volume, linear_bgra, palettized, compressed, levels);
+    stage("draw");
     if (texture == 0u) return 0u;
 
     // FIFO eviction, as upstream.
@@ -1043,6 +1069,7 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
     const auto found = presenter->programs.find(key);
     if (found != presenter->programs.end()) return found->second;
     const auto start = std::chrono::steady_clock::now();
+    stage("draw shader compile");
     ProgramEntry entry;
     std::string hlsl;
     if (drawShaderSource(draw_key, entry.layout, hlsl)) {
@@ -1302,6 +1329,7 @@ uint32_t appendAligned(std::vector<uint8_t> &data, const void *bytes, size_t siz
 uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const std::vector<uint8_t> &bytes,
     uint32_t alignment)
 {
+    stage("upload ring");
     glBindBuffer(GL_COPY_WRITE_BUFFER, buffer);
     const uint32_t size = static_cast<uint32_t>(bytes.size());
     uint32_t base = (used + alignment - 1u) / alignment * alignment;
@@ -1321,6 +1349,7 @@ void flushSegment(RecompD3dPresenter *presenter)
         releaseRetiredTextures(presenter);
         return;
     }
+    stage("flush segment");
     if (segment.vertex_data.size() > kVertexRingBytes || segment.index_data.size() > kIndexRingBytes ||
         segment.uniform_data.size() > kUniformRingBytes) {
         std::fprintf(stderr, "recomp d3d presenter: dropped %zu draws: segment exceeds the upload rings\n",
@@ -1415,6 +1444,7 @@ void flushSegment(RecompD3dPresenter *presenter)
         }
         glBindVertexArray(0u);
         glDisable(GL_SCISSOR_TEST);
+        stage("segment drawn");
     }
     segment.draws.clear();
     segment.vertex_data.clear();
@@ -1664,6 +1694,7 @@ RecompD3dPresenterError endVisibility(RecompD3dPresenter *presenter, uint32_t in
         flushSegment(presenter);
         glEndQuery(GL_SAMPLES_PASSED);
         // The result is polled later; flushing lets the GPU finish it meanwhile.
+        stage("glFlush (visibility end)");
         glFlush();
     }
     presenter->visibility_pending.push_back(query);
@@ -2193,7 +2224,9 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
                 presenter->present_count);
         }
     }
+    stage("eglSwapBuffers");
     eglSwapBuffers(presenter->display, presenter->surface);
+    stage("present done");
 
     /* Keep the presented guest frame for GetBackBuffer(-1) once a draw has used it. */
     if (presenter->previous_frame != 0u) copyGuestBuffer(presenter, presenter->previous_frame);
@@ -2448,6 +2481,9 @@ RecompD3dPresenterError d3d_backend_submit(RecompD3dPresenter *presenter, const 
     if (owner != RECOMP_D3D_PRESENTER_OK) return owner;
     if (presenter->close_requested) return RECOMP_D3D_PRESENTER_CLOSED;
     if (command == nullptr) return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    static const char *const names[] = {"clear", "present", "draw", "gamma", "visibility begin",
+        "visibility end", "coverage", "copy main color"};
+    stage(static_cast<unsigned>(command->type) < 8u ? names[command->type] : "command");
     switch (command->type) {
     case RECOMP_D3D_PRESENTER_COMMAND_GAMMA:
         return submitGamma(presenter, command->data.gamma);
@@ -2619,6 +2655,7 @@ RecompD3dPresenterError d3d_backend_release_memory(
 {
     const RecompD3dPresenterError owner = checkOwner(presenter);
     if (owner != RECOMP_D3D_PRESENTER_OK) return owner;
+    stage(targets ? "release memory" : "invalidate textures");
     if (base >= 0x80000000u && base < 0x84000000u) base -= 0x80000000u;
     const uint64_t end = static_cast<uint64_t>(base) + size;
     if (size == 0u || end > 0x100000000ull) return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
@@ -2695,9 +2732,14 @@ D3dBackendVisibilityPoll d3d_backend_poll_visibility(RecompD3dPresenter *present
     GLuint samples = 0u;
     if (front.query != 0u) {
         GLuint available = GL_FALSE;
+        stage("visibility poll");
         glGetQueryObjectuiv(front.query, GL_QUERY_RESULT_AVAILABLE, &available);
-        if (!available) return D3D_BACKEND_VISIBILITY_PENDING;
+        if (!available) {
+            stage("idle");
+            return D3D_BACKEND_VISIBILITY_PENDING;
+        }
         glGetQueryObjectuiv(front.query, GL_QUERY_RESULT, &samples);
+        stage("idle");
         presenter->free_queries.push_back(front.query);
     }
     *index = front.index;
