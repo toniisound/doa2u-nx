@@ -11,6 +11,11 @@
 //
 // Guest threads are fibers on one host thread. Each fiber keeps its own scope
 // stack, and time spent switched out is excluded from the scopes left open.
+//
+// A stall watcher on another core reports when no frame has been presented
+// for 3 s: where the time went since the last frame, the scopes open on the
+// guest thread and the indirect-call targets the guest keeps resolving, which
+// name the loop it is stuck in.
 #include <switch.h>
 
 #include <time.h>
@@ -66,6 +71,25 @@ uint64_t idle_ticks = 0;
 uint64_t lookup_ticks = 0;
 uint64_t lookup_calls = 0;
 uint64_t lost_scopes = 0;
+
+// Indirect-call targets seen since the last frame (stall diagnosis).
+constexpr int kTargets = 1024;
+struct TargetCount { uint32_t address; uint32_t count; };
+TargetCount targets[kTargets];
+uint64_t target_overflow = 0;
+volatile uint64_t last_present_tick = 0;
+uint64_t frame_lookups = 0;  // lookups since the last frame
+Thread stall_thread;
+
+void noteTarget(uint32_t address)
+{
+    uint32_t h = (address * 2654435761u) >> 22; // 10 bits
+    for (int probe = 0; probe < 16; ++probe, h = (h + 1) & (kTargets - 1)) {
+        if (targets[h].address == address) { ++targets[h].count; return; }
+        if (targets[h].count == 0) { targets[h].address = address; targets[h].count = 1; return; }
+    }
+    ++target_overflow;
+}
 
 inline uint64_t now() { return armGetSystemTick(); }
 
@@ -193,6 +217,8 @@ RecompFunction __real_recomp_program_lookup(uint32_t guest_address);
 RecompFunction __wrap_recomp_program_lookup(uint32_t guest_address)
 {
     if (!onGuestThread()) return __real_recomp_program_lookup(guest_address);
+    noteTarget(guest_address);
+    ++frame_lookups;
     enter(-2);
     RecompFunction function = __real_recomp_program_lookup(guest_address);
     leave();
@@ -222,6 +248,111 @@ int __wrap_nanosleep(const struct timespec *request, struct timespec *remaining)
     return rc;
 }
 
+uint64_t doa2u_nx_kernel_calls(void); // boot_trace.cpp
+
+// The presenter calls this at each present: the stall watcher's clock and
+// the start of a new window of indirect-call targets.
+void doa2u_nx_profile_note_present(void)
+{
+    last_present_tick = now();
+    std::memset(targets, 0, sizeof targets);
+    target_overflow = 0;
+    frame_lookups = 0;
+}
+
+static void stallWatcher(void *)
+{
+    const double tick_ms = 1000.0 / armGetSystemTickFreq();
+    uint64_t reported_for = 0, last_report = 0;
+    uint64_t kernel_base = 0, idle_base = 0, lookup_base = 0;
+    static uint64_t slot_base[kSlots];
+    for (;;) {
+        svcSleepThread(1'000'000'000);
+        const uint64_t present = last_present_tick;
+        if (present == 0) continue;
+        const uint64_t t = now();
+        const double since_ms = (t - present) * tick_ms;
+        if (since_ms < 3000.0) continue;
+        // One report when a stall starts, then one every 10 s while it lasts.
+        if (reported_for == present && (t - last_report) * tick_ms < 10000.0) continue;
+        const bool first = reported_for != present;
+        reported_for = present;
+        last_report = t;
+        if (first) {
+            kernel_base = 0;
+            idle_base = 0;
+            lookup_base = 0;
+            std::memset(slot_base, 0, sizeof slot_base);
+        }
+
+        // Racy snapshot of the guest thread's counters: diagnosis only.
+        const uint64_t kernel = doa2u_nx_kernel_calls();
+        const uint64_t idle = idle_ticks, lookups = frame_lookups;
+        int order[kSlots];
+        uint64_t delta[kSlots];
+        const int count = slot_count;
+        for (int i = 0; i < count; ++i) {
+            order[i] = i;
+            delta[i] = slots[i].ticks - slot_base[i];
+            slot_base[i] = slots[i].ticks;
+        }
+        std::sort(order, order + count, [&](int a, int b) { return delta[a] > delta[b]; });
+        char top[384];
+        int used = 0;
+        for (int i = 0; i < count && i < 6 && used < (int)sizeof top; ++i) {
+            const Slot &sl = slots[order[i]];
+            if (delta[order[i]] == 0) break;
+            used += std::snprintf(top + used, sizeof top - used, " %s%08x=%.0fms",
+                sl.kind == KIND_KERNEL ? "k" : "", (unsigned)sl.address, delta[order[i]] * tick_ms);
+        }
+
+        TargetCount hot[8] = {};
+        for (const TargetCount &tc : targets) {
+            if (tc.count == 0) continue;
+            for (int i = 0; i < 8; ++i) {
+                if (tc.count > hot[i].count) {
+                    for (int j = 7; j > i; --j) hot[j] = hot[j - 1];
+                    hot[i] = tc;
+                    break;
+                }
+            }
+        }
+        char hot_text[256];
+        int hot_used = 0;
+        for (const TargetCount &tc : hot) {
+            if (tc.count == 0 || hot_used >= (int)sizeof hot_text) break;
+            hot_used += std::snprintf(hot_text + hot_used, sizeof hot_text - hot_used,
+                " %08x/%u", (unsigned)tc.address, (unsigned)tc.count);
+        }
+
+        char open[256];
+        int open_used = 0;
+        const FiberStack *stack = current_stack;
+        const int depth = stack->depth < kDepth ? stack->depth : kDepth;
+        for (int i = 0; i < depth && open_used < (int)sizeof open; ++i) {
+            const int slot = stack->scopes[i].slot;
+            if (slot >= 0) {
+                open_used += std::snprintf(open + open_used, sizeof open - open_used, " %s%08x",
+                    slots[slot].kind == KIND_KERNEL ? "k" : "", (unsigned)slots[slot].address);
+            } else {
+                open_used += std::snprintf(open + open_used, sizeof open - open_used,
+                    slot == -1 ? " idle" : " lookup");
+            }
+        }
+
+        std::fprintf(stderr,
+            "[stall] no frame for %.1f s: kernel_calls+%llu lookups=%llu idle=%.0fms "
+            "fiber=%p open:%s top:%s hot:%s%s\n",
+            since_ms / 1000.0, (unsigned long long)(kernel - kernel_base),
+            (unsigned long long)(lookups - lookup_base), (idle - idle_base) * tick_ms,
+            stack->fiber, depth ? open : " (none)", used ? top : " (none)",
+            hot_used ? hot_text : " (none)", target_overflow ? " (+overflow)" : "");
+        kernel_base = kernel;
+        idle_base = idle;
+        lookup_base = lookups;
+    }
+}
+
 // The guest runs on the thread that calls recomp_runner_main.
 void doa2u_nx_profile_start(void)
 {
@@ -229,6 +360,10 @@ void doa2u_nx_profile_start(void)
     guest_thread = threadGetCurHandle();
     fiber_stacks[0].fiber = nullptr;
     current_stack = &fiber_stacks[0];
+    // Core 2 hosts the audio mixer and the log flusher, both light.
+    if (R_SUCCEEDED(threadCreate(&stall_thread, stallWatcher, nullptr, nullptr, 0x8000, 0x2E, 2))) {
+        threadStart(&stall_thread);
+    }
 }
 
 // Called once a second by the presenter with the frames and wall time of
