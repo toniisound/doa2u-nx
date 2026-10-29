@@ -265,7 +265,23 @@ struct PendingQuery {
     uint32_t index = 0u;
     GLuint query = 0u;  // 0: nothing was drawn while it was open
     float host_pixels_per_guest_pixel = 1.0f;
+    std::chrono::steady_clock::time_point ended{};
 };
+
+/* How long a query may report itself unavailable before the result is read
+   with a blocking call (RECOMP_GL_QUERY_TIMEOUT_MS, default 50). The guest
+   polls GetVisibilityTestResult in a loop, so a result that never reports
+   available would hang it: Eden's GPU emulation was seen never marking
+   nouveau's non-blocking occlusion result ready, while a blocking read waits
+   for the GPU's fence, which it does signal. */
+std::chrono::milliseconds queryTimeout()
+{
+    static const long ms = [] {
+        const char *value = std::getenv("RECOMP_GL_QUERY_TIMEOUT_MS");
+        return value != nullptr && value[0] != '\0' ? std::strtol(value, nullptr, 10) : 50L;
+    }();
+    return std::chrono::milliseconds(ms < 0 ? 0 : ms);
+}
 
 struct FramebufferKey {
     GLuint color, depth;
@@ -1690,6 +1706,7 @@ RecompD3dPresenterError endVisibility(RecompD3dPresenter *presenter, uint32_t in
     presenter->visibility_active = {};
     query.index = index;
     query.host_pixels_per_guest_pixel = last.scale_x * last.scale_y;
+    query.ended = std::chrono::steady_clock::now();
     if (query.query != 0u) {
         flushSegment(presenter);
         glEndQuery(GL_SAMPLES_PASSED);
@@ -2735,8 +2752,16 @@ D3dBackendVisibilityPoll d3d_backend_poll_visibility(RecompD3dPresenter *present
         stage("visibility poll");
         glGetQueryObjectuiv(front.query, GL_QUERY_RESULT_AVAILABLE, &available);
         if (!available) {
-            stage("idle");
-            return D3D_BACKEND_VISIBILITY_PENDING;
+            if (std::chrono::steady_clock::now() - front.ended < queryTimeout()) {
+                stage("idle");
+                return D3D_BACKEND_VISIBILITY_PENDING;
+            }
+            static unsigned forced;
+            if (forced++ < 4u) {
+                std::fprintf(stderr, "recomp d3d presenter: visibility index=%u not available after %lld ms;"
+                    " reading it blocking\n", front.index, static_cast<long long>(queryTimeout().count()));
+            }
+            stage("visibility read (blocking)");
         }
         glGetQueryObjectuiv(front.query, GL_QUERY_RESULT, &samples);
         stage("idle");
