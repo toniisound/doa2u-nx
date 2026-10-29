@@ -26,6 +26,7 @@
 
 extern "C" void doa2u_nx_presenter_took_console(void); // nx_main.cpp
 extern "C" void doa2u_nx_profile_report(uint32_t frames, double wall_ms, int console_row); // profile.cpp
+extern "C" void doa2u_nx_profile_note_present(void); // profile.cpp
 
 struct RecompD3dPresenter {
     uint32_t width = 0;
@@ -183,6 +184,7 @@ RecompD3dPresenterError d3d_backend_submit(
         return RECOMP_D3D_PRESENTER_OK;
     case RECOMP_D3D_PRESENTER_COMMAND_PRESENT:
         ++presenter->present_count;
+        doa2u_nx_profile_note_present();
         pollHost(presenter);
         reportPerformance(presenter);
         return presenter->close_requested ? RECOMP_D3D_PRESENTER_CLOSED
