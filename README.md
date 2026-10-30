@@ -55,11 +55,14 @@ not yet been measured on the console.
   and spins until it completes, so once an index has a result, a pending read
   returns the previous one (the lens flare it drives lags one result) instead
   of stalling the game on the GPU. `RECOMP_VISIBILITY_WAIT=1` restores waiting.
-- Within one frame, a texture already captured from the same address (with no
-  re-registration or release since) is reused without comparing its bytes
-  again; vertices and indices are always compared.
-  `RECOMP_CAPTURE_COMPARE_TEXTURES=1` compares every reuse. Each second the
-  log prints the capture's copied, compared and reused megabytes per frame.
+- Textures are not copied into the frame's command packet: the render thread
+  reads them from guest memory, as the Xbox GPU did (a texture the game
+  rewrites while a frame is in flight can show the new bytes a frame early).
+  `RECOMP_CAPTURE_COPY_TEXTURES=1` copies them again; then a texture captured
+  twice in a frame from the same address is reused without a second compare
+  (`RECOMP_CAPTURE_COMPARE_TEXTURES=1` compares it). Vertices and indices
+  are always copied. Each second the log prints the capture's copied,
+  compared, reused and direct megabytes per frame and its time.
 - The 3D voices' HRTF filter decodes its taps from a table and computes the
   resampler's Lagrange weights with fixed denominators: the same samples,
   bit for bit, at about half the cost.

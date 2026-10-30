@@ -15,6 +15,7 @@ struct D3dCaptureStats {
     uint64_t copied_geometry_bytes = 0u; // the vertex and index part of copied_bytes
     uint64_t compared_bytes = 0u;   // memcmp against an earlier copy in the packet
     uint64_t trusted_bytes = 0u;    // texture reuse accepted without a compare
+    uint64_t direct_bytes = 0u;     // textures passed as guest pointers, not copied
     uint64_t commands = 0u;
     double add_ms = 0.0;            // time inside add()
 };
@@ -26,6 +27,9 @@ public:
     // at the same address, with no texture invalidation or memory release
     // since, are reused without comparing their bytes again. Off by default.
     static void setTrustTextures(bool trust);
+    // Texture spans keep pointing at guest memory instead of being copied:
+    // the consumer reads them while the guest runs on. Off by default.
+    static void setDirectTextures(bool direct);
 
     enum Kind : uint32_t { COMMAND, RELEASE, REPORT, INVALIDATE };
     struct Record { Kind kind; uint32_t base; uint32_t size; };
@@ -74,6 +78,7 @@ private:
         CapturedCommand() {} // Skip zeroing: add() writes every field it uses.
         alignas(8) RecompD3dPresenterCommand value;
         size_t offsets[8];
+        const void *direct[8];  // used where offsets[i] == direct_offset
     };
     struct Span { size_t size; size_t offset; const void *source; uint32_t epoch; };
 

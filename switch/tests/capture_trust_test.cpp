@@ -75,11 +75,28 @@ bool run(bool trust)
     return ok;
 }
 
+bool runDirect()
+{
+    D3dCapturePacket::setDirectTextures(true);
+    unsigned char vb[64], tex[256];
+    std::memset(vb, 1, sizeof vb);
+    std::memset(tex, 2, sizeof tex);
+    D3dCapturePacket packet;
+    bool ok = check(packet.add(draw(vb, tex)) == RECOMP_D3D_PRESENTER_OK, "direct add");
+    packet.seal();
+    ok &= check(texture(packet, 0u) == tex, "direct texture points at the source");
+    ok &= check(vertices(packet, 0u) != vb && vertices(packet, 0u)[0] == 1, "vertices are still copied");
+    const D3dCaptureStats stats = d3d_capture_take_stats();
+    ok &= check(stats.direct_bytes == sizeof tex && stats.copied_bytes == sizeof vb, "direct stats");
+    D3dCapturePacket::setDirectTextures(false);
+    return ok;
+}
+
 } // namespace
 
 int main()
 {
-    const bool ok = run(false) && run(true);
+    const bool ok = run(false) && run(true) && runDirect();
     std::printf(ok ? "PASS capture trust\n" : "FAIL capture trust\n");
     return ok ? 0 : 1;
 }

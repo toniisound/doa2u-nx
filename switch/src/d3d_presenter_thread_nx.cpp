@@ -335,10 +335,10 @@ void notePresent(PresenterThread &thread)
     const D3dCaptureStats capture = d3d_capture_take_stats();
     const double per_frame_mb = 1.0 / (1048576.0 * frames);
     std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB (geometry %.2fMB)"
-        " compared=%.2fMB trusted=%.2fMB add=%.2fms\n",
+        " compared=%.2fMB trusted=%.2fMB direct=%.2fMB add=%.2fms\n",
         double(capture.commands) / frames, capture.copied_bytes * per_frame_mb,
         capture.copied_geometry_bytes * per_frame_mb, capture.compared_bytes * per_frame_mb,
-        capture.trusted_bytes * per_frame_mb, capture.add_ms / frames);
+        capture.trusted_bytes * per_frame_mb, capture.direct_bytes * per_frame_mb, capture.add_ms / frames);
 #ifdef __SWITCH__
     doa2u_nx_profile_report(frames, elapsed_ms, -1);
 #endif
@@ -370,6 +370,9 @@ RecompD3dPresenterError recomp_d3d_presenter_create(
         // RECOMP_CAPTURE_COMPARE_TEXTURES=1 compares every texture reuse again.
         const char *compare = std::getenv("RECOMP_CAPTURE_COMPARE_TEXTURES");
         D3dCapturePacket::setTrustTextures(compare == nullptr || std::strcmp(compare, "1") != 0);
+        // RECOMP_CAPTURE_COPY_TEXTURES=1 copies textures into each packet again.
+        const char *copy = std::getenv("RECOMP_CAPTURE_COPY_TEXTURES");
+        D3dCapturePacket::setDirectTextures(copy == nullptr || std::strcmp(copy, "1") != 0);
 #ifdef __SWITCH__
         doa2u_nx_set_next_thread_core(1);  // the renderer gets core 1 to itself
 #endif
