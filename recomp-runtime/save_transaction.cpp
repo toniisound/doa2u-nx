@@ -515,6 +515,12 @@ bool check_journal()
         /* An upgrade interrupted before its rename leaves version.tmp. */
         require(name == "version" || name == "lock" || name == "undo" ||
             (legacy && name == "version.tmp"));
+#ifdef __SWITCH__
+        /* This process holds the lock open for writing, and Horizon refuses
+           to open a file that is open for writing, which libnx's stat does;
+           it is the file this process created, so there is nothing to check. */
+        if (name == "lock") continue;
+#endif
         require(exists_plain(entry.path()) && fs::is_regular_file(entry.path()));
     }
     return legacy;
