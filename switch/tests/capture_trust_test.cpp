@@ -92,11 +92,36 @@ bool runDirect()
     return ok;
 }
 
+// Program draws copy the used program slots and everything after the array.
+bool runProgram()
+{
+    unsigned char vb[64];
+    std::memset(vb, 1, sizeof vb);
+    RecompD3dPresenterCommand command = draw(vb, nullptr);
+    command.data.draw.texture_byte_count = 0u;
+    command.data.draw.program_count = 2u;
+    command.data.draw.program[0][0] = 11u;
+    command.data.draw.program[1][3] = 22u;
+    command.data.draw.program_constants[191][3] = 3.5f;
+    command.data.draw.program_alpha_mask = true;
+    command.data.draw.reflection_stage2_byte_count = 0u;
+    command.data.draw.texture_factor = 0x12345678u;
+    D3dCapturePacket packet;
+    bool ok = check(packet.add(command) == RECOMP_D3D_PRESENTER_OK, "program add");
+    packet.seal();
+    const RecompD3dPresenterDrawCommand &out = packet.command(0u).data.draw;
+    ok &= check(out.program_count == 2u && out.program[0][0] == 11u && out.program[1][3] == 22u, "program slots");
+    ok &= check(out.program_constants[191][3] == 3.5f, "program constants");
+    ok &= check(out.program_alpha_mask && out.texture_factor == 0x12345678u, "fields after the program");
+    d3d_capture_take_stats();
+    return ok;
+}
+
 } // namespace
 
 int main()
 {
-    const bool ok = run(false) && run(true) && runDirect();
+    const bool ok = run(false) && run(true) && runDirect() && runProgram();
     std::printf(ok ? "PASS capture trust\n" : "FAIL capture trust\n");
     return ok ? 0 : 1;
 }
