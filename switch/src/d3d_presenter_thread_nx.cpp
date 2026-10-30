@@ -168,6 +168,14 @@ void execute(PresenterThread &thread, RecompD3dPresenter *backend,
     }
 }
 
+// Names the worker's own waits in the backend's per-stage timing (weak: a
+// backend without stage timing leaves it unset).
+extern "C" __attribute__((weak)) void doa2u_nx_render_stage_set(const char *name);
+void renderStage(const char *name)
+{
+    if (doa2u_nx_render_stage_set != nullptr) doa2u_nx_render_stage_set(name);
+}
+
 // Publishes every resolved query; returns true while one is still pending.
 bool resolveVisibility(PresenterThread &thread, RecompD3dPresenter *backend)
 {
@@ -220,6 +228,7 @@ void run(PresenterThread &thread, RecompD3dPresenterConfig config)
         if (packet == nullptr) {
             // Resolve queries off the GPU while idle, polling until none remain.
             if (querying) querying = resolveVisibility(thread, backend);
+            renderStage("wait for the game");
             std::unique_lock<std::mutex> lock(thread.mutex);
             if (querying) {
                 thread.wake.wait_for(lock, std::chrono::milliseconds(1), [&] { return thread.woken; });
@@ -229,6 +238,7 @@ void run(PresenterThread &thread, RecompD3dPresenterConfig config)
             thread.woken = false;
             continue;
         }
+        renderStage("packet");
         execute(thread, backend, *packet);
         packet->clear();
         querying = resolveVisibility(thread, backend);

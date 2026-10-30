@@ -75,14 +75,74 @@ std::atomic<const char *> render_stage{"idle"};
 std::atomic<uint64_t> render_stage_since_ms{0};
 std::atomic<uint64_t> render_stage_count{0};
 
+/* Time per stage on the calling thread (the render thread), so the log can
+   say where its frame goes: each stage runs until the next one starts. */
+struct StageTime { const char *name; double ms; };
+thread_local StageTime stage_times[24];
+thread_local unsigned stage_time_count = 0u;
+thread_local const char *timed_stage = nullptr;
+thread_local std::chrono::steady_clock::time_point timed_since{};
+
 void stage(const char *name)
 {
+    const auto now = std::chrono::steady_clock::now();
+    if (timed_stage != nullptr) {
+        const double ms = std::chrono::duration<double, std::milli>(now - timed_since).count();
+        unsigned i = 0u;
+        while (i < stage_time_count && stage_times[i].name != timed_stage) ++i;
+        if (i == stage_time_count && i < 24u) stage_times[stage_time_count++] = {timed_stage, 0.0};
+        if (i < 24u) stage_times[i].ms += ms;
+    }
+    timed_stage = name;
+    timed_since = now;
     render_stage.store(name, std::memory_order_relaxed);
     render_stage_since_ms.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count()), std::memory_order_relaxed);
+        now.time_since_epoch()).count()), std::memory_order_relaxed);
     render_stage_count.fetch_add(1u, std::memory_order_relaxed);
 }
+
+/* Once a second: the render thread's milliseconds per presented frame by
+   stage, largest first, with draws and GL segments per frame. */
+struct RenderReport {
+    std::chrono::steady_clock::time_point start{};
+    unsigned frames = 0u;
+    uint64_t draws = 0u, segments = 0u, texture_uploads = 0u;
+} render_report;
+
+void noteRenderFrame()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (render_report.frames++ == 0u) {
+        render_report.start = now;
+        stage_time_count = 0u;
+        render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
+        return;
+    }
+    const double elapsed = std::chrono::duration<double, std::milli>(now - render_report.start).count();
+    if (elapsed < 1000.0) return;
+    const unsigned frames = render_report.frames - 1u;
+    StageTime sorted[24];
+    std::copy(stage_times, stage_times + stage_time_count, sorted);
+    std::sort(sorted, sorted + stage_time_count, [](const StageTime &a, const StageTime &b) { return a.ms > b.ms; });
+    char line[640];
+    int used = std::snprintf(line, sizeof line, "recomp render: per frame %.2fms draws=%.0f segments=%.1f uploads=%.1f |",
+        elapsed / frames, double(render_report.draws) / frames, double(render_report.segments) / frames,
+        double(render_report.texture_uploads) / frames);
+    for (unsigned i = 0u; i < stage_time_count && i < 8u && used > 0 && used < int(sizeof line); ++i)
+        used += std::snprintf(line + used, sizeof line - used, " %s=%.2f", sorted[i].name, sorted[i].ms / frames);
+    std::fprintf(stderr, "%s\n", line);
+    render_report.frames = 1u;
+    render_report.start = now;
+    stage_time_count = 0u;
+    render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
+}
 } // namespace
+
+/* The presenter thread names its own waits (d3d_presenter_thread_nx.cpp). */
+extern "C" void doa2u_nx_render_stage_set(const char *name)
+{
+    stage(name);
+}
 
 extern "C" const char *doa2u_nx_render_stage(uint64_t *since_ms, uint64_t *count)
 {
@@ -996,6 +1056,7 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
             texels * texel_bytes > draw.texture_byte_count) return 0u;
     }
     stage("texture upload");
+    ++render_report.texture_uploads;
     const GLuint texture = uploadTexture(presenter, desc, draw, volume, linear_bgra, palettized, compressed, levels);
     stage("draw");
     if (texture == 0u) return 0u;
@@ -1366,6 +1427,8 @@ void flushSegment(RecompD3dPresenter *presenter)
         return;
     }
     stage("flush segment");
+    ++render_report.segments;
+    render_report.draws += segment.draws.size();
     if (segment.vertex_data.size() > kVertexRingBytes || segment.index_data.size() > kIndexRingBytes ||
         segment.uniform_data.size() > kUniformRingBytes) {
         std::fprintf(stderr, "recomp d3d presenter: dropped %zu draws: segment exceeds the upload rings\n",
@@ -2244,6 +2307,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     stage("eglSwapBuffers");
     eglSwapBuffers(presenter->display, presenter->surface);
     stage("present done");
+    noteRenderFrame();
 
     /* Keep the presented guest frame for GetBackBuffer(-1) once a draw has used it. */
     if (presenter->previous_frame != 0u) copyGuestBuffer(presenter, presenter->previous_frame);
