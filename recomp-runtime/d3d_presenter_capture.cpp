@@ -18,7 +18,9 @@ constexpr const void *Draw::*pointer_fields[] = {
 // No readable guest span can exceed the runner's entire 64 MiB RAM region.
 constexpr uint64_t max_span_bytes = 64u * 1024u * 1024u;
 constexpr size_t null_offset = SIZE_MAX;
+constexpr size_t direct_offset = SIZE_MAX - 1u;
 bool trust_textures = false;
+bool direct_textures = false;
 D3dCaptureStats stats;
 
 // One pointer reused for thousands of small draws (rain) made a pointer-only key quadratic.
@@ -78,6 +80,11 @@ void D3dCapturePacket::setTrustTextures(bool trust)
     trust_textures = trust;
 }
 
+void D3dCapturePacket::setDirectTextures(bool direct)
+{
+    direct_textures = direct;
+}
+
 namespace {
 struct AddTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -132,6 +139,12 @@ RecompD3dPresenterError D3dCapturePacket::add(
                 if (source == nullptr || (command.type == RECOMP_D3D_PRESENTER_COMMAND_DRAW_COVERAGE && i >= 2u)) continue;
 
                 const size_t size = static_cast<size_t>(sizes[i]);
+                if (direct_textures && i >= 2u) {
+                    stats.direct_bytes += size;
+                    captured.offsets[i] = direct_offset;
+                    captured.direct[i] = source;
+                    continue;
+                }
                 const uint64_t key = spanKey(source, size);
                 const auto range = spans_.equal_range(key);
                 for (auto it = range.first; it != range.second; ++it) {
@@ -221,8 +234,9 @@ void D3dCapturePacket::seal()
         if (captured.value.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW &&
             captured.value.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW_COVERAGE) continue;
         for (size_t i = 0u; i < 8u; ++i) {
-            captured.value.data.draw.*pointer_fields[i] = captured.offsets[i] == null_offset
-                ? nullptr : payload_.data() + captured.offsets[i];
+            const size_t offset = captured.offsets[i];
+            captured.value.data.draw.*pointer_fields[i] = offset == null_offset ? nullptr
+                : offset == direct_offset ? captured.direct[i] : payload_.data() + offset;
         }
     }
     sealed_ = true;
