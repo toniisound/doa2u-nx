@@ -1425,8 +1425,17 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     if (!points && !quads && !line_strip && primitive != 2u && (primitive < 5u || primitive > 7u))
         recomp_stop(2, "d3d8:draw-primitive:%u", primitive);
     if (triangles == 0u) return;
-    RecompD3dPresenterCommand command = {0};
+    /* Everything but the vertex program starts zeroed: its 136 slots are 5 KB
+       of the 8 KB command, consumers read only program_count of them and
+       attach_program writes exactly those (zeroing them cost every draw). */
+    RecompD3dPresenterCommand command;
     RecompD3dPresenterDrawCommand *draw = &command.data.draw;
+    {
+        char *const begin = (char *)&command, *const program = (char *)draw->program;
+        char *const after = (char *)(draw->program + 136), *const end = (char *)(&command + 1);
+        memset(begin, 0, (size_t)(program - begin));
+        memset(after, 0, (size_t)(end - after));
+    }
     draw->fvf = *recomp_memory_u32(device + 0x798u);
     const bool program = (draw->fvf & 1u) != 0u;
     recomp_d3d8_target(&draw->target);

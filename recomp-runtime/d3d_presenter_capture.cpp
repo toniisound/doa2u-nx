@@ -45,9 +45,19 @@ void copyRange(Draw &to, const Draw &from, size_t begin, size_t end)
    flags; skipped bytes stay uninitialized. Keep in step with d3d_presenter.h. */
 void copyCommand(RecompD3dPresenterCommand &to, const RecompD3dPresenterCommand &from)
 {
-    if ((from.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW &&
-         from.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW_COVERAGE) || from.data.draw.program_count != 0u) {
+    if (from.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW &&
+        from.type != RECOMP_D3D_PRESENTER_COMMAND_DRAW_COVERAGE) {
         to = from;
+        return;
+    }
+    if (from.data.draw.program_count != 0u) {
+        // Program draws: everything, but only the program slots in use.
+        const Draw &draw = from.data.draw;
+        Draw &out = to.data.draw;
+        to.type = from.type;
+        const size_t used = draw.program_count < 136u ? draw.program_count : 136u;
+        copyRange(out, draw, 0u, offsetof(Draw, program) + used * sizeof draw.program[0]);
+        copyRange(out, draw, offsetof(Draw, program_constants), sizeof(Draw));
         return;
     }
     using Lighting = RecompD3dDirectionalLighting;
