@@ -107,6 +107,8 @@ struct RenderReport {
     std::chrono::steady_clock::time_point start{};
     unsigned frames = 0u;
     uint64_t draws = 0u, segments = 0u, texture_uploads = 0u;
+    double gpu_ms = 0.0;
+    unsigned gpu_frames = 0u;
 } render_report;
 
 void noteRenderFrame()
@@ -125,8 +127,10 @@ void noteRenderFrame()
     std::copy(stage_times, stage_times + stage_time_count, sorted);
     std::sort(sorted, sorted + stage_time_count, [](const StageTime &a, const StageTime &b) { return a.ms > b.ms; });
     char line[640];
-    int used = std::snprintf(line, sizeof line, "recomp render: per frame %.2fms draws=%.0f segments=%.1f uploads=%.1f |",
-        elapsed / frames, double(render_report.draws) / frames, double(render_report.segments) / frames,
+    int used = std::snprintf(line, sizeof line,
+        "recomp render: per frame %.2fms gpu=%.2fms draws=%.0f segments=%.1f uploads=%.1f |",
+        elapsed / frames, render_report.gpu_frames ? render_report.gpu_ms / render_report.gpu_frames : -1.0,
+        double(render_report.draws) / frames, double(render_report.segments) / frames,
         double(render_report.texture_uploads) / frames);
     for (unsigned i = 0u; i < stage_time_count && i < 8u && used > 0 && used < int(sizeof line); ++i)
         used += std::snprintf(line + used, sizeof line - used, " %s=%.2f", sorted[i].name, sorted[i].ms / frames);
@@ -135,6 +139,8 @@ void noteRenderFrame()
     render_report.start = now;
     stage_time_count = 0u;
     render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
+    render_report.gpu_ms = 0.0;
+    render_report.gpu_frames = 0u;
 }
 } // namespace
 
@@ -424,6 +430,11 @@ struct RecompD3dPresenter {
     std::vector<GLuint> free_queries;
 
     uint32_t present_count = 0u;
+    // GL_TIME_ELAPSED per presented frame, read a few frames late (ring).
+    GLuint gpu_timers[4]{};
+    bool gpu_timer_used[4]{};
+    unsigned gpu_timer_next = 0u;
+    bool gpu_timer_open = false;
     uint32_t draw_count = 0u;
     unsigned frame_dump_count = 0u;
 };
@@ -1440,6 +1451,7 @@ void flushSegment(RecompD3dPresenter *presenter)
             segment.index_data, 256u);
         const uint32_t uniform_base = uploadRing(presenter->uniform_buffer, presenter->uniform_used,
             kUniformRingBytes, segment.uniform_data, static_cast<uint32_t>(presenter->uniform_align));
+        stage("draw loop");
         bindFramebuffer(presenter, segment.color, segment.depth);
         glEnable(GL_SCISSOR_TEST);
 
@@ -1529,7 +1541,9 @@ void flushSegment(RecompD3dPresenter *presenter)
     segment.vertex_data.clear();
     segment.index_data.clear();
     segment.uniform_data.clear();
+    stage("retire textures");
     releaseRetiredTextures(presenter);
+    stage("after segment");
 }
 
 void useTarget(RecompD3dPresenter *presenter, const BoundTarget &bound)
@@ -2251,6 +2265,34 @@ void pollHost(RecompD3dPresenter *presenter)
 #endif
 }
 
+/* One GL_TIME_ELAPSED query spans each frame, from the previous swap to this
+   one; results are collected when available, so the read never waits. */
+void timeGpuFrame(RecompD3dPresenter *presenter)
+{
+    if (presenter->gpu_timers[0] == 0u) glGenQueries(4, presenter->gpu_timers);
+    if (presenter->gpu_timer_open) {
+        glEndQuery(GL_TIME_ELAPSED);
+        presenter->gpu_timer_open = false;
+    }
+    for (unsigned i = 0u; i < 4u; ++i) {
+        if (!presenter->gpu_timer_used[i]) continue;
+        GLuint available = 0u;
+        glGetQueryObjectuiv(presenter->gpu_timers[i], GL_QUERY_RESULT_AVAILABLE, &available);
+        if (!available) continue;
+        GLuint64 ns = 0u;
+        glGetQueryObjectui64v(presenter->gpu_timers[i], GL_QUERY_RESULT, &ns);
+        presenter->gpu_timer_used[i] = false;
+        render_report.gpu_ms += ns / 1.0e6;
+        ++render_report.gpu_frames;
+    }
+    const unsigned next = presenter->gpu_timer_next;
+    if (presenter->gpu_timer_used[next]) return;  // all four still in flight
+    glBeginQuery(GL_TIME_ELAPSED, presenter->gpu_timers[next]);
+    presenter->gpu_timer_used[next] = true;
+    presenter->gpu_timer_open = true;
+    presenter->gpu_timer_next = (next + 1u) % 4u;
+}
+
 RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const RecompD3dPresenterPresentCommand &present)
 {
     if (present.effective_flags != 5u || present.swap_counter == 0u) {
@@ -2260,6 +2302,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     if (presenter->close_requested) return RECOMP_D3D_PRESENTER_CLOSED;
     flushSegment(presenter);
     dumpFrame(presenter);
+    stage("present pass");
 
     // The window has a lower-left origin, so this pass flips rows; gamma stays display state.
     glBindFramebuffer(GL_FRAMEBUFFER, 0u);
@@ -2307,6 +2350,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     stage("eglSwapBuffers");
     eglSwapBuffers(presenter->display, presenter->surface);
     stage("present done");
+    timeGpuFrame(presenter);
     noteRenderFrame();
 
     /* Keep the presented guest frame for GetBackBuffer(-1) once a draw has used it. */
@@ -2432,6 +2476,8 @@ void releasePresenter(RecompD3dPresenter *presenter)
         if (!presenter->free_queries.empty()) {
             glDeleteQueries(static_cast<GLsizei>(presenter->free_queries.size()), presenter->free_queries.data());
         }
+        if (presenter->gpu_timer_open) glEndQuery(GL_TIME_ELAPSED);
+        if (presenter->gpu_timers[0] != 0u) glDeleteQueries(4, presenter->gpu_timers);
         if (presenter->present_program != 0u) glDeleteProgram(presenter->present_program);
         if (presenter->empty_vao != 0u) glDeleteVertexArrays(1, &presenter->empty_vao);
     }
