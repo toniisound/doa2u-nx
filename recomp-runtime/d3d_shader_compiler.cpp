@@ -112,7 +112,10 @@ bool translateGlsl(const std::vector<uint8_t> &spirv, bool vertex, RecompCompile
         for (const spirv_cross::Resource &buffer : resources.uniform_buffers) {
             const uint32_t slot = glsl.get_decoration(buffer.id, spv::DecorationBinding);
             glsl.unset_decoration(buffer.id, spv::DecorationDescriptorSet);
-            glsl.set_decoration(buffer.id, spv::DecorationBinding, vertex ? slot : slot + 2u);
+            /* Both stages read the same draw constants, so a fragment block
+               shares its vertex block's binding: one glBindBufferRange per
+               block per draw instead of two. */
+            glsl.set_decoration(buffer.id, spv::DecorationBinding, slot);
             glsl.set_name(buffer.base_type_id, prefix + glsl.get_name(buffer.base_type_id));
         }
         // Texture.Load has no sampler; GLSL's texelFetch still needs one.
@@ -510,6 +513,8 @@ std::string cachePath(const std::string &hlsl, const char *entry_point, bool ver
         hash = (hash ^ 0xffu) * 0x100000001b3ull;
     };
     mix("doa2u-shader-cache-1");
+    // GLSL entries from before fragment blocks shared the vertex bindings.
+    if (target == RecompShaderTarget::Glsl) mix("glsl-shared-bindings");
     mix(hlsl);
     mix(entry_point);
     mix(vertex ? "vertex" : "fragment");

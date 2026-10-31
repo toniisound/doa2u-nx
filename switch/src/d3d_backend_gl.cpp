@@ -172,8 +172,8 @@ constexpr uint32_t kIndexRingBytes = 8u * 1024u * 1024u;
 constexpr uint32_t kUniformRingBytes = 16u * 1024u * 1024u;
 /* Uniform buffer bindings (d3d_shader_compiler.h): vertex slot n is binding n,
    fragment slot n is binding n + 2. */
-constexpr GLuint kVertexTransformBinding = 0u, kVertexProgramBinding = 1u;
-constexpr GLuint kFragmentTransformBinding = 2u, kFragmentProgramBinding = 3u;
+// Both stages' blocks share these bindings (d3d_shader_compiler.cpp).
+constexpr GLuint kTransformBinding = 0u, kProgramBinding = 1u;
 constexpr GLuint kGammaBinding = 4u;
 
 /* With UPPER_LEFT clip control GL still breaks rasterization ties in its own
@@ -225,6 +225,8 @@ struct TextureEntry {
     uint32_t mip_levels = 0u;
     uint8_t palette[kPaletteBytes]{};
     uint64_t fingerprint = 0u;
+    // present_count + 1 of the frame whose bytes last matched the fingerprint.
+    uint32_t checked_frame = 0u;
     GLuint texture = 0u;
 };
 
@@ -1032,14 +1034,28 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
     }
     const auto cached = presenter->texture_index.equal_range(desc.data);
     const bool fingerprinted = !linear_bgra && draw.texture_bytes != nullptr;
-    const uint64_t fingerprint = fingerprinted ? textureFingerprint(draw.texture_bytes, draw.texture_byte_count) : 0u;
+    /* The fingerprint reads 128 words spread over the texture in guest memory,
+       mostly cache misses; a texture drawn many times in a frame is checked
+       once per frame (RECOMP_GL_FINGERPRINT_EVERY_DRAW=1 checks every draw). */
+    static const bool every_draw = envFlag("RECOMP_GL_FINGERPRINT_EVERY_DRAW");
+    const uint32_t frame = presenter->present_count + 1u;
+    uint64_t fingerprint = 0u;
+    bool have_fingerprint = false;
+    const auto currentFingerprint = [&]() {
+        if (!have_fingerprint) {
+            fingerprint = textureFingerprint(draw.texture_bytes, draw.texture_byte_count);
+            have_fingerprint = true;
+        }
+        return fingerprint;
+    };
     for (auto it = cached.first; it != cached.second; ++it) {
         TextureEntry &entry = presenter->textures[it->second];
         if (entry.format_byte == desc.format_byte && entry.width == desc.width &&
             entry.height == desc.height && entry.volume_depth == desc.volume_depth &&
             entry.mip_levels == levels &&
             (!palettized || std::memcmp(entry.palette, draw.palette_bytes, kPaletteBytes) == 0)) {
-            if (fingerprinted && entry.fingerprint != fingerprint) {
+            const bool checked = !every_draw && entry.checked_frame == frame;
+            if (fingerprinted && !checked && entry.fingerprint != currentFingerprint()) {
                 static unsigned reported;
                 if (reported < 32u) {
                     ++reported;
@@ -1051,6 +1067,7 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
                 entry.used = false;
                 break;
             }
+            if (fingerprinted) entry.checked_frame = frame;
             if (linear_bgra) {
                 // Queued draws sampled the old pixels; record them before this upload.
                 flushSegment(presenter);
@@ -1098,7 +1115,8 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
     entry.volume_depth = desc.volume_depth;
     entry.mip_levels = levels;
     if (palettized) std::memcpy(entry.palette, draw.palette_bytes, kPaletteBytes);
-    entry.fingerprint = fingerprint;
+    entry.fingerprint = fingerprinted ? currentFingerprint() : 0u;
+    entry.checked_frame = frame;
     entry.texture = texture;
     presenter->texture_index.emplace(desc.data, slot);
     return texture;
@@ -1515,17 +1533,13 @@ void flushSegment(RecompD3dPresenter *presenter)
             if (draw.uniform_offset != uniforms) {
                 uniforms = draw.uniform_offset;
                 const GLintptr at = uniform_base + uniforms;
-                glBindBufferRange(GL_UNIFORM_BUFFER, kVertexTransformBinding, presenter->uniform_buffer, at,
-                    kTransformFloats * sizeof(float));
-                glBindBufferRange(GL_UNIFORM_BUFFER, kFragmentTransformBinding, presenter->uniform_buffer, at,
+                glBindBufferRange(GL_UNIFORM_BUFFER, kTransformBinding, presenter->uniform_buffer, at,
                     kTransformFloats * sizeof(float));
             }
             if (draw.program_offset != UINT32_MAX && draw.program_offset != constants_offset) {
                 constants_offset = draw.program_offset;
                 const GLintptr at = uniform_base + constants_offset;
-                glBindBufferRange(GL_UNIFORM_BUFFER, kVertexProgramBinding, presenter->uniform_buffer, at,
-                    kProgramFloats * sizeof(float));
-                glBindBufferRange(GL_UNIFORM_BUFFER, kFragmentProgramBinding, presenter->uniform_buffer, at,
+                glBindBufferRange(GL_UNIFORM_BUFFER, kProgramBinding, presenter->uniform_buffer, at,
                     kProgramFloats * sizeof(float));
             }
             for (unsigned slot = 0u; slot < 4u; ++slot) {
@@ -1571,7 +1585,8 @@ void flushSegment(RecompD3dPresenter *presenter)
            Sending each segment lets the GPU draw while the CPU builds the next.
            RECOMP_GL_NO_SEGMENT_FLUSH=1 leaves it to the swap. */
         static const bool hold = envFlag("RECOMP_GL_NO_SEGMENT_FLUSH");
-        if (!hold) {
+        // A few draws are not worth a kick of their own; the next flush takes them.
+        if (!hold && segment.draws.size() >= 16u) {
             stage("glFlush (segment)");
             glFlush();
         }

@@ -1,8 +1,8 @@
 // Host functional test of switch/src/d3d_backend_gl.cpp on Mesa llvmpipe,
-#include <algorithm>
 // driven through the presenter API (d3d_presenter_thread_nx.cpp), as the
 // D3D8 adapter drives it on the console. Frames are read back through the
 // backend's RECOMP_D3D_FRAME_DUMP BMPs.
+#include <algorithm>
 #include "d3d_presenter.h"
 
 #include <cmath>
@@ -258,6 +258,14 @@ int main()
         expect(pixelIs(image, 360, 40, 0, 0xff, 0, 8), "top-right texel green");
         expect(pixelIs(image, 40, 360, 0, 0, 0xff, 8), "bottom-left texel blue");
         expect(pixelIs(image, 360, 360, 0xff, 0xff, 0xff, 8), "bottom-right texel white");
+
+        // New texels at the same address are seen on the next frame (the
+        // fingerprint is checked once per frame per texture).
+        for (uint32_t &texel : texels) texel = 0xffffff00u;
+        clear(0xff000000u);
+        expect(drawCommand(draw) == RECOMP_D3D_PRESENTER_OK, "draw accepted again");
+        image = present();
+        expect(pixelIs(image, 40, 40, 0xff, 0xff, 0, 8), "changed texels show on the next frame");
     }
 
     std::printf("DXT1 texture (driver S3TC)\n");
