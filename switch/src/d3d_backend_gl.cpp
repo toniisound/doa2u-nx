@@ -1425,7 +1425,21 @@ uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const std:
         glBufferData(GL_COPY_WRITE_BUFFER, capacity, nullptr, GL_STREAM_DRAW);
         base = 0u;
     }
-    if (size != 0u) glBufferSubData(GL_COPY_WRITE_BUFFER, base, size, bytes.data());
+    if (size != 0u) {
+        /* The ring only appends past ranges queued draws may still read, and
+           orphans the buffer to wrap, so an unsynchronized map is safe; it
+           skips the copy the driver makes for glBufferSubData into a busy
+           buffer. RECOMP_GL_BUFFER_SUBDATA=1 uploads with glBufferSubData. */
+        static const bool subdata = envFlag("RECOMP_GL_BUFFER_SUBDATA");
+        void *target = subdata ? nullptr : glMapBufferRange(GL_COPY_WRITE_BUFFER, base, size,
+            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        if (target != nullptr) {
+            std::memcpy(target, bytes.data(), size);
+            glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+        } else {
+            glBufferSubData(GL_COPY_WRITE_BUFFER, base, size, bytes.data());
+        }
+    }
     used = base + size;
     return base;
 }
@@ -2421,6 +2435,19 @@ bool initEgl(RecompD3dPresenter *presenter)
     if (!gladLoadGL()) {
         std::fprintf(stderr, "recomp d3d presenter: gladLoadGL failed\n");
         return false;
+    }
+    /* With swap interval 1 and two window buffers, a frame that misses a
+       vblank by a little waits for the next one before Mesa can get a free
+       buffer: on the console the present pass waited ~20 ms a frame and fights
+       ran at ~21 fps with 22 ms of GPU work. The game paces itself to the
+       guest vblank, so presenting without waiting cannot run it fast; the
+       compositor shows whole frames. RECOMP_GL_SWAP_INTERVAL=1 restores vsync. */
+    {
+        const char *interval = std::getenv("RECOMP_GL_SWAP_INTERVAL");
+        const EGLint swap_interval = interval != nullptr ? std::atoi(interval) : 0;
+        if (!eglSwapInterval(presenter->display, swap_interval))
+            std::fprintf(stderr, "recomp d3d presenter: eglSwapInterval(%d) failed 0x%x\n", swap_interval, eglGetError());
+        std::fprintf(stderr, "recomp d3d presenter: swap interval %d\n", swap_interval);
     }
     clipControl = reinterpret_cast<ClipControlFn>(eglGetProcAddress("glClipControl"));
     if (clipControl == nullptr) {

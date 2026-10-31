@@ -63,6 +63,10 @@ not yet been measured on the console.
   (`RECOMP_CAPTURE_COMPARE_TEXTURES=1` compares it). Vertices and indices
   are always copied. Each second the log prints the capture's copied,
   compared, reused and direct megabytes per frame and its time.
+- The renderer presents with swap interval 0: with vsync and two window
+  buffers, a frame that just missed a vblank waited for the next one (about
+  20 ms a frame in fights on the console). The game still paces itself to
+  its own 60 Hz vblank. `RECOMP_GL_SWAP_INTERVAL=1` restores vsync.
 - The 3D voices' HRTF filter decodes its taps from a table and computes the
   resampler's Lagrange weights with fixed denominators: the same samples,
   bit for bit, at about half the cost.
