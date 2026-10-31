@@ -346,6 +346,9 @@ by its own texture in modes 9 and 11. With no stage-2 texture bound, 0x352e46
 compiles the texture variant to a CURRENT pass-through, so the blend skips the
 final diffuse. A bound stage-2 texture would need a third sampler and still
 stops with `d3d8:reflection-stage2-texture`.
+Mode 21, used by alternate costumes, blends stage-1 color like mode 4 but takes
+alpha entry 18, SELECTARG1(CURRENT), so the blend keeps the stage-0 alpha.
+Mode 21 before a second stage-2 blend is accepted but unverified in play.
 The binder also reaches modes 3, 4, 4, 5: a base, two successive
 BLENDTEXTUREALPHA stages, then diffuse. The second blend binds a third native
 sampler, with stage 2's own mip filter, bias and WRAP/CLAMP addressing. Stages
@@ -471,6 +474,18 @@ snapshot their storage descriptors. Binding counts retain parent textures,
 and viewport extents follow the target. Front-buffer targets, offscreen sharing
 of a supersampled main depth, and partial clears remain guarded. Synthetic draw
 tests establish these contracts, not title acceptance.
+Swizzled X8R8G8B8 (0x07) colors use the same BGRA8 host storage: the adapter
+clears their alpha to 1 and masks it from draws, so samplers read it as 1. Tina's
+Story ending (0x258a30) renders its scene into two alternating 256x256 textures
+after the Tengu fight and blends them by that alpha (0x257a10).
+Its projected lights (0x257ee0) add three more camera-space projected stages to
+stage 0: ADD(TEXTURE, CURRENT), each through its own TEXTUREn with COUNT3 and
+PROJECTED, on lit meshes without normals. Only V0 alpha reaches the image, so
+the adapter skips lighting and takes material diffuse alpha (0x34fc80). An
+unbound stage passes CURRENT through (0x352e46). The presenter samples the
+stages through its three 2D slots, shared by texture and sampler state; the
+ending binds two textures, and a fourth distinct pair stops. Fog on these
+additive draws is not applied, as on other fixed-function draws.
 
 SetRenderTarget (0x3447d0) programs the depth offset and pitch from the depth
 header alone, so an offscreen color can test against the main depth. The fight
@@ -586,7 +601,9 @@ singular, the SDK inverse (0x34b530) fails and uploads an unset matrix. The
 adapter then uses zero normals, so only ambient and emissive light remain.
 A reflection draw cannot use such a matrix. It is skipped only when its single
 world has 3x3 rank at most one, so every triangle has zero area, or when
-native raster coverage is empty; otherwise it stops.
+native raster coverage is empty; otherwise it stops. Rank one allows each 2x2
+minor twice the error of one float rounding per entry (`2 * FLT_EPSILON` of
+its two terms), as a zero squash scale leaves after the bone multiply.
 A stage projector (0x1df200) divides by the square of its size minus 50, so
 for one frame TEXTURE0 holds infinities and NaNs. With camera-space position
 (w = 1) a non-finite translation makes every S and T non-finite, and CLAMP
@@ -651,6 +668,15 @@ Guest FS refers to the PCR block. The guest-thread scheduler saves and
 restores each thread's current fiber. Without this binding, the tasks never
 run and the game only clears frames.
 
+Guest threads share one host thread, so `NtReadFile` on a handle without
+write access reads on a host worker while the reading thread waits and the
+scheduler runs the others (`recomp_kernel_wait_host`). A blocking read
+otherwise stalls frames and audio for its whole length; from a Steam Deck
+microSD card that was up to 1.4 s (issue #34). Handles with write access
+still read in place. A read issued by the main game thread still pauses
+frames until it finishes, as it would on hardware. Reads at the handle
+cursor and close both wait until no read on that handle is in flight.
+
 Every costume and character is offered. The game data pointer at `0x87cfa8`
 (observed `0x7feae0`) holds one costume byte per character at +0x2ed8, in the
 15-character order from `0x6959dc` mapped through `0x6959c0`. New saves start
@@ -660,7 +686,8 @@ and +0x2ed4 (`0x11e5f0`). After each Swap, the runner repeats the game's award
 loops (`0xdc640`, `0xdc100`): each costume byte becomes its count and the three
 flags become 1. Loaded profiles get the same values, and the next save stores
 them. Unlocks at +0x2ee7 to +0x2eeb (`0xdc4c0`) cover other content.
-`--no-unlock-all` (runner and `run_game.py`) skips this step, so unlocks
+`--no-unlock-all` (runner and `run_game.py`) and the launchers' **Unlocks: Earn**
+(`unlockAll` in `launcher.json`) skip this step, so unlocks
 come only from the game's own award paths. Acceptance runs use it with a
 profile that has never run with the unlock on; earlier saves keep their
 unlocks.

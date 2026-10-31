@@ -81,7 +81,7 @@ def saved_settings():
     if saved.get("msaa") in (1, 2, 4, 8, 16, 32):
         options["msaa"] = saved["msaa"]
     for key, option in (("smaa", "smaa"), ("widescreen", "widescreen"), ("skipIntro", "skip_intro"),
-                        ("surround", "surround")):
+                        ("surround", "surround"), ("unlockAll", "unlock_all")):
         if isinstance(saved.get(key), bool):
             options[option] = saved[key]
     return options
@@ -113,7 +113,7 @@ def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), a
             env[name] = str(int(value))
     if resolution is not None:
         env["RECOMP_D3D_SCALE"] = str(resolution / 480)
-    # The SDL_GPU presenter keeps compiled shaders here; Direct3D 11 ignores it.
+    # Both presenters keep compiled draw shaders here and load them at the next start.
     shader_cache = ROOT / "private/shader-cache"
     shader_cache.mkdir(parents=True, exist_ok=True)
     env.setdefault("RECOMP_SHADER_CACHE", str(shader_cache))
@@ -244,7 +244,8 @@ if __name__ == "__main__":
                              args.input_analog_pulse_at, pick("widescreen", args.widescreen),
                              pick("msaa", args.msaa), pick("smaa", args.smaa),
                              pick("resolution", args.resolution), args.story_finale,
-                             args.skip_intro or saved.get("skip_intro", False), args.unlock_all,
+                             args.skip_intro or saved.get("skip_intro", False),
+                             args.unlock_all and saved.get("unlock_all", True),
                              pick("surround", args.surround)))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(f"Cannot run game: {error}", file=sys.stderr)

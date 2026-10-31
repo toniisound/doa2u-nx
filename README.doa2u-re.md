@@ -19,6 +19,8 @@
 Sister projects: [DOA3](https://github.com/NoRain211/doa3-re) ·
 [DOAXBV](https://github.com/NoRain211/doaxbv-re)
 
+<a href="https://discord.gg/dUdgUF4A"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="30"></a>
+
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/norainsrecomps)
 
 </div>
@@ -60,10 +62,13 @@ keeps running.
 - **Controllers.** Xbox, PlayStation and other SDL3 controllers, and the
   keyboard for player 1.
 - **Launcher.** `Launcher.exe` picks resolution, anti-aliasing, widescreen, an
-  optional intro-movie skip and 5.1 surround, and remembers them. `DOA2U.exe` plays
-  with the same choices.
+  optional intro-movie skip, 5.1 surround and the unlock setting, and remembers them. `DOA2U.exe` plays
+  with the same choices. On release ZIPs after 0.1.10, the settings launcher on
+  each platform can check GitHub for a newer release and install it from its
+  **UPDATE** page; **Check At Start** turns the start-up check off.
 - **Saves.** Your profile and unlocks save to `private\play-disc`; every
-  character and costume starts unlocked. The game's soft reset
+  character and costume starts unlocked unless you choose **Earn** on the
+  launcher's **GAMEPLAY** page. The game's soft reset
   (Start + Back + both triggers) restarts it.
 - **Built from your disc.** `Launcher.exe` lifts the game from your ISO and
   refuses any executable other than the one the developers tested.
@@ -71,7 +76,7 @@ keeps running.
 ## Status
 
 > [!WARNING]
-> **0.1.8 Alpha is bring-up software.** Story, Watch and the attract demo play
+> **0.1.13 Alpha is bring-up software.** Story, Watch and the attract demo play
 > in development runs on every stage, but many modes and characters have not
 > been tried. A draw the port cannot render yet stops the game with a message
 > in the log.
@@ -84,7 +89,7 @@ keeps running.
 | Story, Ayane and Gen Fu | Stages 1-6 cleared without a stop in scripted runs; the Tengu fight was lost each time |
 | Watch | Fights played, including Kasumi vs Lei Fang on The Burai Zenin at 4K and 60 fps |
 | Other characters, Versus, Tag, Survival, Time Attack, Sparring | Not yet played through |
-| Every character and costume | Unlocked; the game saves the unlocks to your profile |
+| Every character and costume | Unlocked by default (the launcher's **Earn** option leaves them to play); the game saves the unlocks to your profile |
 | Native 16:9 widescreen, up to 4K, MSAA up to 32x, SMAA Ultra | Working, chosen in the launcher |
 | Audio, including 3D voices and reverb | Working |
 | Intro and story movies | Play; the launcher can skip the intro ones |
@@ -120,7 +125,8 @@ Visual Studio or administrator approval.
    (about 15 minutes). The build stops unless it reproduces the exact program
    the developers tested.
 3. Pick resolution, MSAA, SMAA and widescreen on **VIDEO SETTINGS**, stereo or
-   5.1 on **AUDIO SETTINGS** and the intro skip on **MOVIES**, then choose
+   5.1 on **AUDIO SETTINGS**, the intro skip on **MOVIES** and **Earn** on
+   **GAMEPLAY** to leave unlocks to play, then choose
    **START GAME**. A controller, the keyboard or the mouse all work. Your
    choices are remembered, and `DOA2U.exe` plays with them later.
 
@@ -220,19 +226,23 @@ window. The build fetches pinned, hash-verified copies of SDL3 and
 
 At first launch `run_game.py` builds an image from
 `private/dedication-photo.jpg` (shipped in the release ZIP) with Pillow.
-`--no-unlock-all` turns off the automatic character and costume unlock, so
-unlocks come from play; profiles already saved with the unlock keep it.
+`--no-unlock-all`, or **Unlocks: Earn** on the launcher's **GAMEPLAY** page, turns
+off the automatic character and costume unlock, so unlocks come from play;
+profiles already saved with the unlock keep it.
 
 To package a release ZIP from a clean checkout:
 
 ```powershell
-python tools/package_test.py 0.1.8-Alpha
-python tools/package_test.py 0.1.8-Alpha --platform macos
-python tools/package_test.py 0.1.8-Alpha --platform linux
+python tools/package_test.py 0.1.13-Alpha
+python tools/package_test.py 0.1.13-Alpha --platform macos
+python tools/package_test.py 0.1.13-Alpha --platform linux
 ```
 
-It zips committed HEAD, the pinned lifter and the photo from
-`private/release-assets/`. The Windows ZIP adds extract-xiso and its license
+It zips the files of committed HEAD that building and playing on that platform
+need, the pinned lifter's lift and licenses, and the photo from
+`private/release-assets/`. Developer notes, tests outside the build and other
+platforms' launchers and backends stay out; `tools/package_test.py` lists them.
+The Windows ZIP adds extract-xiso and its license
 with [test-release.md](docs/test-release.md) as `README.txt`; the macOS and
 Linux ZIPs use [test-release-macos.md](docs/test-release-macos.md) and
 [test-release-linux.md](docs/test-release-linux.md).

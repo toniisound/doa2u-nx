@@ -22,7 +22,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Web.Extensions
 $type = [Reflection.Assembly]::LoadFile($env:RECOMP_LAUNCHER_TEST_EXE).GetType('LauncherForm')
 $form = $type.GetConstructor([type[]]@([string])).Invoke(@($null))
-foreach ($name in 'resolution', 'msaa', 'smaa', 'screen', 'surround', 'intro') {
+foreach ($name in 'resolution', 'msaa', 'smaa', 'screen', 'surround', 'intro', 'unlock') {
     $row = $type.GetField($name, [Reflection.BindingFlags]'NonPublic, Instance').GetValue($form)
     $row.Index = if ($env:RECOMP_LAUNCHER_TEST_LAST -eq '1') { $row.Names.Length - 1 } else { 0 }
 }
@@ -36,9 +36,9 @@ $json = (New-Object Web.Script.Serialization.JavaScriptSerializer).Serialize($ty
             self.assertTrue((root / "DOA2U.exe").is_file())
             (root / "private").mkdir()
             for last, expected in ((True, dict(resolution=2160, msaa=32, smaa=True, widescreen=True,
-                                                skip_intro=True, surround=True)),
+                                                skip_intro=True, surround=True, unlock_all=False)),
                                    (False, dict(resolution=480, msaa=1, smaa=False, widescreen=False,
-                                                skip_intro=False, surround=False))):
+                                                skip_intro=False, surround=False, unlock_all=True))):
                 env = dict(os.environ, RECOMP_LAUNCHER_TEST_EXE=str(root / "Launcher.exe"),
                            RECOMP_LAUNCHER_TEST_OUT=str(root / "private/launcher.json"),
                            RECOMP_LAUNCHER_TEST_LAST="1" if last else "0")
@@ -48,6 +48,37 @@ $json = (New-Object Web.Script.Serialization.JavaScriptSerializer).Serialize($ty
                 self.assertEqual(result.returncode, 0, result.stderr)
                 with patch("run_game.ROOT", root):
                     self.assertEqual(saved_settings(), expected)
+
+    @unittest.skipUnless(os.name == "nt", "The launchers are Windows executables")
+    def test_launcher_held_down_enters_a_page_without_changing_a_value(self):
+        script = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$type = [Reflection.Assembly]::LoadFile($env:RECOMP_LAUNCHER_TEST_EXE).GetType('LauncherForm')
+$form = $type.GetConstructor([type[]]@([string])).Invoke(@($null))
+$flags = [Reflection.BindingFlags]'NonPublic, Instance'
+$type.GetField('menu', $flags).SetValue($form, 0)
+$keyDown = $type.GetMethod('OnKeyDown', $flags)
+$keyUp = $type.GetMethod('OnKeyUp', $flags)
+$down = [Windows.Forms.KeyEventArgs]::new([Windows.Forms.Keys]::Down)
+$row = $type.GetField('resolution', $flags).GetValue($form)
+$row.Index = 2
+$keyDown.Invoke($form, @($down))
+$keyDown.Invoke($form, @($down))
+$held = $row.Index
+$keyUp.Invoke($form, @($down))
+$keyDown.Invoke($form, @($down))
+"$($type.GetField('inPage', $flags).GetValue($form)) $held $($row.Index)"
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            build_launchers(Path(folder))
+            env = dict(os.environ, RECOMP_LAUNCHER_TEST_EXE=str(Path(folder) / "Launcher.exe"))
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-STA",
+                                     "-ExecutionPolicy", "Bypass", "-Command", script],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Entered the page; the repeat left 1080p alone; a fresh press stepped down to 720p.
+            self.assertEqual(result.stdout.split(), ["True", "2", "1"])
 
     def test_play_keeps_player_saves_and_has_no_deadline_or_script(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -139,9 +170,10 @@ $json = (New-Object Web.Script.Serialization.JavaScriptSerializer).Serialize($ty
             with patch("run_game.ROOT", root):
                 self.assertEqual(saved_settings(), {})
                 settings.write_text(json.dumps({"height": 1080, "msaa": 4, "smaa": False,
-                    "widescreen": True, "skipIntro": True, "surround": True}), encoding="utf-8")
+                    "widescreen": True, "skipIntro": True, "surround": True, "unlockAll": False}),
+                    encoding="utf-8")
                 self.assertEqual(saved_settings(), {"resolution": 1080, "msaa": 4, "smaa": False,
-                    "widescreen": True, "skip_intro": True, "surround": True})
+                    "widescreen": True, "skip_intro": True, "surround": True, "unlock_all": False})
                 settings.write_text(json.dumps({"height": 900, "msaa": 3, "widescreen": "yes"}),
                     encoding="utf-8")
                 self.assertEqual(saved_settings(), {})

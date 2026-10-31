@@ -191,7 +191,7 @@ struct ShaderKey {
     uint32_t program_count;
     uint64_t program_hash;
     uint8_t coverage_only, scaled_depth_bias, sample_depth_bias, count_pass;
-    uint32_t samples;
+    uint16_t samples, projected_stages;  // two halves keep the memcmp key free of padding
 };
 
 struct ShaderKeyHash {
@@ -442,6 +442,8 @@ void resolveTarget(RecompD3dPresenter *presenter, SDL_GPUTexture *source, SDL_GP
 }
 
 void flushSegment(RecompD3dPresenter *presenter);
+void clearTexture(RecompD3dPresenter *presenter, SDL_GPUTexture *color, const SDL_FColor *clear_color,
+    SDL_GPUTexture *depth, const float *clear_depth, const uint8_t *clear_stencil);
 
 void resolveMain(RecompD3dPresenter *presenter)
 {
@@ -570,7 +572,8 @@ RecompD3dPresenterError bindTarget(RecompD3dPresenter *presenter,
         const RecompD3dTextureDesc &desc = target.color;
         if (desc.depth || desc.data == 0u || desc.width == 0u || desc.height == 0u ||
             desc.width > kMaxTextureSize || desc.height > kMaxTextureSize ||
-            (desc.format_byte != RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 && desc.format_byte != 0x12u)) {
+            (desc.format_byte != RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 && desc.format_byte != 0x07u &&
+             desc.format_byte != 0x12u)) {
             std::fprintf(stderr,
                 "recomp d3d presenter: unsupported target data=0x%08X fmt=0x%02X size=%ux%u no_depth=%d\n",
                 desc.data, desc.format_byte, desc.width, desc.height, target.no_depth ? 1 : 0);
@@ -613,6 +616,12 @@ RecompD3dPresenterError bindTarget(RecompD3dPresenter *presenter,
             presenter->render_targets.push_back(created);
             presenter->target_bytes += bytes;
             entry = &presenter->render_targets.back();
+            // X8R8G8B8 samples alpha as 1, even before the guest's first clear.
+            if (desc.format_byte == 0x07u) {
+                flushSegment(presenter);
+                const SDL_FColor opaque = {0.0f, 0.0f, 0.0f, 1.0f};
+                clearTexture(presenter, entry->render, &opaque, nullptr, nullptr, nullptr);
+            }
             std::fprintf(stderr, "recomp d3d presenter: render target data=0x%08X fmt=0x%02X size=%ux%u\n",
                 desc.data, desc.format_byte, desc.width, desc.height);
         }
@@ -1059,7 +1068,8 @@ ShaderPair lookupShaders(RecompD3dPresenter *presenter, const RecompD3dDrawShade
     key.scaled_depth_bias = draw_key.scaled_depth_bias;
     key.sample_depth_bias = draw_key.sample_depth_bias;
     key.count_pass = count_pass;
-    key.samples = draw_key.sample_depth_bias ? presenter->msaa_count : 0u;
+    key.samples = static_cast<uint16_t>(draw_key.sample_depth_bias ? presenter->msaa_count : 0u);
+    key.projected_stages = draw_key.projected_stages;
     {
         std::lock_guard<std::mutex> lock(presenter->shader_lock);
         const auto found = presenter->shaders.find(key);
@@ -1114,6 +1124,8 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
         const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
         compiled += lookupShaders(presenter, key, false).vertex != nullptr;
     }
+    const RecompD3dDrawShaderKey projected{0x142u, 0u, nullptr, false, false, false, true};
+    if (!presenter->precompile_stop.load()) compiled += lookupShaders(presenter, projected, false).vertex != nullptr;
     std::fprintf(stderr, "recomp d3d presenter: precompiled %u draw shaders in %lld ms\n", compiled,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count()));
@@ -1838,7 +1850,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     const uint32_t shader_fvf = geometry_line ? 0x44u : draw.fvf;
     const RecompD3dDrawShaderKey shader_key{shader_fvf, draw.program_count,
         draw.program_count ? draw.program : nullptr, false, scaled_bias,
-        scaled_bias && presenter->msaa_count > 1u};
+        scaled_bias && presenter->msaa_count > 1u, draw.projected_stage_count != 0u};
     const ShaderPair shaders = lookupShaders(presenter, shader_key, false);
     if (shaders.vertex == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
 
@@ -1923,6 +1935,24 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         bump = reflectionLookup(draw.reflection_stage2_texture, draw.reflection_stage2_bytes,
             draw.reflection_stage2_byte_count);
         if (bump == nullptr || mask == nullptr || texture == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+    }
+    if (draw.projected_stage_count != 0u) {
+        if (!draw.texgen_projected || draw.projected_stage_count > 3u || texture == nullptr ||
+            draw.has_alpha_mask || draw.has_reflection || draw.program_count || draw.distortion ||
+            draw.stage1_alpha_mask || draw.bump_env || draw.reflection_stage2)
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        bool slots[3]{};
+        for (uint32_t i = 0u; i < draw.projected_stage_count; ++i)
+            if (draw.projected_slots[i] >= 0 && draw.projected_slots[i] < 3) slots[draw.projected_slots[i]] = true;
+        if (slots[1]) {
+            mask = reflectionLookup(draw.reflection_texture, draw.reflection_bytes, draw.reflection_byte_count);
+            if (mask == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+        if (slots[2]) {
+            bump = reflectionLookup(draw.reflection_stage2_texture, draw.reflection_stage2_bytes,
+                draw.reflection_stage2_byte_count);
+            if (bump == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
     }
     if (draw.bump_env) {
         if (!draw.program_count || draw.has_alpha_mask || draw.has_reflection || draw.program_alpha_mask ||
@@ -2044,11 +2074,12 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         : lookupDrawSampler(presenter, draw.address_u, draw.address_v, draw.point_mip_filter,
             draw.mip_lod_bias, volume ? draw.address_w : 1u);
     bindings.samplers[1] = draw.program_alpha_mask ? presenter->program_mask_sampler
-        : draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env
+        : draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env ||
+            draw.projected_stage_count != 0u
         ? lookupDrawSampler(presenter, draw.reflection_address_u, draw.reflection_address_v,
             draw.reflection_point_mip_filter, draw.reflection_mip_lod_bias)
         : presenter->filter_sampler;
-    bindings.samplers[2] = draw.reflection_stage2
+    bindings.samplers[2] = draw.reflection_stage2 || draw.projected_stage_count != 0u
         ? lookupDrawSampler(presenter, draw.reflection_stage2_address_u, draw.reflection_stage2_address_v,
             draw.reflection_stage2_point_mip_filter, draw.reflection_stage2_mip_lod_bias)
         : draw.bump_env ? lookupDrawSampler(presenter, draw.bump_address_u, draw.bump_address_v, false, 0.0f)
@@ -2061,9 +2092,10 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
             bindings.samplers[slot] == presenter->program_mask_sampler ? 0.0f : bias;
     };
     biasOf(0u, draw.mip_lod_bias);
-    biasOf(1u, draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env
-        ? draw.reflection_mip_lod_bias : 0.0f);
-    biasOf(2u, draw.reflection_stage2 ? draw.reflection_stage2_mip_lod_bias : 0.0f);
+    biasOf(1u, draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env ||
+        draw.projected_stage_count != 0u ? draw.reflection_mip_lod_bias : 0.0f);
+    biasOf(2u, draw.reflection_stage2 || draw.projected_stage_count != 0u
+        ? draw.reflection_stage2_mip_lod_bias : 0.0f);
     bindings.sampler_bias[3] = bindings.sampler_bias[0];
     for (SDL_GPUSampler *sampler : bindings.samplers) {
         if (sampler == nullptr) return RECOMP_D3D_PRESENTER_HOST_FAILURE;

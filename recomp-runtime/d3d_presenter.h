@@ -218,6 +218,15 @@ typedef struct RecompD3dPresenterDrawCommand {
        (world-view position, 1) times reflection_transform columns 0-2, with
        the sample at (s, t) / q per pixel. COUNT2 uses the same path with Q=1. */
     bool texgen_projected;
+    /* Stages 1-3 ADD(TEXTURE, CURRENT) under texgen_projected (0x257ee0). Each of
+       the first projected_stage_count stages samples slot projected_slots[i] (0
+       texture, 1 reflection_texture, 2 reflection_stage2_texture, each with its
+       slot's sampler; -1 passes CURRENT) at (s, t) / q, where (s, t, q) is the
+       world-view position times projected_transforms[i] (TEXTURE1-3) columns 0-2.
+       Each sum clamps to 1. */
+    uint32_t projected_stage_count;
+    int32_t projected_slots[3];
+    float projected_transforms[3][16];
     /* A later stage's MODULATE(TFACTOR, CURRENT) on alpha alone. */
     bool modulate_texture_factor_alpha;
     /* Stage 1 MODULATE(TEXTURE, CURRENT) alpha: reflection_texture at UV1
@@ -247,6 +256,8 @@ typedef struct RecompD3dPresenterDrawCommand {
     bool reflection_normalize;
     bool reflection_mesh_uv;
     bool reflection_premultiplied;
+    /* Stage-1 alpha is SELECTARG1(CURRENT): the blend keeps stage-0 alpha. */
+    bool reflection_color_only;
     /* Discard a zero-alpha stage-1 texel before its reflection blend. */
     bool reflection_alpha_kill;
     /* Stage 2 MODULATE(TEXTURE, CURRENT) without a stage-2 texture: the 5849
