@@ -36,7 +36,7 @@
 #include "xbe_parser.h"
 
 #ifndef DOA2U_NX_VERSION
-#define DOA2U_NX_VERSION "0.1.0"
+#define DOA2U_NX_VERSION "0.1.13"
 #endif
 
 int recomp_runner_main(int argc, char **argv); // runner.cpp main, renamed at compile time
