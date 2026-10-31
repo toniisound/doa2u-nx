@@ -4,9 +4,13 @@
    libraries wins whenever it exists. */
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
+#include <sys/iosupport.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <switch.h>
 
 __attribute__((weak)) long sysconf(int name)
 {
@@ -47,4 +51,32 @@ __attribute__((weak)) int fchmod(int fd, mode_t mode)
     (void)fd;
     (void)mode;
     return 0;
+}
+
+/* pread: newlib declares it, devkitA64 does not implement it. The runtime
+   reads disc files from a worker thread with it while the game keeps using
+   the same handle, so it must not move the file offset: on libnx's SD card
+   device the handle's file struct begins with its FsFile, which reads at an
+   absolute offset. */
+__attribute__((weak)) ssize_t pread(int fd, void *buffer, size_t count, off_t offset)
+{
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    __handle *handle = __get_handle(fd);
+    const devoptab_t *device = handle != NULL ? devoptab_list[handle->device] : NULL;
+    if (handle == NULL || handle->fileStruct == NULL || device == NULL || device->name == NULL ||
+        strcmp(device->name, "sdmc") != 0) {
+        errno = EBADF;
+        return -1;
+    }
+    FsFile *file = (FsFile *)handle->fileStruct;
+    u64 read = 0;
+    const Result rc = fsFileRead(file, (s64)offset, buffer, count, FsReadOption_None, &read);
+    if (R_FAILED(rc)) {
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)read;
 }
