@@ -31,8 +31,6 @@ enum {
 
 static PadState pads[NX_PORT_COUNT];
 static bool initialized;
-static HidVibrationDeviceHandle vibration_handles[NX_PORT_COUNT][2];
-static bool vibration_ready[NX_PORT_COUNT];
 
 static void initialize(void)
 {
@@ -105,41 +103,14 @@ bool recomp_input_host_sample(uint32_t port, RecompInputGamepad *gamepad)
     return true;
 }
 
-static bool prepare_vibration(uint32_t port)
-{
-    if (vibration_ready[port]) return true;
-    const HidNpadIdType id = port == 0u && padIsHandheld(&pads[0])
-        ? HidNpadIdType_Handheld : (HidNpadIdType)(HidNpadIdType_No1 + port);
-    const HidNpadStyleTag style = id == HidNpadIdType_Handheld
-        ? HidNpadStyleTag_NpadHandheld : HidNpadStyleTag_NpadFullKey;
-    if (R_FAILED(hidInitializeVibrationDevices(vibration_handles[port], 2, id, style))) {
-        return false;
-    }
-    vibration_ready[port] = true;
-    return true;
-}
-
+/* Rumble is off: the game's vibration requests are accepted and ignored. */
 void recomp_input_host_set_vibration(uint32_t port, uint16_t left_motor, uint16_t right_motor)
 {
-    if (port >= NX_PORT_COUNT) return;
-    initialize();
-    if (!padIsConnected(&pads[port]) || !prepare_vibration(port)) return;
-    /* The Xbox left motor is the heavy low-frequency one. */
-    HidVibrationValue values[2];
-    const float low = left_motor / 65535.0f;
-    const float high = right_motor / 65535.0f;
-    for (int i = 0; i < 2; ++i) {
-        values[i].amp_low = low * 0.8f;
-        values[i].freq_low = 160.0f;
-        values[i].amp_high = high * 0.8f;
-        values[i].freq_high = 320.0f;
-    }
-    hidSendVibrationValues(vibration_handles[port], values, 2);
+    (void)port;
+    (void)left_motor;
+    (void)right_motor;
 }
 
 void recomp_input_host_stop_vibration(void)
 {
-    for (uint32_t port = 0u; port < NX_PORT_COUNT; ++port) {
-        if (vibration_ready[port]) recomp_input_host_set_vibration(port, 0u, 0u);
-    }
 }

@@ -37,7 +37,7 @@ not yet been measured on the console.
 | Video | `switch/src/d3d_backend_gl.cpp` behind `switch/src/d3d_presenter_thread_nx.cpp` (render thread on core 1) | OpenGL 4.3 |
 | Shaders | `recomp-runtime/d3d_shader_compiler.cpp` (GLSL target), glslang 16.2.0 + SPIRV-Cross 1.4.341 built from source | cached in `shader-cache/` |
 | Audio | `switch/src/audio_output_switch.cpp` (audout, mixer on core 2, dry/wet routing, I3DL2 reverb) | on |
-| Input | `switch/src/input_host_switch.c` (libnx pads, rumble) | 4 ports |
+| Input | `switch/src/input_host_switch.c` (libnx pads, no rumble) | 4 ports |
 | Files and saves | `win32_compat.c` + `switch/include` shims | SD card |
 
 ### What differs from DOA3 NX
