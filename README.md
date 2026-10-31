@@ -138,7 +138,10 @@ turn its option on (A starts at once).
 | R | Run unpaced (as fast as the CPU allows) |
 | L | Original 4:3 picture instead of the game's own 16:9 mode |
 | Y | Skip the intro movies |
-| X | Render at 480p instead of 720p (lighter GPU load) |
+| X | Render at 480p (smoothest) |
+| B | Render at 720p (sharpest, slowest) |
+
+The game renders at 1.25x (600 lines) by default.
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.

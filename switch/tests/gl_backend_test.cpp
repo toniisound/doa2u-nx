@@ -1,4 +1,5 @@
 // Host functional test of switch/src/d3d_backend_gl.cpp on Mesa llvmpipe,
+#include <algorithm>
 // driven through the presenter API (d3d_presenter_thread_nx.cpp), as the
 // D3D8 adapter drives it on the console. Frames are read back through the
 // backend's RECOMP_D3D_FRAME_DUMP BMPs.
@@ -455,7 +456,14 @@ int main()
             recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels);
         }
         std::printf("       visible pixels %u\n", pixels);
-        expect(complete && pixels == 100u * 50u, "100x50 rectangle counts 5000 pixels");
+        // A scale that maps guest edges between host pixels (1.25x) rounds the
+        // rasterized size, so the count scaled back to guest pixels is close.
+        // Half a host row or column of rounding along an edge: within 2% or 10 pixels.
+        const auto near = [](uint32_t value, uint32_t expected) {
+            const uint32_t slack = std::max(expected / 50u, 10u);
+            return value + slack >= expected && value <= expected + slack;
+        };
+        expect(complete && near(pixels, 100u * 50u), "100x50 rectangle counts 5000 pixels");
 
         // A pending index that already has a count answers with that count
         // at once; the new count replaces it once the GPU resolves it.
@@ -468,13 +476,13 @@ int main()
         present();
         complete = false;
         recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels);
-        expect(complete && (pixels == 100u * 50u || pixels == 20u * 10u), "pending index answers at once");
-        for (int i = 0; i < 200 && pixels != 20u * 10u; ++i) {
+        expect(complete && (near(pixels, 100u * 50u) || near(pixels, 20u * 10u)), "pending index answers at once");
+        for (int i = 0; i < 200 && !near(pixels, 20u * 10u); ++i) {
             recomp_d3d_presenter_flush(presenter, true);
             recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels);
         }
         std::printf("       then %u\n", pixels);
-        expect(pixels == 20u * 10u, "20x10 rectangle replaces the count");
+        expect(near(pixels, 20u * 10u), "20x10 rectangle replaces the count");
     }
 
     std::printf("coverage probe\n");

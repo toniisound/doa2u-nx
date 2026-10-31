@@ -513,7 +513,8 @@ int main(int argc, char **argv)
     std::printf("  Y  saltar los videos de intro\n");
     std::printf("  L  imagen 4:3 en vez de 16:9\n");
     std::printf("  R  sin limite de FPS (unpaced)\n");
-    std::printf("  X  render a 480p (menos carga de GPU) en vez de 720p\n");
+    std::printf("  X  render a 480p (mas fluido)\n");
+    std::printf("  B  render a 720p (mas nitido, mas lento)\n");
     std::printf("  A  empezar ya\n");
     consoleUpdate(nullptr);
     u64 held = 0;
@@ -527,11 +528,12 @@ int main(int argc, char **argv)
         const int tenths = static_cast<int>((2.0 - elapsed) * 10.0);
         if (tenths != shown) {
             shown = tenths;
-            std::printf("\r  %.1f s   %s%s%s%s\x1b[K", tenths / 10.0,
+            std::printf("\r  %.1f s   %s%s%s%s%s\x1b[K", tenths / 10.0,
                 (held & HidNpadButton_Y) ? "[sin intro] " : "",
                 (held & HidNpadButton_L) ? "[4:3] " : "",
                 (held & HidNpadButton_R) ? "[unpaced] " : "",
-                (held & HidNpadButton_X) ? "[480p] " : "");
+                (held & HidNpadButton_X) ? "[480p] " : "",
+                (held & HidNpadButton_B) && !(held & HidNpadButton_X) ? "[720p] " : "");
             consoleUpdate(nullptr);
         }
         svcSleepThread(16'000'000);
@@ -540,7 +542,13 @@ int main(int argc, char **argv)
     const bool unpaced = (held & HidNpadButton_R) != 0;
     const bool narrow = (held & HidNpadButton_L) != 0;
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
+    // Render scale: 1.25x (600 lines) by default. In fights on the console
+    // 720p (1.5x) gave ~30 fps with ~17 ms of GPU work and 480p ~40 fps.
+    // X picks 480p and B 720p; X wins if both are pressed.
     const bool low_resolution = (held & HidNpadButton_X) != 0;
+    const bool high_resolution = !low_resolution && (held & HidNpadButton_B) != 0;
+    const char *const scale = low_resolution ? "1" : high_resolution ? "1.5" : "1.25";
+    const char *const resolution = low_resolution ? "480p" : high_resolution ? "720p" : "600p";
     if (unpaced) {
         setenv("RECOMP_UNPACED", "1", 1);
         std::fprintf(stderr, "[nx] RECOMP_UNPACED=1 (R held at boot)\n");
@@ -550,16 +558,16 @@ int main(int argc, char **argv)
     setenv("RECOMP_D3D_WIDESCREEN", narrow ? "0" : "1", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
     // The game renders 480 lines; 1.5x is the 720p of the handheld screen.
-    setenv("RECOMP_D3D_SCALE", low_resolution ? "1" : "1.5", 1);
+    setenv("RECOMP_D3D_SCALE", scale, 1);
     // Compiled draw shaders persist on the SD card, so later boots skip
     // glslang and SPIRV-Cross and only link them.
     mkdir(kShaderCache, 0777);
     setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
     std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d scale=%s (buttons 0x%llx)\n",
-        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, low_resolution ? "1" : "1.5",
+        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, scale,
         (unsigned long long)held);
     std::printf("\nModo: %s, %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
-        narrow ? "4:3" : "16:9", low_resolution ? "480p" : "720p", skip_intro ? ", sin videos de intro" : "");
+        narrow ? "4:3" : "16:9", resolution, skip_intro ? ", sin videos de intro" : "");
     std::printf("Arrancando...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);
