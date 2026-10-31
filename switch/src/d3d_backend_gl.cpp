@@ -259,7 +259,7 @@ struct ShaderKey {
     uint32_t fvf;
     uint32_t program_count;
     uint64_t program_hash;
-    uint8_t coverage_only, scaled_depth_bias, sample_depth_bias, pad;
+    uint8_t coverage_only, scaled_depth_bias, sample_depth_bias, projected_stages;
 };
 
 struct ShaderKeyHash {
@@ -650,7 +650,8 @@ RecompD3dPresenterError bindTarget(RecompD3dPresenter *presenter,
         const RecompD3dTextureDesc &desc = target.color;
         if (desc.depth || desc.data == 0u || desc.width == 0u || desc.height == 0u ||
             desc.width > kMaxTextureSize || desc.height > kMaxTextureSize ||
-            (desc.format_byte != RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 && desc.format_byte != 0x12u)) {
+            (desc.format_byte != RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 && desc.format_byte != 0x07u &&
+             desc.format_byte != 0x12u)) {
             std::fprintf(stderr,
                 "recomp d3d presenter: unsupported target data=0x%08X fmt=0x%02X size=%ux%u no_depth=%d\n",
                 desc.data, desc.format_byte, desc.width, desc.height, target.no_depth ? 1 : 0);
@@ -676,6 +677,16 @@ RecompD3dPresenterError bindTarget(RecompD3dPresenter *presenter,
             presenter->render_targets.push_back(created);
             presenter->target_bytes += bytes;
             entry = &presenter->render_targets.back();
+            // X8R8G8B8 samples alpha as 1, even before the guest's first clear.
+            if (desc.format_byte == 0x07u) {
+                flushSegment(presenter);
+                bindFramebuffer(presenter, entry->texture, 0u);
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                const float opaque[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                glClearBufferfv(GL_COLOR, 0, opaque);
+                presenter->applied_valid = false;
+            }
             std::fprintf(stderr, "recomp d3d presenter: render target data=0x%08X fmt=0x%02X size=%ux%u\n",
                 desc.data, desc.format_byte, desc.width, desc.height);
         }
@@ -1154,6 +1165,7 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
     key.coverage_only = draw_key.coverage_only;
     key.scaled_depth_bias = draw_key.scaled_depth_bias;
     key.sample_depth_bias = draw_key.sample_depth_bias;
+    key.projected_stages = draw_key.projected_stages;
     const auto found = presenter->programs.find(key);
     if (found != presenter->programs.end()) return found->second;
     const auto start = std::chrono::steady_clock::now();
@@ -1196,9 +1208,13 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
 {
     const auto start = std::chrono::steady_clock::now();
     unsigned compiled = 0u;
-    for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
+    // The boot FVFs, then 0x142 with projected stages (Tina's ending), as upstream.
+    constexpr size_t boot_count = sizeof kRecompD3dBootDrawFvfs / sizeof kRecompD3dBootDrawFvfs[0];
+    for (size_t i = 0u; i <= boot_count; ++i) {
         if (presenter->precompile_stop) return;
-        const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
+        const RecompD3dDrawShaderKey key = i < boot_count
+            ? RecompD3dDrawShaderKey{kRecompD3dBootDrawFvfs[i], 0u, nullptr, false, false, false, false}
+            : RecompD3dDrawShaderKey{0x142u, 0u, nullptr, false, false, false, true};
         RecompD3dVertexLayout layout;
         std::string hlsl, error;
         RecompCompiledShader vertex, fragment;
@@ -1549,6 +1565,16 @@ void flushSegment(RecompD3dPresenter *presenter)
         }
         glBindVertexArray(0u);
         glDisable(GL_SCISSOR_TEST);
+        /* Mesa holds the commands until the swap otherwise, so the GPU started
+           each frame only after the CPU had finished it and the next present
+           waited out the whole GPU frame (~20 ms a fight frame on the console).
+           Sending each segment lets the GPU draw while the CPU builds the next.
+           RECOMP_GL_NO_SEGMENT_FLUSH=1 leaves it to the swap. */
+        static const bool hold = envFlag("RECOMP_GL_NO_SEGMENT_FLUSH");
+        if (!hold) {
+            stage("glFlush (segment)");
+            glFlush();
+        }
         stage("segment drawn");
     }
     segment.draws.clear();
@@ -1926,7 +1952,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     const uint32_t shader_fvf = geometry_line ? 0x44u : draw.fvf;
     // Single-sampled, so the sample-position variant of the scaled bias never applies.
     const RecompD3dDrawShaderKey shader_key{shader_fvf, draw.program_count,
-        draw.program_count ? draw.program : nullptr, false, scaled_bias, false};
+        draw.program_count ? draw.program : nullptr, false, scaled_bias, false, draw.projected_stage_count != 0u};
     const ProgramEntry &program = lookupProgram(presenter, shader_key);
     if (program.program == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
 
@@ -2013,6 +2039,24 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         bump = reflectionLookup(draw.reflection_stage2_texture, draw.reflection_stage2_bytes,
             draw.reflection_stage2_byte_count);
         if (bump == 0u || mask == 0u || texture == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+    }
+    if (draw.projected_stage_count != 0u) {
+        if (!draw.texgen_projected || draw.projected_stage_count > 3u || texture == 0u ||
+            draw.has_alpha_mask || draw.has_reflection || draw.program_count || draw.distortion ||
+            draw.stage1_alpha_mask || draw.bump_env || draw.reflection_stage2)
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        bool slots[3]{};
+        for (uint32_t i = 0u; i < draw.projected_stage_count; ++i)
+            if (draw.projected_slots[i] >= 0 && draw.projected_slots[i] < 3) slots[draw.projected_slots[i]] = true;
+        if (slots[1]) {
+            mask = reflectionLookup(draw.reflection_texture, draw.reflection_bytes, draw.reflection_byte_count);
+            if (mask == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+        if (slots[2]) {
+            bump = reflectionLookup(draw.reflection_stage2_texture, draw.reflection_stage2_bytes,
+                draw.reflection_stage2_byte_count);
+            if (bump == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
     }
     if (draw.bump_env) {
         if (!draw.program_count || draw.has_alpha_mask || draw.has_reflection || draw.program_alpha_mask ||
@@ -2112,11 +2156,12 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         : lookupDrawSampler(presenter, draw.address_u, draw.address_v, draw.point_mip_filter,
             draw.mip_lod_bias, volume ? draw.address_w : 1u);
     bindings.samplers[1] = draw.program_alpha_mask ? presenter->program_mask_sampler
-        : draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env
+        : draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env ||
+            draw.projected_stage_count != 0u
         ? lookupDrawSampler(presenter, draw.reflection_address_u, draw.reflection_address_v,
             draw.reflection_point_mip_filter, draw.reflection_mip_lod_bias)
         : presenter->filter_sampler;
-    bindings.samplers[2] = draw.reflection_stage2
+    bindings.samplers[2] = draw.reflection_stage2 || draw.projected_stage_count != 0u
         ? lookupDrawSampler(presenter, draw.reflection_stage2_address_u, draw.reflection_stage2_address_v,
             draw.reflection_stage2_point_mip_filter, draw.reflection_stage2_mip_lod_bias)
         : draw.bump_env ? lookupDrawSampler(presenter, draw.bump_address_u, draw.bump_address_v, false, 0.0f)

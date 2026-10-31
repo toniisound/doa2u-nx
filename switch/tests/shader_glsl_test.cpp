@@ -32,8 +32,11 @@ int main(int argc, char **argv)
     int failures = 0, total = 0;
     const bool dump = argc > 1;
     for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
-        for (int variant = 0; variant < 3; ++variant) {
-            RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, variant >= 1, variant == 2};
+        // Variant 3: projected stages (upstream compiles them for 0x142, Tina's ending).
+        for (int variant = 0; variant < 4; ++variant) {
+            if (variant == 3 && fvf != 0x142u) continue;
+            RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, variant == 1 || variant == 2, variant == 2,
+                variant == 3};
             RecompD3dVertexLayout layout;
             std::string hlsl;
             if (!recomp_d3d_draw_shader_source(key, layout, hlsl)) { printf("fvf %03x v%d: no source\n", fvf, variant); continue; }
