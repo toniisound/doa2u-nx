@@ -52,7 +52,7 @@ target_link_libraries(shader_glsl_test PRIVATE shader_path)
 add_executable(shader_program_fuzz shader_program_fuzz.cpp)
 target_link_libraries(shader_program_fuzz PRIVATE shader_path)
 
-add_executable(gl_backend_test gl_backend_test.cpp "${NX_SRC}/d3d_backend_gl.cpp"
+add_executable(gl_backend_test gl_backend_test.cpp "${NX_SRC}/d3d_backend_gl.cpp" "${NX_SRC}/shader_specialize.cpp"
     "${NX_SRC}/d3d_presenter_thread_nx.cpp" "${RUNTIME}/d3d_presenter_capture.cpp"
     "${RUNTIME}/d3d_vblank.cpp" "${RUNTIME}/xapi_clock.cpp" host_stubs.cpp)
 target_include_directories(gl_backend_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/inc"
@@ -62,3 +62,7 @@ target_link_libraries(gl_backend_test PRIVATE shader_path ${EGL_LIBRARY} ${GL_LI
 
 add_executable(capture_trust_test capture_trust_test.cpp "${RUNTIME}/d3d_presenter_capture.cpp")
 target_include_directories(capture_trust_test PRIVATE "${RUNTIME}")
+
+add_executable(shader_specialize_test shader_specialize_test.cpp "${NX_SRC}/shader_specialize.cpp")
+target_include_directories(shader_specialize_test PRIVATE "${NX_SRC}")
+target_link_libraries(shader_specialize_test PRIVATE shader_path)

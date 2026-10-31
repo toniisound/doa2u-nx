@@ -171,6 +171,8 @@ void execute(PresenterThread &thread, RecompD3dPresenter *backend,
 // Names the worker's own waits in the backend's per-stage timing (weak: a
 // backend without stage timing leaves it unset).
 extern "C" __attribute__((weak)) void doa2u_nx_render_stage_set(const char *name);
+// The runner's guest memory (runtime.c); weak so host tests link without it.
+extern "C" __attribute__((weak)) uint8_t *recomp_memory(uint32_t guest_address, size_t width);
 void renderStage(const char *name)
 {
     if (doa2u_nx_render_stage_set != nullptr) doa2u_nx_render_stage_set(name);
@@ -345,10 +347,11 @@ void notePresent(PresenterThread &thread)
     const D3dCaptureStats capture = d3d_capture_take_stats();
     const double per_frame_mb = 1.0 / (1048576.0 * frames);
     std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB (geometry %.2fMB)"
-        " compared=%.2fMB trusted=%.2fMB direct=%.2fMB add=%.2fms\n",
+        " compared=%.2fMB trusted=%.2fMB direct=%.2fMB stable=%.2fMB add=%.2fms\n",
         double(capture.commands) / frames, capture.copied_bytes * per_frame_mb,
         capture.copied_geometry_bytes * per_frame_mb, capture.compared_bytes * per_frame_mb,
-        capture.trusted_bytes * per_frame_mb, capture.direct_bytes * per_frame_mb, capture.add_ms / frames);
+        capture.trusted_bytes * per_frame_mb, capture.direct_bytes * per_frame_mb,
+        capture.stable_bytes * per_frame_mb, capture.add_ms / frames);
 #ifdef __SWITCH__
     doa2u_nx_profile_report(frames, elapsed_ms, -1);
 #endif
@@ -383,6 +386,17 @@ RecompD3dPresenterError recomp_d3d_presenter_create(
         // RECOMP_CAPTURE_COPY_TEXTURES=1 copies textures into each packet again.
         const char *copy = std::getenv("RECOMP_CAPTURE_COPY_TEXTURES");
         D3dCapturePacket::setDirectTextures(copy == nullptr || std::strcmp(copy, "1") != 0);
+        // Static vertex and index buffers (the same sampled bytes for 30 frames)
+        // stay guest pointers; RECOMP_CAPTURE_COPY_GEOMETRY=1 copies all geometry.
+        const char *geometry = std::getenv("RECOMP_CAPTURE_COPY_GEOMETRY");
+        const void *guest_base = nullptr;
+        if ((geometry == nullptr || std::strcmp(geometry, "1") != 0) && recomp_memory != nullptr) {
+            // Only with guest RAM as one host block: compare two far pages.
+            const uint8_t *low = recomp_memory(0x1000u, 1u);
+            const uint8_t *high = recomp_memory(0x03fff000u, 1u);
+            if (low != nullptr && high == low + (0x03fff000u - 0x1000u)) guest_base = low - 0x1000u;
+        }
+        D3dCapturePacket::setStableGeometry(guest_base, 0x04000000u, 30u);
 #ifdef __SWITCH__
         doa2u_nx_set_next_thread_core(1);  // the renderer gets core 1 to itself
 #endif
@@ -436,6 +450,7 @@ RecompD3dPresenterError recomp_d3d_presenter_submit(
         recomp_d3d_submit_mb = thread.packets[thread.open].bytes() / 1048576.0;
     if (command->type != RECOMP_D3D_PRESENTER_COMMAND_PRESENT) return RECOMP_D3D_PRESENTER_OK;
     error = publish(thread, false);
+    D3dCapturePacket::noteFrame();
     notePresent(thread);
     return error;
 }

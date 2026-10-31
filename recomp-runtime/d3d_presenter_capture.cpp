@@ -21,6 +21,14 @@ constexpr size_t null_offset = SIZE_MAX;
 constexpr size_t direct_offset = SIZE_MAX - 1u;
 bool trust_textures = false;
 bool direct_textures = false;
+// Stable geometry (setStableGeometry): the guest RAM range and, per source
+// span, its last sampled key and how many captures in a row repeated it.
+const unsigned char *guest_base = nullptr;
+size_t guest_size = 0u;
+uint32_t stable_uses = 0u;
+uint32_t capture_frame = 1u;
+struct StableSpan { uint64_t key; uint32_t uses; uint32_t frame; };
+std::unordered_map<uint64_t, StableSpan> stable_spans;  // by source pointer and size
 D3dCaptureStats stats;
 
 // One pointer reused for thousands of small draws (rain) made a pointer-only key quadratic.
@@ -95,6 +103,19 @@ void D3dCapturePacket::setDirectTextures(bool direct)
     direct_textures = direct;
 }
 
+void D3dCapturePacket::setStableGeometry(const void *base, size_t size, uint32_t uses)
+{
+    guest_base = static_cast<const unsigned char *>(base);
+    guest_size = base != nullptr ? size : 0u;
+    stable_uses = uses;
+    stable_spans.clear();
+}
+
+void D3dCapturePacket::noteFrame()
+{
+    ++capture_frame;
+}
+
 namespace {
 struct AddTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -156,6 +177,28 @@ RecompD3dPresenterError D3dCapturePacket::add(
                     continue;
                 }
                 const uint64_t key = spanKey(source, size);
+                if (i < 2u && guest_base != nullptr && size != 0u) {
+                    const auto *bytes = static_cast<const unsigned char *>(source);
+                    if (bytes >= guest_base && size <= guest_size &&
+                        static_cast<size_t>(bytes - guest_base) <= guest_size - size) {
+                        if (stable_spans.size() > 16384u) stable_spans.clear();
+                        const uint64_t at = reinterpret_cast<uintptr_t>(source) * 0x9e3779b97f4a7c15ull ^ size;
+                        StableSpan &stable = stable_spans[at];
+                        if (stable.key != key || stable.frame == 0u) {
+                            stable.key = key;
+                            stable.uses = 0u;
+                        } else if (stable.frame != capture_frame && stable.uses < UINT32_MAX) {
+                            ++stable.uses;  // the same bytes in another frame
+                        }
+                        stable.frame = capture_frame;
+                        if (stable.uses >= stable_uses) {
+                            stats.stable_bytes += size;
+                            captured.offsets[i] = direct_offset;
+                            captured.direct[i] = source;
+                            continue;
+                        }
+                    }
+                }
                 const auto range = spans_.equal_range(key);
                 for (auto it = range.first; it != range.second; ++it) {
                     if (it->second.size != size) continue;

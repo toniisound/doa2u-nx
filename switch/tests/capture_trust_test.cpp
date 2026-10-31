@@ -117,11 +117,41 @@ bool runProgram()
     return ok;
 }
 
+// Guest geometry with the same sampled bytes in enough frames goes direct;
+// a change starts the count again, and memory outside the guest range is
+// always copied.
+bool runStable()
+{
+    static unsigned char guest[4096];
+    unsigned char scratch[64];
+    std::memset(guest, 1, sizeof guest);
+    std::memset(scratch, 1, sizeof scratch);
+    D3dCapturePacket::setStableGeometry(guest, sizeof guest, 3u);
+    const auto frame = [&](const unsigned char *vertices) {
+        D3dCapturePacket packet;
+        packet.add(draw(vertices, nullptr));
+        packet.add(draw(vertices, nullptr));  // twice in a frame counts once
+        packet.seal();
+        const auto *out = static_cast<const unsigned char *>(packet.command(0u).data.draw.vertex_bytes);
+        D3dCapturePacket::noteFrame();
+        return out;
+    };
+    bool ok = true;
+    for (int f = 0; f < 3; ++f) ok &= check(frame(guest) != guest, "copied while the count builds");
+    ok &= check(frame(guest) == guest, "direct after three repeated frames");
+    guest[0] = 2u;  // sampled byte: the span changed
+    ok &= check(frame(guest) != guest, "copied again after a change");
+    for (int f = 0; f < 6; ++f) ok &= check(frame(scratch) != scratch, "scratch memory always copied");
+    ok &= check(d3d_capture_take_stats().stable_bytes == 2u * 64u, "stable stats");
+    D3dCapturePacket::setStableGeometry(nullptr, 0u, 0u);
+    return ok;
+}
+
 } // namespace
 
 int main()
 {
-    const bool ok = run(false) && run(true) && runDirect() && runProgram();
+    const bool ok = run(false) && run(true) && runDirect() && runProgram() && runStable();
     std::printf(ok ? "PASS capture trust\n" : "FAIL capture trust\n");
     return ok ? 0 : 1;
 }

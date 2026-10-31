@@ -67,6 +67,18 @@ not yet been measured on the console.
   buffers, a frame that just missed a vblank waited for the next one (about
   20 ms a frame in fights on the console). The game still paces itself to
   its own 60 Hz vblank. `RECOMP_GL_SWAP_INTERVAL=1` restores vsync.
+- Draw shaders are specialized per draw: a variant replaces the feature
+  flags a draw has (lighting, light count, reflection, filter and alpha
+  modes) with literals of the same value, so the GPU compiler drops the
+  unused paths of upstream's uber shaders. Variants are built on a worker
+  thread while the draw uses the uber shader, linked one per frame, and kept
+  on the SD card as GLSL and as driver program binaries.
+  `RECOMP_GL_NO_SPECIALIZE=1` draws with the uber shaders only.
+- Static vertex and index buffers (the same sampled bytes for 30 frames)
+  are read by the renderer from guest memory instead of being copied every
+  frame; `RECOMP_CAPTURE_COPY_GEOMETRY=1` copies all geometry.
+- Each second the log prints the GPU's milliseconds per frame by render
+  target (`recomp gpu:`), with the kinds of draws that went to it.
 - The 3D voices' HRTF filter decodes its taps from a table and computes the
   resampler's Lagrange weights with fixed denominators: the same samples,
   bit for bit, at about half the cost.

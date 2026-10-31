@@ -266,6 +266,7 @@ elseif(DOA2U_NX_PRESENTER STREQUAL "gl")
 
     set(DOA2U_NX_PRESENTER_SOURCES
         "${NX_SRC}/d3d_backend_gl.cpp"
+        "${NX_SRC}/shader_specialize.cpp"
         "${NX_SRC}/d3d_presenter_thread_nx.cpp"
         "${RUNTIME}/d3d_presenter_capture.cpp"
         "${RUNTIME}/d3d_shader_compiler.cpp"

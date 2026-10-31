@@ -23,6 +23,7 @@
 #include "d3d_draw_shader.h"
 #include "d3d_shader_compiler.h"
 #include "d3d_texture_model.h"
+#include "shader_specialize.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -36,6 +37,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -111,17 +116,17 @@ struct RenderReport {
     unsigned gpu_frames = 0u;
 } render_report;
 
-void noteRenderFrame()
+unsigned noteRenderFrame()
 {
     const auto now = std::chrono::steady_clock::now();
     if (render_report.frames++ == 0u) {
         render_report.start = now;
         stage_time_count = 0u;
         render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
-        return;
+        return 0u;
     }
     const double elapsed = std::chrono::duration<double, std::milli>(now - render_report.start).count();
-    if (elapsed < 1000.0) return;
+    if (elapsed < 1000.0) return 0u;
     const unsigned frames = render_report.frames - 1u;
     StageTime sorted[24];
     std::copy(stage_times, stage_times + stage_time_count, sorted);
@@ -141,6 +146,7 @@ void noteRenderFrame()
     render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
     render_report.gpu_ms = 0.0;
     render_report.gpu_frames = 0u;
+    return frames;
 }
 } // namespace
 
@@ -272,6 +278,32 @@ struct ShaderKeyEqual {
     bool operator()(const ShaderKey &a, const ShaderKey &b) const { return std::memcmp(&a, &b, sizeof a) == 0; }
 };
 
+/* A specialized draw shader: the generic key plus the hash of its literals. */
+struct VariantKey {
+    ShaderKey shader;
+    uint64_t literals;
+};
+struct VariantKeyHash {
+    size_t operator()(const VariantKey &key) const { return static_cast<size_t>(hashBytes(&key, sizeof key)); }
+};
+struct VariantKeyEqual {
+    bool operator()(const VariantKey &a, const VariantKey &b) const { return std::memcmp(&a, &b, sizeof a) == 0; }
+};
+constexpr GLint kVariantPending = -1, kVariantFailed = -2;
+constexpr size_t kMaxVariants = 768u;
+
+struct VariantJob {
+    VariantKey key;
+    RecompD3dDrawShaderKey draw_key;
+    std::vector<std::array<uint32_t, 4>> program;  // owned copy of draw_key.program
+    std::vector<shader_specialize::Literal> literals;
+};
+struct VariantResult {
+    VariantKey key;
+    bool ok = false;
+    std::string vertex, fragment;  // GLSL
+};
+
 /* Fixed-function raster state of one draw: SDL_GPU's pipeline key, applied
    field by field so unchanged GL state is not set again. */
 struct RasterState {
@@ -310,10 +342,21 @@ struct QueuedDraw {
 
 /* Draws for one bound target, recorded until the target changes or something
    must observe what they drew. */
+/* Draw kinds counted per segment for the GPU report. */
+enum DrawKind : unsigned { kKindLit, kKindReflection, kKindFilter, kKindBlend, kKindProgram, kKindTextured, kKindCount };
+const char *const kKindNames[kKindCount] = {"lit", "refl", "filter", "blend", "prog", "tex"};
+
+constexpr unsigned kRecentTransforms = 8u;
+
 struct Segment {
+    // Offsets of the last distinct Transform blocks in uniform_data.
+    uint32_t recent_transforms[kRecentTransforms] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    unsigned recent_next = 0u;
     GLuint color = 0u;
     GLuint depth = 0u;
     uint32_t width = 0u, height = 0u;
+    uint32_t kinds[kKindCount]{};
     std::vector<uint8_t> vertex_data;
     std::vector<uint8_t> index_data;
     std::vector<uint8_t> uniform_data;
@@ -401,6 +444,21 @@ struct RecompD3dPresenter {
     GLuint bound_framebuffer = UINT32_MAX;
 
     std::unordered_map<ShaderKey, ProgramEntry, ShaderKeyHash, ShaderKeyEqual> programs;
+    /* Specialized variants (shader_specialize.h): GLSL built on a worker
+       thread, linked on this one, kVariantPending until then. */
+    bool specialize = true, specialize_sync = false;
+    bool flags_parsed = false;
+    std::vector<shader_specialize::FlagVector> flag_vectors;
+    uint32_t flag_transform_floats = 0u;
+    std::unordered_map<VariantKey, GLint, VariantKeyHash, VariantKeyEqual> variants;
+    std::mutex variant_mutex;
+    std::condition_variable variant_wake;
+    std::deque<VariantJob> variant_jobs;
+    std::vector<VariantResult> variant_results;
+    bool variant_stop = false;
+    std::thread variant_thread;
+    unsigned variants_linked = 0u, variants_failed = 0u;
+    GLint binary_formats = 0;
     std::unordered_map<uint32_t, GLuint> vaos;  // by shader FVF
     std::thread precompile;
     volatile bool precompile_stop = false;
@@ -433,6 +491,22 @@ struct RecompD3dPresenter {
 
     uint32_t present_count = 0u;
     // GL_TIME_ELAPSED per presented frame, read a few frames late (ring).
+    /* GL_TIMESTAMP pairs around each segment's draw loop, resolved once
+       available, for the per-target GPU report. */
+    struct SegmentTiming {
+        GLuint queries[2]{};
+        uint32_t width = 0u, height = 0u, draws = 0u;
+        uint32_t kinds[kKindCount]{};
+    };
+    std::vector<SegmentTiming> segment_timings;  // in flight, oldest first
+    std::vector<GLuint> free_timestamps;
+    struct TargetGpu {
+        uint32_t width = 0u, height = 0u;
+        double ms = 0.0;
+        uint64_t draws = 0u, segments = 0u;
+        uint64_t kinds[kKindCount]{};
+    };
+    std::vector<TargetGpu> target_gpu;  // resolved since the last report
     GLuint gpu_timers[4]{};
     bool gpu_timer_used[4]{};
     unsigned gpu_timer_next = 0u;
@@ -1172,9 +1246,7 @@ bool drawShaderSource(const RecompD3dDrawShaderKey &draw_key, RecompD3dVertexLay
     return true;
 }
 
-/* The draw program for one key. Failures are cached too, so a shader that
-   cannot build is not retried every draw. */
-const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3dDrawShaderKey &draw_key)
+ShaderKey makeShaderKey(const RecompD3dDrawShaderKey &draw_key)
 {
     ShaderKey key{};
     key.fvf = draw_key.fvf;
@@ -1184,6 +1256,93 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
     key.scaled_depth_bias = draw_key.scaled_depth_bias;
     key.sample_depth_bias = draw_key.sample_depth_bias;
     key.projected_stages = draw_key.projected_stages;
+    return key;
+}
+
+/* Linked programs persist next to the GLSL cache as driver binaries
+   (glProgramBinary), keyed by both stages' GLSL: a later boot skips the GPU
+   compiler, the slow part of a link on the console. */
+std::string programBinaryPath(const std::string &vertex, const std::string &fragment)
+{
+    const char *folder = std::getenv("RECOMP_SHADER_CACHE");
+    if (folder == nullptr || folder[0] == '\0') return {};
+    uint64_t hash = hashBytes("doa2u-gl-program-1", 18u);
+    hash = hashBytes(vertex.data(), vertex.size(), hash);
+    hash = hashBytes(fragment.data(), fragment.size(), hash);
+    char name[40];
+    std::snprintf(name, sizeof name, "/%016llx.glbin", static_cast<unsigned long long>(hash));
+    return std::string(folder) + name;
+}
+
+GLuint linkGlsl(RecompD3dPresenter *presenter, const std::string &vertex, const std::string &fragment,
+    const char *what)
+{
+    const std::string path = presenter->binary_formats > 0 ? programBinaryPath(vertex, fragment) : std::string();
+    if (!path.empty()) {
+        std::ifstream file(path, std::ios::binary);
+        GLenum format = 0u;
+        if (file && file.read(reinterpret_cast<char *>(&format), sizeof format)) {
+            const std::vector<char> binary((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            if (!binary.empty()) {
+                const GLuint program = glCreateProgram();
+                glProgramBinary(program, format, binary.data(), static_cast<GLsizei>(binary.size()));
+                GLint ok = GL_FALSE;
+                glGetProgramiv(program, GL_LINK_STATUS, &ok);
+                if (ok) return program;
+                glDeleteProgram(program);  // a driver update invalidates binaries: link again
+            }
+        }
+    }
+    const GLuint vs = compileStage(GL_VERTEX_SHADER, vertex.data(), vertex.size(), what);
+    const GLuint fs = compileStage(GL_FRAGMENT_SHADER, fragment.data(), fragment.size(), what);
+    GLuint program = 0u;
+    if (vs != 0u && fs != 0u) {
+        program = glCreateProgram();
+        if (!path.empty()) glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glAttachShader(program, vs);
+        glAttachShader(program, fs);
+        glLinkProgram(program);
+        glDetachShader(program, vs);
+        glDetachShader(program, fs);
+        GLint ok = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[2048];
+            glGetProgramInfoLog(program, sizeof log, nullptr, log);
+            std::fprintf(stderr, "recomp d3d presenter: %s program link failed: %s\n", what, log);
+            glDeleteProgram(program);
+            program = 0u;
+        }
+    }
+    if (vs != 0u) glDeleteShader(vs);
+    if (fs != 0u) glDeleteShader(fs);
+    if (program != 0u && !path.empty()) {
+        GLint length = 0;
+        glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
+        if (length > 0) {
+            std::vector<char> binary(static_cast<size_t>(length));
+            GLenum format = 0u;
+            GLsizei written = 0;
+            glGetProgramBinary(program, length, &written, &format, binary.data());
+            if (written > 0) {
+                const std::string temporary = path + ".tmp";
+                std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+                file.write(reinterpret_cast<const char *>(&format), sizeof format);
+                file.write(binary.data(), written);
+                file.close();
+                if (file) std::rename(temporary.c_str(), path.c_str());
+                else std::remove(temporary.c_str());
+            }
+        }
+    }
+    return program;
+}
+
+/* The draw program for one key. Failures are cached too, so a shader that
+   cannot build is not retried every draw. */
+const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3dDrawShaderKey &draw_key)
+{
+    const ShaderKey key = makeShaderKey(draw_key);
     const auto found = presenter->programs.find(key);
     if (found != presenter->programs.end()) return found->second;
     const auto start = std::chrono::steady_clock::now();
@@ -1191,6 +1350,15 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
     ProgramEntry entry;
     std::string hlsl;
     if (drawShaderSource(draw_key, entry.layout, hlsl)) {
+        if (!presenter->flags_parsed && !draw_key.coverage_only) {
+            presenter->flags_parsed = true;
+            if (!shader_specialize::parseFlagVectors(hlsl, presenter->flag_vectors, presenter->flag_transform_floats) ||
+                presenter->flag_transform_floats != kTransformFloats) {
+                std::fprintf(stderr, "recomp d3d presenter: Transform layout unread (%u floats); no specialization\n",
+                    presenter->flag_transform_floats);
+                presenter->flag_vectors.clear();
+            }
+        }
         // Single-sampled: sample-depth-bias shaders see one sample.
         std::vector<std::string> defines;
         if (draw_key.sample_depth_bias) defines.push_back("RECOMP_SAMPLE_COUNT=1");
@@ -1198,13 +1366,8 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
         std::string error;
         if (recomp_shader_compile(hlsl, "vs_main", true, RecompShaderTarget::Glsl, defines, vertex, error) &&
             recomp_shader_compile(hlsl, "ps_main", false, RecompShaderTarget::Glsl, defines, fragment, error)) {
-            const GLuint vs = compileStage(GL_VERTEX_SHADER, reinterpret_cast<const char *>(vertex.code.data()),
-                vertex.code.size(), "draw");
-            const GLuint fs = compileStage(GL_FRAGMENT_SHADER,
-                reinterpret_cast<const char *>(fragment.code.data()), fragment.code.size(), "draw");
-            entry.program = linkProgram(vs, fs, "draw");
-            if (vs != 0u) glDeleteShader(vs);
-            if (fs != 0u) glDeleteShader(fs);
+            entry.program = linkGlsl(presenter, std::string(vertex.code.begin(), vertex.code.end()),
+                std::string(fragment.code.begin(), fragment.code.end()), "draw");
         } else {
             std::fprintf(stderr, "recomp d3d presenter: draw shader fvf=0x%03X failed: %s\n",
                 draw_key.fvf, error.c_str());
@@ -1218,6 +1381,110 @@ const ProgramEntry &lookupProgram(RecompD3dPresenter *presenter, const RecompD3d
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count()));
     return presenter->programs.emplace(key, entry).first->second;
+}
+
+/* Builds one variant's GLSL (worker thread, or inline in sync mode). */
+VariantResult buildVariant(RecompD3dPresenter *presenter, VariantJob &job)
+{
+    VariantResult result;
+    result.key = job.key;
+    job.draw_key.program = job.program.empty() ? nullptr
+        : reinterpret_cast<const uint32_t (*)[4]>(job.program.data());
+    RecompD3dVertexLayout layout;
+    std::string hlsl;
+    if (!drawShaderSource(job.draw_key, layout, hlsl)) return result;
+    hlsl = shader_specialize::apply(hlsl, presenter->flag_vectors, job.literals);
+    std::vector<std::string> defines;
+    if (job.draw_key.sample_depth_bias) defines.push_back("RECOMP_SAMPLE_COUNT=1");
+    RecompCompiledShader vertex, fragment;
+    std::string error;
+    if (!recomp_shader_compile(hlsl, "vs_main", true, RecompShaderTarget::Glsl, defines, vertex, error) ||
+        !recomp_shader_compile(hlsl, "ps_main", false, RecompShaderTarget::Glsl, defines, fragment, error)) {
+        std::fprintf(stderr, "recomp d3d presenter: variant fvf=0x%03X failed: %s\n", job.draw_key.fvf, error.c_str());
+        return result;
+    }
+    result.vertex.assign(vertex.code.begin(), vertex.code.end());
+    result.fragment.assign(fragment.code.begin(), fragment.code.end());
+    result.ok = true;
+    return result;
+}
+
+void variantWorker(RecompD3dPresenter *presenter)
+{
+    for (;;) {
+        VariantJob job;
+        {
+            std::unique_lock<std::mutex> lock(presenter->variant_mutex);
+            presenter->variant_wake.wait(lock, [&] { return presenter->variant_stop || !presenter->variant_jobs.empty(); });
+            if (presenter->variant_stop) return;
+            job = std::move(presenter->variant_jobs.front());
+            presenter->variant_jobs.pop_front();
+        }
+        VariantResult result = buildVariant(presenter, job);
+        std::lock_guard<std::mutex> lock(presenter->variant_mutex);
+        presenter->variant_results.push_back(std::move(result));
+    }
+}
+
+/* Links finished variants on the render thread: one per call (once a frame),
+   since each link can take tens of milliseconds the first time. */
+void linkVariants(RecompD3dPresenter *presenter, size_t budget)
+{
+    for (size_t done = 0u; done < budget; ++done) {
+        VariantResult result;
+        {
+            std::lock_guard<std::mutex> lock(presenter->variant_mutex);
+            if (presenter->variant_results.empty()) return;
+            result = std::move(presenter->variant_results.back());
+            presenter->variant_results.pop_back();
+        }
+        stage("variant link");
+        const GLuint program = result.ok ? linkGlsl(presenter, result.vertex, result.fragment, "variant") : 0u;
+        presenter->variants[result.key] = program != 0u ? static_cast<GLint>(program) : kVariantFailed;
+        if (program != 0u) ++presenter->variants_linked; else ++presenter->variants_failed;
+        if (presenter->variants_linked + presenter->variants_failed <= 4u)
+            std::fprintf(stderr, "recomp d3d presenter: shader variant fvf=0x%03X %s\n", result.key.shader.fvf,
+                program != 0u ? "linked" : "failed");
+    }
+}
+
+/* The specialized program for this draw if it is ready, else the generic
+   one; a draw seen for the first time queues its variant. */
+GLuint chooseProgram(RecompD3dPresenter *presenter, const RecompD3dDrawShaderKey &draw_key, GLuint generic,
+    const float *transform)
+{
+    if (!presenter->specialize || presenter->flag_vectors.empty() || draw_key.coverage_only || generic == 0u)
+        return generic;
+    std::vector<shader_specialize::Literal> literals;
+    VariantKey key{};
+    key.shader = makeShaderKey(draw_key);
+    key.literals = shader_specialize::collect(presenter->flag_vectors, transform, kTransformFloats, literals);
+    const auto found = presenter->variants.find(key);
+    if (found != presenter->variants.end()) return found->second > 0 ? static_cast<GLuint>(found->second) : generic;
+    if (presenter->variants.size() >= kMaxVariants) return generic;
+    VariantJob job;
+    job.key = key;
+    job.draw_key = draw_key;
+    if (draw_key.program_count != 0u) job.program.assign(reinterpret_cast<const std::array<uint32_t, 4> *>(draw_key.program),
+        reinterpret_cast<const std::array<uint32_t, 4> *>(draw_key.program) + draw_key.program_count);
+    job.literals = std::move(literals);
+    presenter->variants[key] = kVariantPending;
+    if (presenter->specialize_sync) {
+        VariantResult result = buildVariant(presenter, job);
+        {
+            std::lock_guard<std::mutex> lock(presenter->variant_mutex);
+            presenter->variant_results.push_back(std::move(result));
+        }
+        linkVariants(presenter, 1u);
+        const GLint program = presenter->variants[key];
+        return program > 0 ? static_cast<GLuint>(program) : generic;
+    }
+    {
+        std::lock_guard<std::mutex> lock(presenter->variant_mutex);
+        presenter->variant_jobs.push_back(std::move(job));
+    }
+    presenter->variant_wake.notify_one();
+    return generic;
 }
 
 /* Compiles the boot shaders' GLSL off the render thread into the shader
@@ -1500,6 +1767,18 @@ void flushSegment(RecompD3dPresenter *presenter)
         const uint32_t uniform_base = uploadRing(presenter->uniform_buffer, presenter->uniform_used,
             kUniformRingBytes, segment.uniform_data, static_cast<uint32_t>(presenter->uniform_align));
         stage("draw loop");
+        GLuint timestamps[2] = {0u, 0u};
+        if (presenter->segment_timings.size() < 64u) {
+            for (GLuint &query : timestamps) {
+                if (!presenter->free_timestamps.empty()) {
+                    query = presenter->free_timestamps.back();
+                    presenter->free_timestamps.pop_back();
+                } else {
+                    glGenQueries(1, &query);
+                }
+            }
+            glQueryCounter(timestamps[0], GL_TIMESTAMP);
+        }
         bindFramebuffer(presenter, segment.color, segment.depth);
         glEnable(GL_SCISSOR_TEST);
 
@@ -1579,6 +1858,17 @@ void flushSegment(RecompD3dPresenter *presenter)
         }
         glBindVertexArray(0u);
         glDisable(GL_SCISSOR_TEST);
+        if (timestamps[0] != 0u) {
+            glQueryCounter(timestamps[1], GL_TIMESTAMP);
+            RecompD3dPresenter::SegmentTiming timing;
+            timing.queries[0] = timestamps[0];
+            timing.queries[1] = timestamps[1];
+            timing.width = segment.width;
+            timing.height = segment.height;
+            timing.draws = static_cast<uint32_t>(segment.draws.size());
+            std::copy(segment.kinds, segment.kinds + kKindCount, timing.kinds);
+            presenter->segment_timings.push_back(timing);
+        }
         /* Mesa holds the commands until the swap otherwise, so the GPU started
            each frame only after the CPU had finished it and the next present
            waited out the whole GPU frame (~20 ms a fight frame on the console).
@@ -1593,9 +1883,11 @@ void flushSegment(RecompD3dPresenter *presenter)
         stage("segment drawn");
     }
     segment.draws.clear();
+    std::fill(segment.kinds, segment.kinds + kKindCount, 0u);
     segment.vertex_data.clear();
     segment.index_data.clear();
     segment.uniform_data.clear();
+    std::fill(std::begin(segment.recent_transforms), std::end(segment.recent_transforms), UINT32_MAX);
     stage("retire textures");
     releaseRetiredTextures(presenter);
     stage("after segment");
@@ -1666,9 +1958,16 @@ struct DrawBindings {
     int32_t scissor[4];
 };
 
+void buildTransform(const float *constants, float *transform)
+{
+    std::memcpy(transform, constants, 140u * sizeof(float));
+    std::memcpy(transform + 140u, constants + 140u + kProgramFloats, (kTransformFloats - 140u) * sizeof(float));
+}
+
 void queueDraw(RecompD3dPresenter *presenter, GLuint program, GLuint vao, const RasterState &raster,
     const void *vertices, uint32_t vertex_bytes, uint32_t stride, const void *indices, uint32_t index_count,
-    const float *constants, bool program_constants, const DrawBindings &bindings, uint8_t stencil_ref)
+    const float *constants, const float *transform, bool program_constants, const DrawBindings &bindings,
+    uint8_t stencil_ref)
 {
     Segment &segment = presenter->segment;
     QueuedDraw queued;
@@ -1679,19 +1978,25 @@ void queueDraw(RecompD3dPresenter *presenter, GLuint program, GLuint vao, const 
     queued.vertex_stride = stride;
     queued.index_offset = appendAligned(segment.index_data, indices, index_count * sizeof(uint16_t), 16u);
     queued.index_count = index_count;
-    /* As upstream: the Transform buffer is the draw constants without vc[],
-       which goes to its own buffer; consecutive draws often repeat both. */
-    float transform[kTransformFloats];
-    std::memcpy(transform, constants, 140u * sizeof(float));
-    std::memcpy(transform + 140u, constants + 140u + kProgramFloats, (kTransformFloats - 140u) * sizeof(float));
+    /* As upstream: the Transform buffer is the draw constants without vc[]
+       (buildTransform), which goes to its own buffer; draws often repeat both. */
+    constexpr size_t transform_bytes = kTransformFloats * sizeof(float);
     std::vector<uint8_t> &uniforms = segment.uniform_data;
     const size_t alignment = static_cast<size_t>(presenter->uniform_align);
-    if (!segment.draws.empty() &&
-        segment.draws.back().uniform_offset + sizeof transform <= uniforms.size() &&
-        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset, transform, sizeof transform) == 0) {
-        queued.uniform_offset = segment.draws.back().uniform_offset;
-    } else {
-        queued.uniform_offset = appendAligned(uniforms, transform, sizeof transform, alignment);
+    /* Reuse any of the segment's last few distinct blocks: draws often
+       alternate between a handful of objects with identical constants. */
+    queued.uniform_offset = UINT32_MAX;
+    for (const uint32_t offset : segment.recent_transforms) {
+        if (offset != UINT32_MAX && offset + transform_bytes <= uniforms.size() &&
+            std::memcmp(uniforms.data() + offset, transform, transform_bytes) == 0) {
+            queued.uniform_offset = offset;
+            break;
+        }
+    }
+    if (queued.uniform_offset == UINT32_MAX) {
+        queued.uniform_offset = appendAligned(uniforms, transform, transform_bytes, alignment);
+        segment.recent_transforms[segment.recent_next] = queued.uniform_offset;
+        segment.recent_next = (segment.recent_next + 1u) % kRecentTransforms;
     }
     if (program_constants) {
         const float *vc = constants + 140u;
@@ -2210,8 +2515,21 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         openQuery(presenter);
         // openQuery flushed the segment; this draw records into the same target again.
     }
-    queueDraw(presenter, program.program, vao, raster, vertices, vertex_bytes, stride, indices, index_count,
-        constants, draw.program_count != 0u, bindings, static_cast<uint8_t>(draw.depth.stencil_ref));
+    float transform[kTransformFloats];
+    buildTransform(constants, transform);
+    const GLuint chosen = chooseProgram(presenter, shader_key, program.program, transform);
+    queueDraw(presenter, chosen, vao, raster, vertices, vertex_bytes, stride, indices, index_count,
+        constants, transform, draw.program_count != 0u, bindings, static_cast<uint8_t>(draw.depth.stencil_ref));
+    {
+        uint32_t *kinds = presenter->segment.kinds;
+        kinds[kKindLit] += draw.directional.enabled;
+        kinds[kKindReflection] += draw.has_reflection || draw.texgen_reflection || draw.reflection_stage2 ||
+            draw.projected_stage_count != 0u;
+        kinds[kKindFilter] += draw.four_tap_filter || draw.bright_pass || draw.luminance_tint || draw.distortion;
+        kinds[kKindBlend] += draw.blend.blend_enable;
+        kinds[kKindProgram] += draw.program_count != 0u;
+        kinds[kKindTextured] += texture != 0u;
+    }
     presenter->last_bound = bound;
     ++presenter->draw_count;
     return RECOMP_D3D_PRESENTER_OK;
@@ -2339,6 +2657,35 @@ void pollHost(RecompD3dPresenter *presenter)
 #endif
 }
 
+/* Once a second, with the render line: GPU milliseconds per frame by target
+   size (largest first), with the draws and draw kinds that went to it. The
+   timestamps bracket each segment's draw loop as the GPU runs it. */
+void reportTargetGpu(RecompD3dPresenter *presenter, unsigned frames)
+{
+    auto &targets = presenter->target_gpu;
+    std::sort(targets.begin(), targets.end(),
+        [](const RecompD3dPresenter::TargetGpu &a, const RecompD3dPresenter::TargetGpu &b) { return a.ms > b.ms; });
+    for (size_t i = 0u; i < targets.size() && i < 6u; ++i) {
+        const auto &t = targets[i];
+        char line[320];
+        int used = std::snprintf(line, sizeof line, "recomp gpu: target %ux%u %.2fms/frame segments=%.1f draws=%.0f",
+            t.width, t.height, t.ms / frames, double(t.segments) / frames, double(t.draws) / frames);
+        for (unsigned k = 0u; k < kKindCount && used > 0 && used < int(sizeof line); ++k)
+            used += std::snprintf(line + used, sizeof line - used, " %s=%.0f", kKindNames[k], double(t.kinds[k]) / frames);
+        std::fprintf(stderr, "%s\n", line);
+    }
+    targets.clear();
+    if (presenter->specialize) {
+        size_t pending;
+        {
+            std::lock_guard<std::mutex> lock(presenter->variant_mutex);
+            pending = presenter->variant_jobs.size() + presenter->variant_results.size();
+        }
+        std::fprintf(stderr, "recomp gpu: shader variants linked=%u failed=%u pending=%zu\n",
+            presenter->variants_linked, presenter->variants_failed, pending);
+    }
+}
+
 /* One GL_TIME_ELAPSED query spans each frame, from the previous swap to this
    one; results are collected when available, so the read never waits. */
 void timeGpuFrame(RecompD3dPresenter *presenter)
@@ -2359,6 +2706,35 @@ void timeGpuFrame(RecompD3dPresenter *presenter)
         render_report.gpu_ms += ns / 1.0e6;
         ++render_report.gpu_frames;
     }
+    // Segment timestamps, oldest first, as far as they are available.
+    size_t resolved = 0u;
+    for (; resolved < presenter->segment_timings.size(); ++resolved) {
+        const RecompD3dPresenter::SegmentTiming &timing = presenter->segment_timings[resolved];
+        GLuint available = 0u;
+        glGetQueryObjectuiv(timing.queries[1], GL_QUERY_RESULT_AVAILABLE, &available);
+        if (!available) break;
+        GLuint64 begin = 0u, end = 0u;
+        glGetQueryObjectui64v(timing.queries[0], GL_QUERY_RESULT, &begin);
+        glGetQueryObjectui64v(timing.queries[1], GL_QUERY_RESULT, &end);
+        presenter->free_timestamps.push_back(timing.queries[0]);
+        presenter->free_timestamps.push_back(timing.queries[1]);
+        RecompD3dPresenter::TargetGpu *target = nullptr;
+        for (auto &entry : presenter->target_gpu)
+            if (entry.width == timing.width && entry.height == timing.height) target = &entry;
+        if (target == nullptr) {
+            presenter->target_gpu.emplace_back();
+            target = &presenter->target_gpu.back();
+            target->width = timing.width;
+            target->height = timing.height;
+        }
+        target->ms += end > begin ? (end - begin) / 1.0e6 : 0.0;
+        target->draws += timing.draws;
+        ++target->segments;
+        for (unsigned k = 0u; k < kKindCount; ++k) target->kinds[k] += timing.kinds[k];
+    }
+    presenter->segment_timings.erase(presenter->segment_timings.begin(),
+        presenter->segment_timings.begin() + static_cast<std::ptrdiff_t>(resolved));
+
     const unsigned next = presenter->gpu_timer_next;
     if (presenter->gpu_timer_used[next]) return;  // all four still in flight
     glBeginQuery(GL_TIME_ELAPSED, presenter->gpu_timers[next]);
@@ -2425,7 +2801,8 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     eglSwapBuffers(presenter->display, presenter->surface);
     stage("present done");
     timeGpuFrame(presenter);
-    noteRenderFrame();
+    linkVariants(presenter, 1u);
+    if (const unsigned frames = noteRenderFrame()) reportTargetGpu(presenter, frames);
 
     /* Keep the presented guest frame for GetBackBuffer(-1) once a draw has used it. */
     if (presenter->previous_frame != 0u) copyGuestBuffer(presenter, presenter->previous_frame);
@@ -2521,8 +2898,11 @@ bool initEgl(RecompD3dPresenter *presenter)
         if (name != nullptr && std::strcmp(name, "GL_EXT_texture_compression_s3tc") == 0) presenter->s3tc = true;
     }
     if (envFlag("RECOMP_GL_NO_S3TC")) presenter->s3tc = false;
-    std::fprintf(stderr, "recomp d3d presenter: %s / %s / %s s3tc=%d\n", glGetString(GL_VENDOR),
-        glGetString(GL_RENDERER), glGetString(GL_VERSION), presenter->s3tc ? 1 : 0);
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &presenter->binary_formats);
+    if (envFlag("RECOMP_GL_NO_PROGRAM_BINARY")) presenter->binary_formats = 0;
+    std::fprintf(stderr, "recomp d3d presenter: %s / %s / %s s3tc=%d program_binary_formats=%d\n",
+        glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION), presenter->s3tc ? 1 : 0,
+        presenter->binary_formats);
     return true;
 }
 
@@ -2563,6 +2943,11 @@ void releasePresenter(RecompD3dPresenter *presenter)
         if (!presenter->free_queries.empty()) {
             glDeleteQueries(static_cast<GLsizei>(presenter->free_queries.size()), presenter->free_queries.data());
         }
+        for (const auto &variant : presenter->variants)
+            if (variant.second > 0) glDeleteProgram(static_cast<GLuint>(variant.second));
+        for (const auto &timing : presenter->segment_timings) glDeleteQueries(2, timing.queries);
+        if (!presenter->free_timestamps.empty())
+            glDeleteQueries(static_cast<GLsizei>(presenter->free_timestamps.size()), presenter->free_timestamps.data());
         if (presenter->gpu_timer_open) glEndQuery(GL_TIME_ELAPSED);
         if (presenter->gpu_timers[0] != 0u) glDeleteQueries(4, presenter->gpu_timers);
         if (presenter->present_program != 0u) glDeleteProgram(presenter->present_program);
@@ -2681,6 +3066,12 @@ RecompD3dPresenterError d3d_backend_create(const RecompD3dPresenterConfig *confi
         created->widescreen ? 1 : 0);
     try {
         created->precompile = std::thread(precompileDrawShaders, created);
+        // RECOMP_GL_NO_SPECIALIZE=1 draws with the uber shaders only;
+        // RECOMP_GL_SPECIALIZE_SYNC=1 builds each variant before its first draw (tests).
+        created->specialize = !envFlag("RECOMP_GL_NO_SPECIALIZE");
+        created->specialize_sync = envFlag("RECOMP_GL_SPECIALIZE_SYNC");
+        if (created->specialize && !created->specialize_sync)
+            created->variant_thread = std::thread(variantWorker, created);
     } catch (const std::system_error &) {
         // Shaders then compile on first use.
     }
@@ -2923,6 +3314,12 @@ RecompD3dPresenterError d3d_backend_destroy(RecompD3dPresenter **presenter)
     *presenter = nullptr;
     destroyed->precompile_stop = true;
     if (destroyed->precompile.joinable()) destroyed->precompile.join();
+    {
+        std::lock_guard<std::mutex> lock(destroyed->variant_mutex);
+        destroyed->variant_stop = true;
+    }
+    destroyed->variant_wake.notify_all();
+    if (destroyed->variant_thread.joinable()) destroyed->variant_thread.join();
     releasePresenter(destroyed);
     delete destroyed;
     return RECOMP_D3D_PRESENTER_OK;

@@ -16,6 +16,7 @@ struct D3dCaptureStats {
     uint64_t compared_bytes = 0u;   // memcmp against an earlier copy in the packet
     uint64_t trusted_bytes = 0u;    // texture reuse accepted without a compare
     uint64_t direct_bytes = 0u;     // textures passed as guest pointers, not copied
+    uint64_t stable_bytes = 0u;     // static vertices and indices passed as guest pointers
     uint64_t commands = 0u;
     double add_ms = 0.0;            // time inside add()
 };
@@ -30,6 +31,13 @@ public:
     // Texture spans keep pointing at guest memory instead of being copied:
     // the consumer reads them while the guest runs on. Off by default.
     static void setDirectTextures(bool direct);
+    // Vertex and index spans inside [base, base + size) that came back with
+    // the same sampled bytes in `uses` frames in a row (static buffers)
+    // stay guest pointers too; anything else, and any span outside guest
+    // memory (adapter scratch), is copied. A null base turns this off.
+    static void setStableGeometry(const void *base, size_t size, uint32_t uses);
+    // Counts a presented frame for setStableGeometry.
+    static void noteFrame();
 
     enum Kind : uint32_t { COMMAND, RELEASE, REPORT, INVALIDATE };
     struct Record { Kind kind; uint32_t base; uint32_t size; };
