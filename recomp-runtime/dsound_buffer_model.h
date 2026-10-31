@@ -33,6 +33,10 @@ uint32_t recomp_dsound_buffer_cursor(
     RecompDsoundBufferModel *model, uint64_t now_ms);
 /* Consume elapsed PCM on a separate output clock; wrap at loop_end_bytes to
    loop_start_bytes when looping. A span can cover multiple loop iterations. */
+/* Spans recomp_dsound_buffer_consume discarded after a stall longer than
+   RECOMP_DSOUND_STALL_MS; diagnostics only. */
+extern uint32_t recomp_dsound_stall_drops;
+
 uint32_t recomp_dsound_buffer_consume(
     RecompDsoundBufferModel *model, uint64_t now_ms, uint32_t *offset_bytes);
 uint32_t recomp_dsound_buffer_play(

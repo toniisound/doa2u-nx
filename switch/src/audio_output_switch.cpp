@@ -20,6 +20,9 @@
 // off the guest core, instead of inside the game's DirectSound calls.
 #include "audio_output.h"
 #include "audio_reverb.h"
+extern "C" {
+#include "dsound_buffer_model.h"  // a C header without C++ guards
+}
 #include "dsound_hrtf.h"
 
 #include <switch.h>
@@ -48,7 +51,9 @@ constexpr float kRateTrim = 0.01f;
 constexpr uint32_t kDeviceRate = 48000;
 constexpr uint32_t kSpeakers = 2;
 constexpr uint32_t kPeriodFrames = 1024;   // 21.3 ms per device buffer
-constexpr uint32_t kDeviceBuffers = 4;
+// Six periods (128 ms) queued at the device: a late mixer wakeup on a busy
+// core 2 eats into them before the output runs dry.
+constexpr uint32_t kDeviceBuffers = 6;
 constexpr uint32_t kQueueMs = 1000;        // per-voice capacity
 constexpr uint32_t kFrameFloats = 4;       // dry L, dry R, wet L, wet R
 
@@ -107,6 +112,11 @@ unsigned long long nonzero_buffers = 0;
 uint32_t stats_periods = 0;
 float stats_peak = 0.0f, stats_input_peak = 0.0f;
 unsigned long long stats_starved_frames = 0, stats_mixed_frames = 0;
+// Periods after which the device had nothing left queued (an audible gap),
+// and the longest mix of one period.
+unsigned long long stats_device_dry = 0;
+double stats_mix_max_ms = 0.0;
+uint32_t stats_last_stall_drops = 0;
 uint32_t stats_voices = 0;
 unsigned long long stats_last_submitted = 0, stats_last_nonzero = 0;
 bool reported_nonzero[kVoiceCount];
@@ -247,12 +257,17 @@ void mixPeriod(int16_t *out)
             lost = dropped;
             starved_events = underruns;
         }
+        const uint32_t stall_drops = recomp_dsound_stall_drops;
         std::fprintf(stderr,
             "[audio-output] stats 5s: peak_out=%.4f peak_mix=%.4f max_voices=%u "
             "mixed_frames=%llu starved_frames=%llu submitted=%llu nonzero=%llu "
-            "dropped_total=%llu underruns_total=%llu\n",
+            "dropped_total=%llu underruns_total=%llu device_dry=%llu mix_max=%.2fms dsound_stall_drops=%u\n",
             static_cast<double>(stats_peak), static_cast<double>(stats_input_peak), stats_voices,
-            stats_mixed_frames, stats_starved_frames, submitted, nonzero, lost, starved_events);
+            stats_mixed_frames, stats_starved_frames, submitted, nonzero, lost, starved_events,
+            stats_device_dry, stats_mix_max_ms, stall_drops - stats_last_stall_drops);
+        stats_last_stall_drops = stall_drops;
+        stats_device_dry = 0;
+        stats_mix_max_ms = 0.0;
         stats_periods = 0;
         stats_peak = stats_input_peak = 0.0f;
         stats_starved_frames = stats_mixed_frames = 0;
@@ -273,7 +288,13 @@ void mixerLoop(void *)
         if (R_FAILED(audoutWaitPlayFinish(&released, &count, 100'000'000ull)) || released == nullptr) {
             continue;
         }
+        // Nothing left queued at the device: it played out before this refill.
+        u32 queued = 1;
+        if (R_SUCCEEDED(audoutGetAudioOutBufferCount(&queued)) && queued == 0) ++stats_device_dry;
+        const u64 start = armGetSystemTick();
         mixPeriod(static_cast<int16_t *>(released->buffer));
+        const double ms = armTicksToNs(armGetSystemTick() - start) / 1e6;
+        if (ms > stats_mix_max_ms) stats_mix_max_ms = ms;
         audoutAppendAudioOutBuffer(released);
     }
 }

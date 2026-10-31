@@ -85,6 +85,9 @@ uint32_t recomp_dsound_buffer_cursor(
     return model->cursor_bytes;
 }
 
+/* Stalls discarded above, for host diagnostics. */
+uint32_t recomp_dsound_stall_drops;
+
 uint32_t recomp_dsound_buffer_consume(
     RecompDsoundBufferModel *model, uint64_t now_ms, uint32_t *offset_bytes)
 {
@@ -101,6 +104,7 @@ uint32_t recomp_dsound_buffer_consume(
        output across stalls matters. The Switch build raises the limit while
        its frames still take longer than 100 ms. */
     if (elapsed > RECOMP_DSOUND_STALL_MS) {
+        ++recomp_dsound_stall_drops;
         return 0u;
     }
     uint64_t frames = (elapsed * model->sample_rate + remainder) / 1000u;
