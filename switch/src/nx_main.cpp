@@ -466,6 +466,105 @@ void __wrap_exit(int code)
 
 } // extern "C"
 
+/* ---- Resolution menu ------------------------------------------------------ */
+
+/* Draws text with the console's 16x16 font, each font pixel a scale x scale
+   block, into a linear RGBA8888 framebuffer. */
+static void drawText(u32 *pixels, u32 stride, int x, int y, int scale, const char *text, u32 color)
+{
+    const ConsoleFont &font = consoleGetDefault()->font;
+    const u16 *glyphs = static_cast<const u16 *>(font.gfx);
+    for (; *text != '\0'; ++text, x += 16 * scale) {
+        const int index = static_cast<unsigned char>(*text) - font.asciiOffset;
+        if (index < 0 || index >= font.numChars) continue;
+        const u16 *rows = glyphs + 16 * index;
+        for (int row = 0; row < 16; ++row) {
+            for (int column = 0; column < 16; ++column) {
+                if (!(rows[row] & (0x8000u >> column))) continue;
+                for (int dy = 0; dy < scale; ++dy) {
+                    const int py = y + row * scale + dy;
+                    if (py < 0 || py >= 720) continue;
+                    for (int dx = 0; dx < scale; ++dx) {
+                        const int px = x + column * scale + dx;
+                        if (px >= 0 && px < 1280) pixels[py * stride + px] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void fillRect(u32 *pixels, u32 stride, int x, int y, int width, int height, u32 color)
+{
+    for (int py = y; py < y + height && py < 720; ++py)
+        for (int px = x; px < x + width && px < 1280; ++px) pixels[py * stride + px] = color;
+}
+
+static int textWidth(const char *text, int scale)
+{
+    return static_cast<int>(std::strlen(text)) * 16 * scale;
+}
+
+/* Returns true for 480p. Up/down (or the stick) moves, A confirms; there is
+   no time limit. The text console is closed meanwhile and opened again. */
+static bool chooseResolution()
+{
+    consoleExit(nullptr);
+    console_ready = false;
+    console_state = nullptr;
+    Framebuffer framebuffer;
+    const bool drawn = R_SUCCEEDED(framebufferCreate(&framebuffer, nwindowGetDefault(), 1280, 720,
+        PIXEL_FORMAT_RGBA_8888, 2));
+    if (drawn) framebufferMakeLinear(&framebuffer);
+    PadState pad;
+    padInitializeDefault(&pad);
+    constexpr u32 kBackground = 0xff201410u, kText = 0xffffffffu, kDim = 0xffa0a0a0u;
+    constexpr u32 kSelected = 0xff3060e0u;  // ABGR: orange-red box
+    const char *const labels[2] = {"600p", "480p"};
+    const char *const notes[2] = {"Recomendado", "Mas fluido"};
+    int selected = 0;
+    bool redraw = true;
+    // Ignore a press still held from the homebrew menu.
+    padUpdate(&pad);
+    u64 ignore = padGetButtons(&pad);
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        const u64 held = padGetButtons(&pad);
+        const u64 down = padGetButtonsDown(&pad) & ~ignore;
+        ignore &= held;
+        if (down & (HidNpadButton_AnyUp | HidNpadButton_AnyLeft)) { selected = 0; redraw = true; }
+        if (down & (HidNpadButton_AnyDown | HidNpadButton_AnyRight)) { selected = 1; redraw = true; }
+        if (down & HidNpadButton_A) break;
+        if (drawn && redraw) {
+            redraw = false;
+            u32 stride = 0;
+            auto *pixels = static_cast<u32 *>(framebufferBegin(&framebuffer, &stride));
+            stride /= sizeof(u32);
+            fillRect(pixels, stride, 0, 0, 1280, 720, kBackground);
+            char title[48];
+            std::snprintf(title, sizeof title, "DOA2U NX %s", DOA2U_NX_VERSION);
+            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 60, 3, title, kText);
+            const char *const prompt = "Elige la resolucion";
+            drawText(pixels, stride, (1280 - textWidth(prompt, 3)) / 2, 150, 3, prompt, kDim);
+            for (int i = 0; i < 2; ++i) {
+                const int top = 250 + i * 190;
+                if (i == selected) fillRect(pixels, stride, 240, top, 800, 160, kSelected);
+                drawText(pixels, stride, (1280 - textWidth(labels[i], 5)) / 2, top + 8, 5, labels[i], kText);
+                drawText(pixels, stride, (1280 - textWidth(notes[i], 2)) / 2, top + 100, 2, notes[i],
+                    i == selected ? kText : kDim);
+            }
+            const char *const help = "Arriba/Abajo: elegir   A: aceptar";
+            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 660, 2, help, kDim);
+            framebufferEnd(&framebuffer);
+        }
+        svcSleepThread(16'000'000);
+    }
+    if (drawn) framebufferClose(&framebuffer);
+    console_state = consoleInit(nullptr);
+    console_ready = true;
+    return selected == 1;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -500,74 +599,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // R runs unpaced (as fast as the CPU allows, to measure headroom above
-    // 60 fps); L keeps the original 4:3 picture instead of the game's own
-    // 16:9 mode; Y skips the intro movies. There is no CPU boost: boost mode
-    // would drop the GPU to 76.8 MHz. Clock the console with sys-clk instead.
-    // Boot options: a 2 s window in which pressing (or holding) a button
-    // turns its option on. Reading only the buttons held at launch is not
-    // reliable: Eden delivers no pad state for the first moments.
-    PadState pad;
-    padInitializeDefault(&pad);
-    std::printf("\nOpciones (pulsa ahora):\n");
-    std::printf("  Y  saltar los videos de intro\n");
-    std::printf("  L  imagen 4:3 en vez de 16:9\n");
-    std::printf("  R  sin limite de FPS (unpaced)\n");
-    std::printf("  X  render a 480p (mas fluido)\n");
-    std::printf("  B  render a 720p (mas nitido, mas lento)\n");
-    std::printf("  A  empezar ya\n");
-    consoleUpdate(nullptr);
-    u64 held = 0;
-    const u64 start = armGetSystemTick();
-    int shown = -1;
-    for (;;) {
-        padUpdate(&pad);
-        held |= padGetButtons(&pad) | padGetButtonsDown(&pad);
-        const double elapsed = armTicksToNs(armGetSystemTick() - start) / 1e9;
-        if (elapsed >= 2.0 || (held & HidNpadButton_A) || !appletMainLoop()) break;
-        const int tenths = static_cast<int>((2.0 - elapsed) * 10.0);
-        if (tenths != shown) {
-            shown = tenths;
-            std::printf("\r  %.1f s   %s%s%s%s%s\x1b[K", tenths / 10.0,
-                (held & HidNpadButton_Y) ? "[sin intro] " : "",
-                (held & HidNpadButton_L) ? "[4:3] " : "",
-                (held & HidNpadButton_R) ? "[unpaced] " : "",
-                (held & HidNpadButton_X) ? "[480p] " : "",
-                (held & HidNpadButton_B) && !(held & HidNpadButton_X) ? "[720p] " : "");
-            consoleUpdate(nullptr);
-        }
-        svcSleepThread(16'000'000);
-    }
-    std::printf("\n");
-    const bool unpaced = (held & HidNpadButton_R) != 0;
-    const bool narrow = (held & HidNpadButton_L) != 0;
-    const bool skip_intro = (held & HidNpadButton_Y) != 0;
-    // Render scale: 1.25x (600 lines) by default. In fights on the console
-    // 720p (1.5x) gave ~30 fps with ~17 ms of GPU work and 480p ~40 fps.
-    // X picks 480p and B 720p; X wins if both are pressed.
-    const bool low_resolution = (held & HidNpadButton_X) != 0;
-    const bool high_resolution = !low_resolution && (held & HidNpadButton_B) != 0;
-    const char *const scale = low_resolution ? "1" : high_resolution ? "1.5" : "1.25";
-    const char *const resolution = low_resolution ? "480p" : high_resolution ? "720p" : "600p";
-    if (unpaced) {
-        setenv("RECOMP_UNPACED", "1", 1);
-        std::fprintf(stderr, "[nx] RECOMP_UNPACED=1 (R held at boot)\n");
-    }
-    // The kernel's XC_VIDEO and XC_AUDIO settings follow these, as the
-    // launcher sets them on PC. The console outputs stereo.
-    setenv("RECOMP_D3D_WIDESCREEN", narrow ? "0" : "1", 1);
+    // The only boot choice is the render resolution, picked on a large-print
+    // screen that waits for the player: 600p (1.25x, the default) or 480p.
+    const bool low_resolution = chooseResolution();
+    const char *const scale = low_resolution ? "1" : "1.25";
+    const char *const resolution = low_resolution ? "480p" : "600p";
+    // The game's own 16:9 mode, with its intro movies, paced at 60 Hz. The
+    // kernel's XC_VIDEO and XC_AUDIO settings follow these, as the launcher
+    // sets them on PC. The console outputs stereo.
+    setenv("RECOMP_D3D_WIDESCREEN", "1", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
-    // The game renders 480 lines; 1.5x is the 720p of the handheld screen.
+    // The game renders 480 lines; 1.25x is 600.
     setenv("RECOMP_D3D_SCALE", scale, 1);
     // Compiled draw shaders persist on the SD card, so later boots skip
     // glslang and SPIRV-Cross and only link them.
     mkdir(kShaderCache, 0777);
     setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
-    std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d scale=%s (buttons 0x%llx)\n",
-        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, scale,
-        (unsigned long long)held);
-    std::printf("\nModo: %s, %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
-        narrow ? "4:3" : "16:9", resolution, skip_intro ? ", sin videos de intro" : "");
+    std::fprintf(stderr, "[nx] boot options: widescreen=1 scale=%s (%s)\n", scale, resolution);
+    std::printf("DOA2U NX %s\n\nModo: %s\n", DOA2U_NX_VERSION, resolution);
     std::printf("Arrancando...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);
@@ -579,7 +628,6 @@ int main(int argc, char **argv)
     chdir(kRoot);
     const std::string runner_xbe = std::string(kRunnerDisc) + "/" + xbe;
     std::vector<std::string> arguments = {"doa2u-nx", "--xbe", runner_xbe, "--disc-root", kRunnerDisc};
-    if (skip_intro) arguments.emplace_back("--skip-intro");
     std::vector<char *> runner_argv;
     for (std::string &argument : arguments) runner_argv.push_back(argument.data());
     runner_argv.push_back(nullptr);
