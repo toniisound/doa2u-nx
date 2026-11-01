@@ -116,6 +116,11 @@ typedef struct RecompD3dPresenterDrawCommand {
     bool line_antialias;
     uint32_t primitive_type;
     uint32_t index_count;
+    /* Index n reads vertex n - index_base of vertex_bytes (a base vertex).
+       Zero unless the adapter is built with RECOMP_DRAW_INDEX_BASE, which
+       passes a range deep in a shared buffer this way instead of copying and
+       rebasing its indices; only triangle draws use it. */
+    uint32_t index_base;
     uint32_t triangle_count;
     uint32_t vertex_count;
     uint32_t vertex_stride;

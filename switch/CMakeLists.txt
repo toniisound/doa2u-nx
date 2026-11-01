@@ -47,6 +47,9 @@ set(NX_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_compile_definitions(RECOMP_AUDIO_DEFERRED_HRTF)
 # Per-phase timing of the draw adapter, reported once a second in the log.
 add_compile_definitions(RECOMP_DRAW_ADAPTER_TIMING)
+# Triangle draws deep in shared buffers use a base vertex instead of a
+# rebased copy of their indices (d3d8_draw_adapter.c, the GL backend).
+add_compile_definitions(RECOMP_DRAW_INDEX_BASE)
 
 add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>

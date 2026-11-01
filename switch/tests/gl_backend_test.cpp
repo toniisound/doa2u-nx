@@ -433,6 +433,30 @@ int main()
         expect(pixelIs(image, 8, 3, 0, 0, 0), "row 3 not covered");
     }
 
+    std::printf("base vertex\n");
+    {
+        // Indices 104-107 into a range starting at vertex 104: as the adapter
+        // passes a stage mesh deep in a shared buffer with RECOMP_DRAW_INDEX_BASE.
+        clear(0xff000000u);
+        const RhwDiffuse vertices[4] = {{200, 200, 0.5f, 1, 0xff00ff00u}, {300, 200, 0.5f, 1, 0xff00ff00u},
+            {200, 300, 0.5f, 1, 0xff00ff00u}, {300, 300, 0.5f, 1, 0xff00ff00u}};
+        const uint16_t indices[6] = {104, 105, 106, 106, 105, 107};
+        RecompD3dPresenterDrawCommand draw = baseDraw();
+        draw.fvf = 0x44u;
+        draw.primitive_type = 5u;
+        draw.vertex_stride = sizeof(RhwDiffuse);
+        draw.vertex_count = 4u;
+        draw.index_count = 6u;
+        draw.index_base = 104u;
+        draw.triangle_count = 2u;
+        draw.vertex_bytes = vertices;
+        draw.index_bytes = indices;
+        expect(drawCommand(draw) == RECOMP_D3D_PRESENTER_OK, "base-vertex draw accepted");
+        image = present();
+        expect(pixelIs(image, 250, 250, 0, 0xff, 0), "base-vertex quad drawn");
+        expect(pixelIs(image, 150, 150, 0, 0, 0), "nothing outside it");
+    }
+
     std::printf("visibility test\n");
     {
         clear(0xff000000u);

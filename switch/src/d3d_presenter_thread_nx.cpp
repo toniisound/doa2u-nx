@@ -11,6 +11,7 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <cstdio>
@@ -40,7 +41,9 @@ struct PresenterThread {
     bool started = false;
     bool shutdown = false;
     RecompD3dPresenterError created = RECOMP_D3D_PRESENTER_OK;
-    RecompD3dPresenterError status = RECOMP_D3D_PRESENTER_OK;
+    RecompD3dPresenterError status = RECOMP_D3D_PRESENTER_OK;  // guarded by mutex
+    // A copy of status the guest reads on every submit without the mutex.
+    std::atomic<RecompD3dPresenterError> status_seen{RECOMP_D3D_PRESENTER_OK};
     RecompD3dPresenterError destroyed = RECOMP_D3D_PRESENTER_OK;
     unsigned draw_declines = 0;
     bool covered = true;
@@ -90,8 +93,7 @@ RecompD3dPresenterError validate(RecompD3dPresenter *presenter)
 
 RecompD3dPresenterError status(PresenterThread &thread)
 {
-    std::lock_guard<std::mutex> lock(thread.mutex);
-    return thread.status;
+    return thread.status_seen.load(std::memory_order_acquire);
 }
 
 void fail(PresenterThread &thread, RecompD3dPresenterError error)
@@ -99,7 +101,10 @@ void fail(PresenterThread &thread, RecompD3dPresenterError error)
     if (error == RECOMP_D3D_PRESENTER_OK) return;
     {
         std::lock_guard<std::mutex> lock(thread.mutex);
-        if (thread.status == RECOMP_D3D_PRESENTER_OK) thread.status = error;
+        if (thread.status == RECOMP_D3D_PRESENTER_OK) {
+            thread.status = error;
+            thread.status_seen.store(error, std::memory_order_release);
+        }
     }
     thread.changed.notify_all();
 }
@@ -217,6 +222,7 @@ void run(PresenterThread &thread, RecompD3dPresenterConfig config)
         std::lock_guard<std::mutex> lock(thread.mutex);
         thread.created = created;
         thread.status = created;
+        thread.status_seen.store(created, std::memory_order_release);
         thread.started = true;
     }
     thread.changed.notify_all();

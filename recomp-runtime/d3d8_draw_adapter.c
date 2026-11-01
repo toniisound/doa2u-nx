@@ -1631,6 +1631,15 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     }
     /* Stage meshes index a few hundred vertices deep inside shared buffers;
        send only the indexed range (about 10 of 12 MB per frame otherwise). */
+#ifdef RECOMP_DRAW_INDEX_BASE
+    /* Triangles indexing the guest's own buffer keep their indices: the
+       presenter draws them with a base vertex instead of a rebased copy. */
+    if (smallest != 0u && sequential == NULL && primitive >= 5u && primitive <= 7u) {
+        vertices += smallest * stride;
+        largest -= smallest;
+        draw->index_base = smallest;
+    } else
+#endif
     if (smallest != 0u) {
         if (sequential == NULL) {
             sequential = malloc(count * sizeof *sequential);

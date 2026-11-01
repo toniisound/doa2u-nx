@@ -330,6 +330,7 @@ struct QueuedDraw {
     uint32_t vertex_stride = 0u;
     uint32_t index_offset = 0u;
     uint32_t index_count = 0u;
+    GLint base_vertex = 0;  // -index_base of the draw
     GLuint textures[4]{};
     GLuint samplers[4]{};
     uint32_t uniform_offset = 0u;
@@ -1862,8 +1863,14 @@ void flushSegment(RecompD3dPresenter *presenter)
                 std::memcpy(scissor, draw.scissor, sizeof scissor);
                 glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
             }
-            glDrawElements(draw.raster.primitive, static_cast<GLsizei>(draw.index_count), GL_UNSIGNED_SHORT,
-                reinterpret_cast<const void *>(static_cast<uintptr_t>(index_base + draw.index_offset)));
+            if (draw.base_vertex != 0) {
+                glDrawElementsBaseVertex(draw.raster.primitive, static_cast<GLsizei>(draw.index_count),
+                    GL_UNSIGNED_SHORT, reinterpret_cast<const void *>(static_cast<uintptr_t>(index_base + draw.index_offset)),
+                    draw.base_vertex);
+            } else {
+                glDrawElements(draw.raster.primitive, static_cast<GLsizei>(draw.index_count), GL_UNSIGNED_SHORT,
+                    reinterpret_cast<const void *>(static_cast<uintptr_t>(index_base + draw.index_offset)));
+            }
         }
         glBindVertexArray(0u);
         glDisable(GL_SCISSOR_TEST);
@@ -1976,7 +1983,7 @@ void buildTransform(const float *constants, float *transform)
 void queueDraw(RecompD3dPresenter *presenter, GLuint program, GLuint vao, const RasterState &raster,
     const void *vertices, uint32_t vertex_bytes, uint32_t stride, const void *indices, uint32_t index_count,
     const float *constants, const float *transform, bool program_constants, const DrawBindings &bindings,
-    uint8_t stencil_ref)
+    uint8_t stencil_ref, GLint base_vertex)
 {
     Segment &segment = presenter->segment;
     QueuedDraw queued;
@@ -1987,6 +1994,7 @@ void queueDraw(RecompD3dPresenter *presenter, GLuint program, GLuint vao, const 
     queued.vertex_stride = stride;
     queued.index_offset = appendAligned(segment.index_data, indices, index_count * sizeof(uint16_t), 16u);
     queued.index_count = index_count;
+    queued.base_vertex = base_vertex;
     /* As upstream: the Transform buffer is the draw constants without vc[]
        (buildTransform), which goes to its own buffer; draws often repeat both. */
     constexpr size_t transform_bytes = kTransformFloats * sizeof(float);
@@ -2528,7 +2536,8 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     buildTransform(constants, transform);
     const GLuint chosen = chooseProgram(presenter, shader_key, program.program, transform);
     queueDraw(presenter, chosen, vao, raster, vertices, vertex_bytes, stride, indices, index_count,
-        constants, transform, draw.program_count != 0u, bindings, static_cast<uint8_t>(draw.depth.stencil_ref));
+        constants, transform, draw.program_count != 0u, bindings, static_cast<uint8_t>(draw.depth.stencil_ref),
+        geometry_line ? 0 : -static_cast<GLint>(draw.index_base));
     {
         uint32_t *kinds = presenter->segment.kinds;
         kinds[kKindLit] += draw.directional.enabled;
@@ -3146,9 +3155,11 @@ RecompD3dPresenterError d3d_backend_draw_coverage(
         return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
     const auto *indices = static_cast<const uint16_t *>(draw->index_bytes);
     for (uint32_t i = 0u; i < draw->index_count; ++i) {
-        if (indices[i] >= draw->vertex_count) return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+        // Indices are offset by index_base (a base vertex) when the adapter set one.
+        if (indices[i] < draw->index_base || indices[i] - draw->index_base >= draw->vertex_count)
+            return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
         const auto *vertex = static_cast<const uint8_t *>(draw->vertex_bytes) +
-            static_cast<size_t>(indices[i]) * draw->vertex_stride;
+            static_cast<size_t>(indices[i] - draw->index_base) * draw->vertex_stride;
         for (uint32_t j = 0u; j < 3u + draw->blend_weight_count; ++j) {
             float value;
             std::memcpy(&value, vertex + j * sizeof value, sizeof value);
@@ -3220,7 +3231,7 @@ RecompD3dPresenterError d3d_backend_draw_coverage(
         return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
     const auto transform = [&](uint16_t index, float (&clip)[4]) {
         const auto *vertex = static_cast<const uint8_t *>(draw->vertex_bytes) +
-            static_cast<size_t>(index) * draw->vertex_stride;
+            static_cast<size_t>(index - draw->index_base) * draw->vertex_stride;
         float position[3], weights[3] = {};
         std::memcpy(position, vertex, sizeof position);
         std::memcpy(weights, vertex + 12u, draw->blend_weight_count * sizeof(float));
