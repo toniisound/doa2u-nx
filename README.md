@@ -147,8 +147,8 @@ first boot (and the first sight of each new effect) compiles a little; later
 boots only link.
 
 At launch a large-print screen asks for the render resolution and waits:
-**600p** (1.25x, recommended) or **480p** (smoothest). Up/down picks, A
-starts. The game runs in its own 16:9 mode with its intro movies.
+**720p** (1.5x, sharpest), **600p** (1.25x, recommended) or **480p**
+(smoothest). Up/down picks, A starts. The game runs in its own 16:9 mode with its intro movies.
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.

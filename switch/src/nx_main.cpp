@@ -505,9 +505,20 @@ static int textWidth(const char *text, int scale)
     return static_cast<int>(std::strlen(text)) * 16 * scale;
 }
 
-/* Returns true for 480p. Up/down (or the stick) moves, A confirms; there is
-   no time limit. The text console is closed meanwhile and opened again. */
-static bool chooseResolution()
+/* The render scale the player picks: 720p (1.5x), 600p (1.25x, selected at
+   first) or 480p (1x). Up/down (or the stick) moves, A confirms; there is no
+   time limit. The text console is closed meanwhile and opened again. */
+struct ResolutionChoice {
+    const char *label, *note, *scale;
+};
+constexpr ResolutionChoice kResolutions[] = {
+    {"720p", "Sharpest", "1.5"},
+    {"600p", "Recommended", "1.25"},
+    {"480p", "Smoothest", "1"},
+};
+constexpr int kResolutionCount = sizeof kResolutions / sizeof kResolutions[0];
+
+static const ResolutionChoice &chooseResolution()
 {
     consoleExit(nullptr);
     console_ready = false;
@@ -519,10 +530,8 @@ static bool chooseResolution()
     PadState pad;
     padInitializeDefault(&pad);
     constexpr u32 kBackground = 0xff201410u, kText = 0xffffffffu, kDim = 0xffa0a0a0u;
-    constexpr u32 kSelected = 0xff3060e0u;  // ABGR: orange-red box
-    const char *const labels[2] = {"600p", "480p"};
-    const char *const notes[2] = {"Recomendado", "Mas fluido"};
-    int selected = 0;
+    constexpr u32 kSelected = 0xff3060e0u;  // ABGR: orange box
+    int selected = 1;
     bool redraw = true;
     // Ignore a press still held from the homebrew menu.
     padUpdate(&pad);
@@ -532,8 +541,8 @@ static bool chooseResolution()
         const u64 held = padGetButtons(&pad);
         const u64 down = padGetButtonsDown(&pad) & ~ignore;
         ignore &= held;
-        if (down & (HidNpadButton_AnyUp | HidNpadButton_AnyLeft)) { selected = 0; redraw = true; }
-        if (down & (HidNpadButton_AnyDown | HidNpadButton_AnyRight)) { selected = 1; redraw = true; }
+        if ((down & HidNpadButton_AnyUp) && selected > 0) { --selected; redraw = true; }
+        if ((down & HidNpadButton_AnyDown) && selected < kResolutionCount - 1) { ++selected; redraw = true; }
         if (down & HidNpadButton_A) break;
         if (drawn && redraw) {
             redraw = false;
@@ -543,18 +552,19 @@ static bool chooseResolution()
             fillRect(pixels, stride, 0, 0, 1280, 720, kBackground);
             char title[48];
             std::snprintf(title, sizeof title, "DOA2U NX %s", DOA2U_NX_VERSION);
-            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 60, 3, title, kText);
-            const char *const prompt = "Elige la resolucion";
-            drawText(pixels, stride, (1280 - textWidth(prompt, 3)) / 2, 150, 3, prompt, kDim);
-            for (int i = 0; i < 2; ++i) {
-                const int top = 250 + i * 190;
-                if (i == selected) fillRect(pixels, stride, 240, top, 800, 160, kSelected);
-                drawText(pixels, stride, (1280 - textWidth(labels[i], 5)) / 2, top + 8, 5, labels[i], kText);
-                drawText(pixels, stride, (1280 - textWidth(notes[i], 2)) / 2, top + 100, 2, notes[i],
-                    i == selected ? kText : kDim);
+            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 40, 3, title, kText);
+            const char *const prompt = "Choose the resolution";
+            drawText(pixels, stride, (1280 - textWidth(prompt, 3)) / 2, 120, 3, prompt, kDim);
+            for (int i = 0; i < kResolutionCount; ++i) {
+                const int top = 200 + i * 145;
+                if (i == selected) fillRect(pixels, stride, 290, top, 700, 130, kSelected);
+                drawText(pixels, stride, (1280 - textWidth(kResolutions[i].label, 4)) / 2, top + 10, 4,
+                    kResolutions[i].label, kText);
+                drawText(pixels, stride, (1280 - textWidth(kResolutions[i].note, 2)) / 2, top + 86, 2,
+                    kResolutions[i].note, i == selected ? kText : kDim);
             }
-            const char *const help = "Arriba/Abajo: elegir   A: aceptar";
-            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 660, 2, help, kDim);
+            const char *const help = "Up/Down: choose   A: start";
+            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 665, 2, help, kDim);
             framebufferEnd(&framebuffer);
         }
         svcSleepThread(16'000'000);
@@ -562,7 +572,7 @@ static bool chooseResolution()
     if (drawn) framebufferClose(&framebuffer);
     console_state = consoleInit(nullptr);
     console_ready = true;
-    return selected == 1;
+    return kResolutions[selected];
 }
 
 int main(int argc, char **argv)
@@ -600,24 +610,24 @@ int main(int argc, char **argv)
     }
 
     // The only boot choice is the render resolution, picked on a large-print
-    // screen that waits for the player: 600p (1.25x, the default) or 480p.
-    const bool low_resolution = chooseResolution();
-    const char *const scale = low_resolution ? "1" : "1.25";
-    const char *const resolution = low_resolution ? "480p" : "600p";
+    // screen that waits for the player: 720p, 600p (selected at first) or 480p.
+    const ResolutionChoice &choice = chooseResolution();
+    const char *const scale = choice.scale;
+    const char *const resolution = choice.label;
     // The game's own 16:9 mode, with its intro movies, paced at 60 Hz. The
     // kernel's XC_VIDEO and XC_AUDIO settings follow these, as the launcher
     // sets them on PC. The console outputs stereo.
     setenv("RECOMP_D3D_WIDESCREEN", "1", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
-    // The game renders 480 lines; 1.25x is 600.
+    // The game renders 480 lines: 1.5x is 720, 1.25x is 600.
     setenv("RECOMP_D3D_SCALE", scale, 1);
     // Compiled draw shaders persist on the SD card, so later boots skip
     // glslang and SPIRV-Cross and only link them.
     mkdir(kShaderCache, 0777);
     setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
     std::fprintf(stderr, "[nx] boot options: widescreen=1 scale=%s (%s)\n", scale, resolution);
-    std::printf("DOA2U NX %s\n\nModo: %s\n", DOA2U_NX_VERSION, resolution);
-    std::printf("Arrancando...\n");
+    std::printf("DOA2U NX %s\n\nResolution: %s\n", DOA2U_NX_VERSION, resolution);
+    std::printf("Starting...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);
     if (R_SUCCEEDED(threadCreate(&heartbeat_thread, heartbeat, nullptr, nullptr,
