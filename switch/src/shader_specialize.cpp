@@ -73,10 +73,11 @@ bool parseFlagVectors(const std::string &hlsl, std::vector<FlagVector> &flags, u
     return !flags.empty();
 }
 
-uint64_t collect(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats,
-    std::vector<Literal> &literals)
+namespace {
+template <typename Visit>
+uint64_t forEachLiteral(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats,
+    Visit visit)
 {
-    literals.clear();
     uint64_t hash = 0xcbf29ce484222325ull;
     for (uint16_t v = 0u; v < flags.size(); ++v) {
         for (uint8_t c = 0u; c < 4u; ++c) {
@@ -85,12 +86,25 @@ uint64_t collect(const std::vector<FlagVector> &flags, const float *transform, u
             const float value = transform[index];
             if (!(value >= 0.0f && value <= 8.0f) || std::floor(value) != value) continue;
             const auto whole = static_cast<uint8_t>(value);
-            literals.push_back({v, c, whole});
+            visit(Literal{v, c, whole});
             hash = (hash ^ (static_cast<uint64_t>(v) << 16 | static_cast<uint64_t>(c) << 8 | whole)) *
                 0x100000001b3ull;
         }
     }
     return hash;
+}
+} // namespace
+
+uint64_t collect(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats,
+    std::vector<Literal> &literals)
+{
+    literals.clear();
+    return forEachLiteral(flags, transform, transform_floats, [&](const Literal &literal) { literals.push_back(literal); });
+}
+
+uint64_t hashLiterals(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats)
+{
+    return forEachLiteral(flags, transform, transform_floats, [](const Literal &) {});
 }
 
 std::string apply(const std::string &hlsl, const std::vector<FlagVector> &flags,

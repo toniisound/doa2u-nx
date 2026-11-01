@@ -59,7 +59,8 @@ int main()
             for (const FlagVector &flag : real)
                 for (unsigned c = 0u; c < 4u; ++c) values[flag.offset + c] = static_cast<float>(random() % (trial == 0 ? 1u : 9u));
             std::vector<Literal> set;
-            collect(real, values.data(), floats, set);
+            const uint64_t hash = collect(real, values.data(), floats, set);
+            expect(hash == hashLiterals(real, values.data(), floats), "hashLiterals matches collect");
             const std::string specialized = apply(hlsl, real, set);
             RecompCompiledShader vs, fs;
             std::string error;

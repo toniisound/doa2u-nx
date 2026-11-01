@@ -41,6 +41,9 @@ struct Literal {
 uint64_t collect(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats,
     std::vector<Literal> &literals);
 
+/* The same hash as collect, without building the list (the per-draw path). */
+uint64_t hashLiterals(const std::vector<FlagVector> &flags, const float *transform, uint32_t transform_floats);
+
 /* The HLSL with each literal's single-component reads (name.x and the like)
    replaced by the literal. Swizzles of several components stay uniform reads. */
 std::string apply(const std::string &hlsl, const std::vector<FlagVector> &flags,

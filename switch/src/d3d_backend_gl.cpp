@@ -458,6 +458,8 @@ struct RecompD3dPresenter {
     bool variant_stop = false;
     std::thread variant_thread;
     unsigned variants_linked = 0u, variants_failed = 0u;
+    GLuint last_generic = 0u;  // chooseProgram's cached key for this generic program
+    ShaderKey last_shader_key{};
     GLint binary_formats = 0;
     std::unordered_map<uint32_t, GLuint> vaos;  // by shader FVF
     std::thread precompile;
@@ -1455,13 +1457,20 @@ GLuint chooseProgram(RecompD3dPresenter *presenter, const RecompD3dDrawShaderKey
 {
     if (!presenter->specialize || presenter->flag_vectors.empty() || draw_key.coverage_only || generic == 0u)
         return generic;
-    std::vector<shader_specialize::Literal> literals;
+    /* Per draw: hash the flag values (no allocation) and look the variant up;
+       the program key is hashed only when the generic program changes. */
     VariantKey key{};
-    key.shader = makeShaderKey(draw_key);
-    key.literals = shader_specialize::collect(presenter->flag_vectors, transform, kTransformFloats, literals);
+    if (generic != presenter->last_generic) {
+        presenter->last_generic = generic;
+        presenter->last_shader_key = makeShaderKey(draw_key);
+    }
+    key.shader = presenter->last_shader_key;
+    key.literals = shader_specialize::hashLiterals(presenter->flag_vectors, transform, kTransformFloats);
     const auto found = presenter->variants.find(key);
     if (found != presenter->variants.end()) return found->second > 0 ? static_cast<GLuint>(found->second) : generic;
     if (presenter->variants.size() >= kMaxVariants) return generic;
+    std::vector<shader_specialize::Literal> literals;
+    shader_specialize::collect(presenter->flag_vectors, transform, kTransformFloats, literals);
     VariantJob job;
     job.key = key;
     job.draw_key = draw_key;
