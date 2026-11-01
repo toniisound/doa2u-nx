@@ -33,6 +33,9 @@ typedef struct Buffer {
     int32_t distance_volume, center_front, center, pan_front, pan_rear; /* hundredths of dB */
     int32_t doppler;                               /* 4096 per octave */
     RecompHrtfVoice hrtf;
+#ifdef RECOMP_AUDIO_DEFERRED_HRTF
+    bool hrtf_reset; /* the output voice restarted: the next submission resets its filter state */
+#endif
 } Buffer;
 static Buffer buffers[BUFFER_COUNT];
 static void update_3d(Buffer *buffer);
@@ -221,6 +224,9 @@ static void reset_output(Buffer *buffer)
     recomp_audio_output_reset_voice((uint32_t)(buffer - buffers));
     const RecompHrtfFilter filter = buffer->hrtf.filter;
     buffer->hrtf = (RecompHrtfVoice){.filter = filter, .rendered = filter};
+#ifdef RECOMP_AUDIO_DEFERRED_HRTF
+    buffer->hrtf_reset = true;
+#endif
 }
 
 static void pump(Buffer *buffer, uint64_t now)
@@ -262,6 +268,18 @@ static void pump(Buffer *buffer, uint64_t now)
         recomp_audio_output_submit(slot, pcm, bytes, buffer->model.sample_rate, buffer->channels,
             buffer->format == 0x69u ? 16u : buffer->bits, buffer->volume);
     }
+#ifdef RECOMP_AUDIO_DEFERRED_HRTF
+    /* The host filters 3D voices off this thread: it receives the mono source
+       with the filter in effect now, and renders it in submission order. */
+    if (buffer->is3d) {
+        recomp_audio_output_submit_hrtf(slot, samples, bytes / 2u, buffer->model.sample_rate,
+            &buffer->hrtf.filter, buffer->hrtf_reset ? &buffer->hrtf.rendered : NULL, buffer->volume);
+        buffer->hrtf_reset = false;
+        buffer->hrtf.rendered = buffer->hrtf.filter;
+    }
+    if (!recomp_audio_output_ready()) recomp_stop(2, "dsound:audio-output-failed");
+    return;
+#endif
     /* The APU filters 3D voices at 48 kHz; pieces keep each submission in bounds. */
     static float ears[3u * 20000u];
     uint32_t limit = (uint32_t)((uint64_t)19000u * buffer->model.sample_rate / RECOMP_HRTF_RATE);
@@ -475,6 +493,9 @@ static void create_buffer(void)
     write_mix(buffer);
     update_3d(buffer);
     buffer->hrtf.rendered = buffer->hrtf.filter;
+#ifdef RECOMP_AUDIO_DEFERRED_HRTF
+    buffer->hrtf_reset = true;  /* the host's filter state for this slot starts fresh */
+#endif
     result = set_data(buffer, 0u, desc[2]);
     if (result != RECOMP_DSOUND_OK) dispose(buffer);
     else { recomp_dsound_device_add_owner(); write32(output, buffer->root + PUBLIC_OFFSET); }

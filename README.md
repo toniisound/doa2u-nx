@@ -79,6 +79,10 @@ not yet been measured on the console.
   frame; `RECOMP_CAPTURE_COPY_GEOMETRY=1` copies all geometry.
 - Each second the log prints the GPU's milliseconds per frame by render
   target (`recomp gpu:`), with the kinds of draws that went to it.
+- 3D voices are HRTF-filtered on the audio mixer thread (core 2), not the
+  game thread: DirectSound hands over each voice's mono source with the
+  filter in effect, and the mixer renders it in order with that voice's
+  other calls (`RECOMP_AUDIO_DEFERRED_HRTF`, set for the Switch build).
 - The 3D voices' HRTF filter decodes its taps from a table and computes the
   resampler's Lagrange weights with fixed denominators: the same samples,
   bit for bit, at about half the cost.

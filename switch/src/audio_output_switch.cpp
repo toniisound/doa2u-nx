@@ -86,6 +86,36 @@ struct Voice {
 
 std::mutex mutex;
 Voice voices[kVoiceCount];
+
+/* The owner (guest) thread's per-voice calls run on the mixer thread, in
+   order, at the start of each period: 3D voices' HRTF filtering moved off
+   the guest thread with them, and keeping submit, routing and reset in one
+   queue keeps their order. */
+struct AudioCommand {
+    enum Kind { Submit, SubmitHrtf, Reset, Routing } kind = Submit;
+    uint32_t slot = 0, rate = 0, channels = 0, bits = 0;
+    int32_t volume = 0;
+    std::vector<uint8_t> data;
+    VoiceRouting route{};
+    RecompHrtfFilter filter{}, rendered{};
+    bool reset_hrtf = false;
+};
+std::mutex command_mutex;
+std::vector<AudioCommand> pending_commands;
+RecompHrtfVoice hrtf_voices[kVoiceCount];
+constexpr size_t kMaxPendingCommands = 8192;
+unsigned long long dropped_commands = 0;
+
+void enqueue(AudioCommand &&command)
+{
+    std::lock_guard<std::mutex> lock(command_mutex);
+    if (pending_commands.size() >= kMaxPendingCommands) {
+        ++dropped_commands;
+        return;
+    }
+    pending_commands.push_back(std::move(command));
+}
+void drainCommands();
 VoiceRouting routing[kVoiceCount];
 bool attempted = false;
 bool device_open = false;
@@ -190,6 +220,7 @@ bool push(Voice &voice, const VoiceRouting &route, const uint8_t *pcm, uint32_t 
 // Mixes one device period; voices resample linearly.
 void mixPeriod(int16_t *out)
 {
+    drainCommands();
     float *mix = mix_scratch.data();
     float *wet = wet_scratch.data();
     std::memset(mix, 0, sizeof(float) * kPeriodFrames * 2u);
@@ -261,10 +292,11 @@ void mixPeriod(int16_t *out)
         std::fprintf(stderr,
             "[audio-output] stats 5s: peak_out=%.4f peak_mix=%.4f max_voices=%u "
             "mixed_frames=%llu starved_frames=%llu submitted=%llu nonzero=%llu "
-            "dropped_total=%llu underruns_total=%llu device_dry=%llu mix_max=%.2fms dsound_stall_drops=%u\n",
+            "dropped_total=%llu underruns_total=%llu device_dry=%llu mix_max=%.2fms dsound_stall_drops=%u "
+            "queue_drops=%llu\n",
             static_cast<double>(stats_peak), static_cast<double>(stats_input_peak), stats_voices,
             stats_mixed_frames, stats_starved_frames, submitted, nonzero, lost, starved_events,
-            stats_device_dry, stats_mix_max_ms, stall_drops - stats_last_stall_drops);
+            stats_device_dry, stats_mix_max_ms, stall_drops - stats_last_stall_drops, dropped_commands);
         stats_last_stall_drops = stall_drops;
         stats_device_dry = 0;
         stats_mix_max_ms = 0.0;
@@ -393,6 +425,10 @@ extern "C" void recomp_audio_output_initialize(void)
 
 extern "C" void recomp_audio_output_shutdown(void)
 {
+    {
+        std::lock_guard<std::mutex> lock(command_mutex);
+        pending_commands.clear();
+    }
     if (!recomp_audio_output_on_owner_thread()) {
         std::fprintf(stderr, "[audio-output] shutdown deferred to owner thread\n");
         return;
@@ -417,9 +453,9 @@ extern "C" void recomp_audio_output_shutdown(void)
         nonzero_buffers);
 }
 
-extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
+namespace {
+void resetVoiceNow(uint32_t slot)
 {
-    if (!recomp_audio_output_on_owner_thread()) return;
     std::lock_guard<std::mutex> lock(mutex);
     if (slot < kVoiceCount) {
         if (voices[slot].active) ++voice_resets;
@@ -427,6 +463,7 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
         routing[slot] = {};
     }
 }
+} // namespace
 
 extern "C" int recomp_audio_output_set_reverb(const RecompAudioReverb *parameters)
 {
@@ -482,17 +519,40 @@ extern "C" int recomp_audio_output_set_voice_routing(uint32_t slot, uint32_t cha
     recomp_audio_output_initialize();
     if (muted) return 1;
     if (!device_open || (wet_send && !reverb_ready)) return 0;
+    AudioCommand command;
+    command.kind = AudioCommand::Routing;
+    command.slot = slot;
+    command.route = route;
+    enqueue(std::move(command));
+    return 1;
+}
+
+namespace {
+void setRoutingNow(uint32_t slot, const VoiceRouting &route)
+{
     std::lock_guard<std::mutex> lock(mutex);
     Voice &voice = voices[slot];
-    if (voice.active && voice.channels != channels) return 0;
-    if (std::memcmp(&routing[slot], &route, sizeof route) == 0) return 1;
+    if (voice.active && voice.channels != route.channels) {
+        // The guest saw success; a stale voice of another format restarts.
+        resetVoice(voice);
+    }
+    if (std::memcmp(&routing[slot], &route, sizeof route) == 0) return;
     // A voice switching between direct and routed output restarts its queue;
     // a routed voice keeps what it queued and takes the new matrices from its
     // next submission, as an XAudio2 output matrix change does.
     if (voice.active && !voice.routed) resetVoice(voice);
     routing[slot] = route;
     ++routing_updates;
-    return 1;
+}
+} // namespace
+
+extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
+{
+    if (!recomp_audio_output_on_owner_thread() || slot >= kVoiceCount) return;
+    AudioCommand command;
+    command.kind = AudioCommand::Reset;
+    command.slot = slot;
+    enqueue(std::move(command));
 }
 
 extern "C" void recomp_audio_output_submit(
@@ -501,6 +561,47 @@ extern "C" void recomp_audio_output_submit(
     int32_t volume_hundredth_db)
 {
     recomp_audio_output_initialize();
+    if (!device_open || bytes == 0 || pcm == nullptr || bytes > kMaxBufferBytes) {
+        if (device_open && bytes != 0) drop(slot, "invalid-pcm");
+        return;
+    }
+    AudioCommand command;
+    command.kind = AudioCommand::Submit;
+    command.slot = slot;
+    command.rate = sample_rate;
+    command.channels = channels;
+    command.bits = bits_per_sample;
+    command.volume = volume_hundredth_db;
+    command.data.assign(pcm, pcm + bytes);
+    enqueue(std::move(command));
+}
+
+extern "C" void recomp_audio_output_submit_hrtf(uint32_t slot, const int16_t *samples, uint32_t frames,
+    uint32_t source_rate, const RecompHrtfFilter *filter, const RecompHrtfFilter *rendered_reset,
+    int32_t volume_hundredth_db)
+{
+    recomp_audio_output_initialize();
+    if (!device_open || frames == 0 || samples == nullptr || filter == nullptr || slot >= kVoiceCount ||
+        source_rate < kMinSampleRate || source_rate > kMaxSampleRate) return;
+    AudioCommand command;
+    command.kind = AudioCommand::SubmitHrtf;
+    command.slot = slot;
+    command.rate = source_rate;
+    command.volume = volume_hundredth_db;
+    command.filter = *filter;
+    command.reset_hrtf = rendered_reset != nullptr;
+    if (rendered_reset != nullptr) command.rendered = *rendered_reset;
+    const auto *bytes = reinterpret_cast<const uint8_t *>(samples);
+    command.data.assign(bytes, bytes + static_cast<size_t>(frames) * sizeof(int16_t));
+    enqueue(std::move(command));
+}
+
+namespace {
+void submitNow(
+    uint32_t slot, const uint8_t *pcm, uint32_t bytes,
+    uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample,
+    int32_t volume_hundredth_db)
+{
     if (!device_open || bytes == 0) return;
     if (slot >= kVoiceCount || !pcm || bytes > kMaxBufferBytes ||
         sample_rate < kMinSampleRate || sample_rate > kMaxSampleRate ||
@@ -607,3 +708,58 @@ extern "C" void recomp_audio_output_submit(
     }
     if (nonzero) reported_nonzero[slot] = true;
 }
+
+/* Mixer thread: runs the owner thread's queued calls in order, filtering
+   3D voices as the guest thread used to (dsound_buffer_adapter.c pump). */
+void drainCommands()
+{
+    std::vector<AudioCommand> commands;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex);
+        commands.swap(pending_commands);
+    }
+    static float ears[3u * 20000u];
+    for (AudioCommand &command : commands) {
+        switch (command.kind) {
+        case AudioCommand::Reset:
+            resetVoiceNow(command.slot);
+            hrtf_voices[command.slot] = {};
+            break;
+        case AudioCommand::Routing:
+            setRoutingNow(command.slot, command.route);
+            break;
+        case AudioCommand::Submit:
+            submitNow(command.slot, command.data.data(), static_cast<uint32_t>(command.data.size()), command.rate,
+                command.channels, command.bits, command.volume);
+            break;
+        case AudioCommand::SubmitHrtf: {
+            RecompHrtfVoice &hrtf = hrtf_voices[command.slot];
+            if (command.reset_hrtf) {
+                hrtf = RecompHrtfVoice{};
+                hrtf.rendered = command.rendered;
+            }
+            hrtf.filter = command.filter;
+            const auto *samples = reinterpret_cast<const int16_t *>(command.data.data());
+            const uint32_t frames = static_cast<uint32_t>(command.data.size() / sizeof(int16_t));
+            // The APU filters 3D voices at 48 kHz; pieces keep each submission in bounds.
+            uint32_t limit = static_cast<uint32_t>(uint64_t{19000u} * command.rate / RECOMP_HRTF_RATE);
+            if (limit == 0u) limit = 1u;
+            for (uint32_t done = 0u; done < frames;) {
+                const uint32_t piece = frames - done < limit ? frames - done : limit;
+                const uint32_t rendered = recomp_hrtf_render(&hrtf, samples + done, piece, command.rate, ears, 20000u);
+                if (rendered != 0u) submitNow(command.slot, reinterpret_cast<const uint8_t *>(ears), rendered * 12u,
+                    RECOMP_HRTF_RATE, 3u, 32u, command.volume);
+                done += piece;
+            }
+            break;
+        }
+        }
+    }
+    // Keep the swapped-out storage for the next period's calls.
+    std::lock_guard<std::mutex> lock(command_mutex);
+    if (pending_commands.empty()) {
+        commands.clear();
+        pending_commands.swap(commands);
+    }
+}
+} // namespace

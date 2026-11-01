@@ -171,6 +171,9 @@ void execute(PresenterThread &thread, RecompD3dPresenter *backend,
 // Names the worker's own waits in the backend's per-stage timing (weak: a
 // backend without stage timing leaves it unset).
 extern "C" __attribute__((weak)) void doa2u_nx_render_stage_set(const char *name);
+// The draw adapter's phase timing (d3d8_draw_adapter.c); weak for host tests.
+extern "C" __attribute__((weak)) uint64_t recomp_draw_adapter_phase_ns[4];
+extern "C" __attribute__((weak)) uint64_t recomp_draw_adapter_draws;
 // The runner's guest memory (runtime.c); weak so host tests link without it.
 extern "C" __attribute__((weak)) uint8_t *recomp_memory(uint32_t guest_address, size_t width);
 void renderStage(const char *name)
@@ -352,6 +355,15 @@ void notePresent(PresenterThread &thread)
         capture.copied_geometry_bytes * per_frame_mb, capture.compared_bytes * per_frame_mb,
         capture.trusted_bytes * per_frame_mb, capture.direct_bytes * per_frame_mb,
         capture.stable_bytes * per_frame_mb, capture.add_ms / frames);
+    if (&recomp_draw_adapter_draws != nullptr && recomp_draw_adapter_phase_ns != nullptr) {
+        const double per_frame_ms = 1.0 / (1.0e6 * frames);
+        std::fprintf(stderr, "recomp draw adapter: per frame draws=%.0f indices=%.2fms state=%.2fms"
+            " stages=%.2fms submit=%.2fms\n", double(recomp_draw_adapter_draws) / frames,
+            recomp_draw_adapter_phase_ns[0] * per_frame_ms, recomp_draw_adapter_phase_ns[1] * per_frame_ms,
+            recomp_draw_adapter_phase_ns[2] * per_frame_ms, recomp_draw_adapter_phase_ns[3] * per_frame_ms);
+        for (unsigned i = 0u; i < 4u; ++i) recomp_draw_adapter_phase_ns[i] = 0u;
+        recomp_draw_adapter_draws = 0u;
+    }
 #ifdef __SWITCH__
     doa2u_nx_profile_report(frames, elapsed_ms, -1);
 #endif

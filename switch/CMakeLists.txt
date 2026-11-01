@@ -42,6 +42,12 @@ set(NX_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Same code generation rules as the desktop builds (see recomp-runtime):
 # IEEE operation order, no strict aliasing, 32-bit wraparound.
+# 3D voices are HRTF-filtered by the audio mixer thread (core 2) instead of the
+# guest thread: dsound_buffer_adapter.c hands it their mono source.
+add_compile_definitions(RECOMP_AUDIO_DEFERRED_HRTF)
+# Per-phase timing of the draw adapter, reported once a second in the log.
+add_compile_definitions(RECOMP_DRAW_ADAPTER_TIMING)
+
 add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>
     $<$<COMPILE_LANGUAGE:C,CXX>:-fno-strict-aliasing>

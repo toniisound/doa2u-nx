@@ -1511,6 +1511,24 @@ static bool projected_add_stages(uint32_t device)
         stage[32u + 28u] == 0x20000u;
 }
 
+#ifdef RECOMP_DRAW_ADAPTER_TIMING
+#include <time.h>
+/* Host diagnostics: nanoseconds submit_draw spends per phase (indices,
+   transforms and state, textures and stages, presenter submit), summed over
+   draws that reach the presenter; the host reads and clears them. */
+uint64_t recomp_draw_adapter_phase_ns[4];
+uint64_t recomp_draw_adapter_draws;
+static uint64_t draw_timing_now(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
+}
+#define DRAW_TIMING_MARK(name) const uint64_t name = draw_timing_now()
+#else
+#define DRAW_TIMING_MARK(name) do { } while (0)
+#endif
+
 static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     uint32_t stride, uint32_t index_address)
 {
@@ -1531,6 +1549,7 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     if (!points && !quads && !line_strip && primitive != 2u && (primitive < 5u || primitive > 7u))
         recomp_stop(2, "d3d8:draw-primitive:%u", primitive);
     if (triangles == 0u) return;
+    DRAW_TIMING_MARK(timing_start);
     /* Everything but the vertex program starts zeroed: its 136 slots are 5 KB
        of the 8 KB command, consumers read only program_count of them and
        attach_program writes exactly those (zeroing them cost every draw). */
@@ -1624,6 +1643,7 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
         largest -= smallest;
     }
     draw->vertex_count = largest + 1u;
+    DRAW_TIMING_MARK(timing_indices);
     const uint32_t bytes = recomp_d3d_draw_vertex_bytes(stride, largest);
     const uint32_t tail = layout.stride > stride ? layout.stride - stride : 0u;
     if (bytes == 0u || bytes > RECOMP_XBOX_RAM_SIZE - tail) recomp_stop(2, "d3d8:draw-vertex-span");
@@ -1719,6 +1739,7 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     draw->cull_mode = state->cull_mode == 0x900u ? RECOMP_D3D_CULL_CLOCKWISE :
         state->cull_mode == 0x901u ? RECOMP_D3D_CULL_COUNTER_CLOCKWISE : RECOMP_D3D_CULL_NONE;
     draw->texture_factor = state->texture_factor;
+    DRAW_TIMING_MARK(timing_state);
     attach_texture(device, 0u, draw);
     if (draw->texture.volume_depth != 0u &&
         (program || points || draw->fvf != 0x142u ||
@@ -1754,7 +1775,16 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
         draw->line_width = line_width();
         draw->line_antialias = state->edge_antialias != 0u;
     } else if (primitive == 2u) expanded = widen_lines(program || !layout.pretransformed, draw);
+    DRAW_TIMING_MARK(timing_stages);
     recomp_d3d8_submit(&command);
+#ifdef RECOMP_DRAW_ADAPTER_TIMING
+    const uint64_t timing_end = draw_timing_now();
+    recomp_draw_adapter_phase_ns[0] += timing_indices - timing_start;
+    recomp_draw_adapter_phase_ns[1] += timing_state - timing_indices;
+    recomp_draw_adapter_phase_ns[2] += timing_stages - timing_state;
+    recomp_draw_adapter_phase_ns[3] += timing_end - timing_stages;
+    ++recomp_draw_adapter_draws;
+#endif
     free(sequential);
     free(expanded);
     free(packed);
