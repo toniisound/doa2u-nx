@@ -281,6 +281,7 @@ endif()
 add_executable(doa2u-nx
     ${_runtime_sources}
     "${NX_SRC}/nx_main.cpp"
+    "${NX_SRC}/boot_menu.cpp"
     "${NX_SRC}/switch_shims.c"
     "${NX_SRC}/boot_trace.cpp"
     "${NX_SRC}/crash_report.cpp"
@@ -314,6 +315,11 @@ set_source_files_properties("${RUNTIME}/runner.cpp" PROPERTIES
 # while still giving the register allocation the lifted code needs.
 set_source_files_properties(${_recomp_program_sources} PROPERTIES
     COMPILE_OPTIONS "-O2;-w")
+set_source_files_properties(
+    "${RUNTIME}/d3d8_draw_adapter.c"
+    "${RUNTIME}/dsound_buffer_adapter.c"
+    "${RUNTIME}/d3d_presenter_capture.cpp"
+    PROPERTIES COMPILE_OPTIONS "-O3")
 target_compile_options(doa2u-nx PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
 target_link_options(doa2u-nx PRIVATE "-Wl,--wrap=exit" "-Wl,--wrap=abort" "-Wl,--wrap=setvbuf" "-Wl,--wrap=pthread_create"

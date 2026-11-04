@@ -10,6 +10,7 @@
 #include "kernel_abi.h"
 #include "stop_report.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -722,16 +723,20 @@ static void attach_lighting(uint32_t device, const RecompD3dVertexLayout *layout
 
 /* Camera-space reflection inputs: world-view, its normal matrix and the
    texture matrix of the generating stage (TEXTURE0 0xce0, TEXTURE1 0xd20). */
-/* World 3x3 rank of at most one: every row pair has a zero cross product.
-   Float products are exact in double, so the test is exact. */
+/* World 3x3 rank of at most one: every row pair has a zero cross product, up to
+   rounding. 0xea6e0 scales rows 0 and 2 of the stack top by zero (0x283d30), so
+   each child world entry is one rounded product of the surviving row. Rounding
+   each entry once moves a 2x2 minor by at most FLT_EPSILON times its two terms
+   (exact in double); this allows twice that. Issue #32's squash reached 0.26. */
 static bool world_collapses_to_line(const float world[16])
 {
     for (uint32_t a = 0u; a < 2u; ++a)
         for (uint32_t b = a + 1u; b < 3u; ++b)
             for (uint32_t c = 0u; c < 3u; ++c) {
                 const uint32_t x = (c + 1u) % 3u, y = (c + 2u) % 3u;
-                if ((double)world[a * 4u + x] * world[b * 4u + y] !=
-                    (double)world[a * 4u + y] * world[b * 4u + x]) return false;
+                const double p = (double)world[a * 4u + x] * world[b * 4u + y];
+                const double q = (double)world[a * 4u + y] * world[b * 4u + x];
+                if (!(fabs(p - q) <= 2.0 * FLT_EPSILON * (fabs(p) + fabs(q)))) return false;
             }
     return true;
 }
@@ -875,6 +880,7 @@ static bool attach_reflection(uint32_t device, const RecompD3dVertexLayout *layo
         if (!isfinite(draw->reflection_diffuse[i])) recomp_stop(2, "d3d8:reflection-material");
     draw->reflection_mesh_uv = stages[1][28] == 0u;
     draw->reflection_premultiplied = stages[1][12] == 16u;
+    draw->reflection_color_only = stages[1][16] == 2u;
     draw->reflection_alpha_kill = stages[1][11] == 4u;
     draw->reflection_stage2 = stages[2][12] == 14u;
     if (draw->reflection_stage2) {
@@ -941,6 +947,92 @@ static void stage1_mask(uint32_t device, const RecompD3dVertexLayout *layout, ui
     draw->stage1_alpha_mask = true;
     draw->stage1_alpha_kill = stage[1][11] == 4u;
     draw->stage1_kill_only = kill_only;
+}
+
+/* Tina's Story ending (0x257ee0) adds up to three projected light textures to stage
+   0's: stages 1-3 ADD(TEXTURE, CURRENT) over camera-space position, COUNT3|PROJECTED,
+   each through its own TEXTUREn. A DISABLE stage ends the chain, and a stage without
+   a texture compiles to a CURRENT pass-through (0x352e46). Stages share the three 2D
+   slots by texture and sampler state, so a fourth distinct pair stops. */
+static void projected_stages(uint32_t device, const uint32_t stage[4][32],
+    RecompD3dPresenterDrawCommand *draw)
+{
+    /* Lighting was skipped, so stage 0 must not read lit RGB: SELECTARG1(TEXTURE) color
+       and SELECTARG1(DIFFUSE or CURRENT) alpha. */
+    const bool lit = *recomp_memory_u32(0x3553f8u) != 0u;
+    if (stage[0][21] != 0x103u || stage[0][7] != 0u || draw->texture.linear ||
+        (lit && (stage[0][12] != 2u || stage[0][14] != 2u || stage[0][16] != 2u || stage[0][18] > 1u)) ||
+        draw->texture.volume_depth != 0u || draw->palette_bytes != NULL ||
+        draw->modulate_texture_factor || draw->modulate_texture_factor_alpha ||
+        draw->texture_factor_modulate || draw->texture_factor_color_scale != 0u)
+        recomp_stop(2, "d3d8:projected-stages:%x:%u:%x", stage[0][21], stage[0][7], draw->texture.format_byte);
+    struct Slot {
+        RecompD3dTextureDesc texture;
+        const void *bytes;
+        uint32_t byte_count, u, v;
+        bool point;
+        float bias;
+    } slots[3] = {{draw->texture, draw->texture_bytes, draw->texture_byte_count,
+        draw->address_u, draw->address_v, draw->point_mip_filter, draw->mip_lod_bias}};
+    uint32_t used = 1u;
+    for (uint32_t i = 1u; i < 4u && stage[i][12] != 1u; ++i) {
+        const uint32_t *s = stage[i];
+        if (s[12] != 7u || s[14] != 2u || s[15] != 1u || s[16] != 2u || s[18] != 1u ||
+            s[21] != 0x103u || s[28] != 0x20000u || s[7] != 0u || s[11] != 0u || s[3] != 2u || s[4] != 2u)
+            recomp_stop(2, "d3d8:projected-stage:%u:%u,%u,%u/%u,%u:%x,%x:maxmip=%u:kill=%u:filter=%u,%u",
+                i, s[12], s[14], s[15], s[16], s[18], s[21], s[28], s[7], s[11], s[3], s[4]);
+        draw->projected_stage_count = i;
+        draw->projected_slots[i - 1u] = -1;
+        RecompD3dPresenterDrawCommand bound = {0};
+        attach_texture(device, i, &bound);
+        if (!bound.has_texture) continue;
+        const RecompD3dTextureDesc *t = &bound.texture;
+        if (t->linear || bound.palette_bytes != NULL || t->format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8 ||
+            (t->mip_levels > 1u && s[5] != 1u && s[5] != 2u))
+            recomp_stop(2, "d3d8:projected-stage-texture:%u:%x:mip=%u", i, t->format_byte, s[5]);
+        const struct Slot wanted = {*t, bound.texture_bytes, bound.texture_byte_count,
+            bound.address_u, bound.address_v, s[5] == 1u, lod_bias(s[6])};
+        uint32_t slot = 0u;
+        while (slot < used && !(slots[slot].texture.data == t->data &&
+            slots[slot].texture.format_byte == t->format_byte && slots[slot].texture.width == t->width &&
+            slots[slot].texture.height == t->height && slots[slot].texture.mip_levels == t->mip_levels &&
+            slots[slot].u == wanted.u && slots[slot].v == wanted.v &&
+            slots[slot].point == wanted.point && slots[slot].bias == wanted.bias)) ++slot;
+        if (slot == 3u) recomp_stop(2, "d3d8:projected-stage-slots");
+        if (slot == used) slots[used++] = wanted;
+        draw->projected_slots[i - 1u] = (int32_t)slot;
+        float *m = draw->projected_transforms[i - 1u];
+        recomp_guest_load(m, device + 0xce0u + i * 64u, 64u);
+        for (uint32_t k = 0u; k < 16u; ++k)
+            if (k % 4u < 3u && !isfinite(m[k])) recomp_stop(2, "d3d8:projected-stage-transform:%u", i);
+    }
+    if (used > 1u) {
+        draw->reflection_texture = slots[1].texture;
+        draw->reflection_bytes = slots[1].bytes;
+        draw->reflection_byte_count = slots[1].byte_count;
+        draw->reflection_address_u = slots[1].u;
+        draw->reflection_address_v = slots[1].v;
+        draw->reflection_point_mip_filter = slots[1].point;
+        draw->reflection_mip_lod_bias = slots[1].bias;
+    }
+    if (used > 2u) {
+        draw->reflection_stage2_texture = slots[2].texture;
+        draw->reflection_stage2_bytes = slots[2].bytes;
+        draw->reflection_stage2_byte_count = slots[2].byte_count;
+        draw->reflection_stage2_address_u = slots[2].u;
+        draw->reflection_stage2_address_v = slots[2].v;
+        draw->reflection_stage2_point_mip_filter = slots[2].point;
+        draw->reflection_stage2_mip_lod_bias = slots[2].bias;
+    }
+    if (lit) {
+        /* Lit RGB is never read; V0.a is the material diffuse alpha (0x34fc80). */
+        float alpha;
+        recomp_guest_load(&alpha, device + 0xf0cu, sizeof alpha);
+        if (isnan(alpha)) alpha = signbit(alpha) ? 0.0f : 1.0f;
+        if (!isfinite(alpha)) recomp_stop(2, "d3d8:projected-stages-material-alpha");
+        draw->material_alpha = alpha;
+        draw->material_alpha_mode = RECOMP_D3D_MATERIAL_ALPHA_SELECT_DIFFUSE;
+    }
 }
 
 static bool fixed_stages(uint32_t device, const RecompD3dVertexLayout *layout,
@@ -1088,7 +1180,9 @@ static bool fixed_stages(uint32_t device, const RecompD3dVertexLayout *layout,
                 draw->texture_factor_color_scale)) ||
             (draw->modulate_texture_factor && draw->texture_factor_modulate))
             recomp_stop(2, "d3d8:texture-factor-twice");
-        if (stage[1][12] != 1u && !draw->modulate_texture_factor && !draw->has_reflection && !stage1_alpha)
+        if (draw->texgen_projected && stage[1][12] == 7u)
+            projected_stages(device, (const uint32_t (*)[32])stage, draw);
+        else if (stage[1][12] != 1u && !draw->modulate_texture_factor && !draw->has_reflection && !stage1_alpha)
             recomp_stop(2, "d3d8:draw-texture-stages:%u,%u,%u/%u,%u,%u:%u,%u,%u/%u,%u,%u:%u,%u:"
                 "s2=%u,%u/%u,%u:s3=%u:t2=%u:addr=%u,%u,%u,%u:kill=%u,%u:tc=%x,%x,%x,%x:tc2=%x,%x,%x",
                 stage[0][12], stage[0][14], stage[0][15], stage[0][16], stage[0][18], stage[0][19],
@@ -1327,11 +1421,20 @@ static uint8_t *point_sprites(uint32_t device, const RecompD3dVertexLayout *layo
     const bool lighting = *recomp_memory_u32(0x3553f8u) != 0u;
     if (lighting && (!(color_texture || color_factor) || *recomp_memory_u32(0x355494u) != 0u))
         recomp_stop(2, "d3d8:point-sprite-lighting");
+    /* Lit alpha follows NV2A's color-material diffuse source, which 0x34ee70 builds
+       from COLORVERTEX (0x355404) and DIFFUSEMATERIALSOURCE (0x35541c), dropping
+       COLOR1 without a vertex color: COLOR1 keeps vertex alpha, MATERIAL takes the
+       diffuse alpha 0x34fc80 uploads. Koku-An's (0x1ed3a0) and the snowy White
+       Storm's (0x1a54a0) snow is lit COLOR1 with material alpha 0. */
+    const uint32_t diffuse_source = *recomp_memory_u32(0x355404u) != 0u ? *recomp_memory_u32(0x35541cu) : 0u;
+    if (lighting && diffuse_source == 2u && layout->specular_offset != RECOMP_D3D_FVF_ABSENT)
+        recomp_stop(2, "d3d8:point-sprite-specular-alpha");
+    const bool material_alpha = lighting &&
+        !(diffuse_source == 1u && layout->diffuse_offset != RECOMP_D3D_FVF_ABSENT);
     if (color_factor || alpha_factor)
         draw->directional.stage_mode = stage0_select(stage, draw->directional.stage, NULL);
-    if (lighting && alpha_modulate) {
-        /* 0x34fc80 supplies material diffuse alpha even with vertex-color sources;
-           texture-only RGB does not consume the lighting RGB calculation. */
+    if (material_alpha && alpha_modulate) {
+        /* Texture-only RGB does not consume the lighting RGB calculation. */
         float alpha;
         recomp_guest_load(&alpha, device + 0xf0cu, sizeof alpha);
         if (isnan(alpha)) alpha = signbit(alpha) ? 0.0f : 1.0f;
@@ -1384,7 +1487,7 @@ static uint8_t *point_sprites(uint32_t device, const RecompD3dVertexLayout *layo
         if (layout->diffuse_offset != RECOMP_D3D_FVF_ABSENT)
             memcpy(&diffuse, vertex + layout->diffuse_offset, sizeof diffuse);
         if (color_texture) diffuse |= 0x00ffffffu;
-        if (alpha_texture || lighting) diffuse |= 0xff000000u;
+        if (alpha_texture || material_alpha) diffuse |= 0xff000000u;
         for (uint32_t k = 0u; k < 4u; ++k) {
             const float u = (float)(k & 1u), v = (float)(k >> 1u);
             corners[i * 4u + k] = (Corner){eye[0] + (2.0f * u - 1.0f) * dx,
@@ -1403,6 +1506,46 @@ static uint8_t *point_sprites(uint32_t device, const RecompD3dVertexLayout *layo
     draw->cull_mode = RECOMP_D3D_CULL_NONE;
     memcpy(draw->transform, p, sizeof p);
     return storage;
+}
+
+/* D3D8 table fog as 0x34f5f0 programs it: FogEnable 0x3553d0, table mode 0x3553d4
+   (1 EXP, 2 EXP2, 3 LINEAR), start, end and density at 0x3553d8-0x3553e0 and the
+   color at 0x355488 (FUN_00286000 sets them per stage). Linear pushes bias
+   1 + end/(end - start) and scale -1/(end - start); NV2A is assumed to subtract 1
+   as xemu models it (unmeasured), leaving (end - d)/(end - start) on planar eye depth d.
+   shortcut: range fog (0x3553e4), vertex fog (mode 0), projections that mix eye
+   x/y into w and invalid ranges stay unfogged, and EXP/EXP2 use D3D8's density
+   formulas over the SDK's scaled encoding; check a hardware capture if they differ. */
+static void attach_fog(uint32_t device, RecompD3dPresenterDrawCommand *draw)
+{
+    const uint32_t mode = *recomp_memory_u32(0x3553d4u);
+    if (*recomp_memory_u32(0x3553d0u) == 0u || *recomp_memory_u32(0x3553e4u) != 0u ||
+        mode == 0u || mode > 3u) return;
+    float range[3], p[16];
+    recomp_guest_load(range, 0x3553d8u, sizeof range);
+    recomp_guest_load(p, device + 0xca0u, sizeof p);
+    if (p[3] != 0.0f || p[7] != 0.0f || p[11] == 0.0f || !isfinite(p[11]) || !isfinite(p[15])) return;
+    if (mode == 3u ? !(isfinite(range[0]) && isfinite(range[1]) && range[1] != range[0])
+        : !(isfinite(range[2]) && range[2] >= 0.0f)) return;
+    draw->fog_mode = mode == 3u ? 1u : mode + 1u;
+    draw->fog_start = range[0];
+    draw->fog_end = range[1];
+    draw->fog_density = range[2];
+    draw->fog_depth[0] = 1.0f / p[11];
+    draw->fog_depth[1] = -p[15] / p[11];
+    draw->fog_color = *recomp_memory_u32(0x355488u);
+}
+
+/* Stage 1 ADDs a texture over stage 0's camera-space projection, as Tina's Story
+   ending (0x257ee0) does on lit meshes without normals. Every stage's color reads
+   its texture, and V0 supplies only alpha, which 0x34fc80 sends as material
+   diffuse alpha, so lighting is not evaluated (see projected_stages). */
+static bool projected_add_stages(uint32_t device)
+{
+    const uint32_t *stage = recomp_memory_u32(STAGES);
+    return *recomp_memory_u32(device + PIXEL_HANDLE) == 0u && stage[28] == 0x20000u &&
+        stage[32u + 12u] == 7u && stage[32u + 14u] == 2u && stage[32u + 15u] == 1u &&
+        stage[32u + 28u] == 0x20000u;
 }
 
 static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
@@ -1425,17 +1568,8 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     if (!points && !quads && !line_strip && primitive != 2u && (primitive < 5u || primitive > 7u))
         recomp_stop(2, "d3d8:draw-primitive:%u", primitive);
     if (triangles == 0u) return;
-    /* Everything but the vertex program starts zeroed: its 136 slots are 5 KB
-       of the 8 KB command, consumers read only program_count of them and
-       attach_program writes exactly those (zeroing them cost every draw). */
-    RecompD3dPresenterCommand command;
+    RecompD3dPresenterCommand command = {0};
     RecompD3dPresenterDrawCommand *draw = &command.data.draw;
-    {
-        char *const begin = (char *)&command, *const program = (char *)draw->program;
-        char *const after = (char *)(draw->program + 136), *const end = (char *)(&command + 1);
-        memset(begin, 0, (size_t)(program - begin));
-        memset(after, 0, (size_t)(end - after));
-    }
     draw->fvf = *recomp_memory_u32(device + 0x798u);
     const bool program = (draw->fvf & 1u) != 0u;
     recomp_d3d8_target(&draw->target);
@@ -1563,7 +1697,21 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
             free(packed);
             return;
         }
-        multiply(view, projection, vp, "view-projection");
+        /* The camera matrices stay constant across most draws in a frame. Cache
+           their product while comparing the complete inputs to preserve exact
+           behavior when the game changes either matrix. */
+        static float cached_view[16], cached_projection[16], cached_vp[16];
+        static bool cached_view_projection;
+        if (!cached_view_projection || memcmp(view, cached_view, sizeof view) != 0 ||
+            memcmp(projection, cached_projection, sizeof projection) != 0) {
+            multiply(view, projection, vp, "view-projection");
+            memcpy(cached_view, view, sizeof view);
+            memcpy(cached_projection, projection, sizeof projection);
+            memcpy(cached_vp, vp, sizeof vp);
+            cached_view_projection = true;
+        } else {
+            memcpy(vp, cached_vp, sizeof vp);
+        }
         multiply(world, vp, draw->transform, "world");
         draw->has_transform = true;
         draw->blend_weight_count = layout.blend_weight_count;
@@ -1619,7 +1767,8 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
          *recomp_memory_u32(device + PIXEL_HANDLE) != 0u ||
          draw->address_w < 1u || draw->address_w > 3u))
         recomp_stop(2, "d3d8:volume-draw-layout:fvf=%x:w=%u", draw->fvf, draw->address_w);
-    if (!program && !points) attach_lighting(device, &layout, draw);
+    const bool unlit_projected = !program && !points && draw->has_texture && projected_add_stages(device);
+    if (!program && !points && !unlit_projected) attach_lighting(device, &layout, draw);
     uint8_t *expanded = NULL;
     if (points && (program || *recomp_memory_u32(device + PIXEL_HANDLE) != 0u)) {
         recomp_stop(2, "d3d8:draw-points-unbound");
@@ -1639,8 +1788,12 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
             free(packed);
             return;
         }
+        if (unlit_projected && draw->projected_stage_count == 0u)
+            recomp_stop(2, "d3d8:projected-stages-unrouted");
     }
     command.type = RECOMP_D3D_PRESENTER_COMMAND_DRAW;
+    if (!program && !layout.pretransformed && *recomp_memory_u32(device + PIXEL_HANDLE) == 0u)
+        attach_fog(device, draw);
     if (native_line) {
         draw->line_width = line_width();
         draw->line_antialias = state->edge_antialias != 0u;

@@ -76,11 +76,23 @@ static uint64_t now_ms(void)
 static Buffer *buffer_at(uint32_t handle)
 {
     uint32_t address = canonical(handle);
+    /* DOA2 polls the same DirectSound voice repeatedly (notably GetStatus).
+       Revalidate guest fields so released or recycled voices still use lookup. */
+    static uint32_t cached_handle;
+    static Buffer *cached_buffer;
+    if (cached_buffer && handle == cached_handle &&
+        address == cached_buffer->root + PUBLIC_OFFSET &&
+        read32(cached_buffer->root + 4u) == cached_buffer->references &&
+        read32(address) == cached_buffer->settings) return cached_buffer;
     for (uint32_t i = 0; i < BUFFER_COUNT; ++i) {
         Buffer *buffer = &buffers[i];
         if (buffer->root && address == buffer->root + PUBLIC_OFFSET &&
             read32(buffer->root + 4u) == buffer->references &&
-            read32(address) == buffer->settings) return buffer;
+            read32(address) == buffer->settings) {
+            cached_handle = handle;
+            cached_buffer = buffer;
+            return buffer;
+        }
     }
     recomp_stop(2, "dsound:buffer-handle-invalid:%08x", handle);
     return NULL;

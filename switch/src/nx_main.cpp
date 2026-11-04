@@ -40,6 +40,7 @@
 #endif
 
 int recomp_runner_main(int argc, char **argv); // runner.cpp main, renamed at compile time
+extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, int *selected_widescreen);
 extern "C" void __real_exit(int code) __attribute__((noreturn));
 
 extern "C" {
@@ -466,6 +467,55 @@ void __wrap_exit(int code)
 
 } // extern "C"
 
+
+namespace {
+const char kResolutionOptions[] = "sdmc:/switch/doa2u-nx/doa2u-nx.ini";
+int readResolution()
+{
+    FILE *file = std::fopen(kResolutionOptions, "r");
+    if (file == nullptr) return 600;
+    int height = 600;
+    char line[96];
+    while (std::fgets(line, sizeof line, file)) {
+        int value = 0;
+        if (std::sscanf(line, " resolution = %d", &value) == 1 &&
+            (value == 720 || value == 600 || value == 480)) height = value;
+    }
+    std::fclose(file);
+    return height;
+}
+int readWidescreen()
+{
+    FILE *file = std::fopen(kResolutionOptions, "r");
+    if (file == nullptr) return 1;
+    int widescreen = 0;
+    char line[96];
+    while (std::fgets(line, sizeof line, file)) {
+        int value = 0;
+        if (std::sscanf(line, " widescreen = %d", &value) == 1 &&
+            (value == 0 || value == 1)) widescreen = value;
+    }
+    std::fclose(file);
+    return widescreen;
+}
+void writeResolution(int height, int widescreen)
+{
+    FILE *file = std::fopen(kResolutionOptions, "w");
+    if (file == nullptr) return;
+    std::fprintf(file, "; DOA2U NX boot menu choice\nresolution=%d\nwidescreen=%d\n", height, widescreen);
+    std::fclose(file);
+}
+int chooseResolution(int initial_height, int initial_widescreen, int *selected_widescreen)
+{
+    consoleExit(nullptr);
+    console_state = nullptr;
+    console_ready = false;
+    const int height = doa2u_nx_boot_menu(initial_height, initial_widescreen, selected_widescreen);
+    console_state = consoleInit(nullptr);
+    console_ready = true;
+    return height;
+}} // namespace
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -500,66 +550,48 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // R runs unpaced (as fast as the CPU allows, to measure headroom above
-    // 60 fps); L keeps the original 4:3 picture instead of the game's own
-    // 16:9 mode; Y skips the intro movies. There is no CPU boost: boost mode
-    // would drop the GPU to 76.8 MHz. Clock the console with sys-clk instead.
-    // Boot options: a 2 s window in which pressing (or holding) a button
-    // turns its option on. Reading only the buttons held at launch is not
-    // reliable: Eden delivers no pad state for the first moments.
+    // Keep the one-boot shortcuts while the controller initializes.
+    // Eden may report empty pad state during the first moments after launch.
     PadState pad;
     padInitializeDefault(&pad);
-    std::printf("\nOpciones (pulsa ahora):\n");
-    std::printf("  Y  saltar los videos de intro\n");
-    std::printf("  L  imagen 4:3 en vez de 16:9\n");
-    std::printf("  R  sin limite de FPS (unpaced)\n");
-    std::printf("  X  render a 480p (menos carga de GPU) en vez de 720p\n");
-    std::printf("  A  empezar ya\n");
-    consoleUpdate(nullptr);
     u64 held = 0;
-    const u64 start = armGetSystemTick();
-    int shown = -1;
-    for (;;) {
+    for (int i = 0; i < 30 && appletMainLoop(); ++i) {
         padUpdate(&pad);
         held |= padGetButtons(&pad) | padGetButtonsDown(&pad);
-        const double elapsed = armTicksToNs(armGetSystemTick() - start) / 1e9;
-        if (elapsed >= 2.0 || (held & HidNpadButton_A) || !appletMainLoop()) break;
-        const int tenths = static_cast<int>((2.0 - elapsed) * 10.0);
-        if (tenths != shown) {
-            shown = tenths;
-            std::printf("\r  %.1f s   %s%s%s%s\x1b[K", tenths / 10.0,
-                (held & HidNpadButton_Y) ? "[sin intro] " : "",
-                (held & HidNpadButton_L) ? "[4:3] " : "",
-                (held & HidNpadButton_R) ? "[unpaced] " : "",
-                (held & HidNpadButton_X) ? "[480p] " : "");
-            consoleUpdate(nullptr);
-        }
         svcSleepThread(16'000'000);
     }
-    std::printf("\n");
     const bool unpaced = (held & HidNpadButton_R) != 0;
-    const bool narrow = (held & HidNpadButton_L) != 0;
+
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
-    const bool low_resolution = (held & HidNpadButton_X) != 0;
+    int widescreen = readWidescreen();
+    const int resolution = chooseResolution(readResolution(), widescreen, &widescreen);
+    if (resolution == 0) {
+        std::fprintf(stderr, "[nx] left from the boot menu\n");
+        consoleExit(nullptr);
+        console_ready = false;
+        return 0;
+    }
+    writeResolution(resolution, widescreen);
     if (unpaced) {
         setenv("RECOMP_UNPACED", "1", 1);
         std::fprintf(stderr, "[nx] RECOMP_UNPACED=1 (R held at boot)\n");
     }
     // The kernel's XC_VIDEO and XC_AUDIO settings follow these, as the
     // launcher sets them on PC. The console outputs stereo.
-    setenv("RECOMP_D3D_WIDESCREEN", narrow ? "0" : "1", 1);
+    setenv("RECOMP_D3D_WIDESCREEN", widescreen ? "1" : "0", 1);
     unsetenv("RECOMP_AUDIO_SURROUND");
-    // The game renders 480 lines; 1.5x is the 720p of the handheld screen.
-    setenv("RECOMP_D3D_SCALE", low_resolution ? "1" : "1.5", 1);
+    // Match the selected output height to the game's 480-line render target.
+    char scale[16];
+    std::snprintf(scale, sizeof scale, "%.4f", resolution / 480.0);
+    setenv("RECOMP_D3D_SCALE", scale, 1);
     // Compiled draw shaders persist on the SD card, so later boots skip
     // glslang and SPIRV-Cross and only link them.
     mkdir(kShaderCache, 0777);
     setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
-    std::fprintf(stderr, "[nx] boot options: unpaced=%d widescreen=%d skip_intro=%d scale=%s (buttons 0x%llx)\n",
-        unpaced ? 1 : 0, narrow ? 0 : 1, skip_intro ? 1 : 0, low_resolution ? "1" : "1.5",
-        (unsigned long long)held);
-    std::printf("\nModo: %s, %s, %s%s\n", unpaced ? "sin limite (unpaced)" : "60 Hz",
-        narrow ? "4:3" : "16:9", low_resolution ? "480p" : "720p", skip_intro ? ", sin videos de intro" : "");
+    std::fprintf(stderr, "[nx] boot options: resolution=%dp unpaced=%d widescreen=%d skip_intro=%d\n",
+        resolution, unpaced ? 1 : 0, widescreen, skip_intro ? 1 : 0);
+    std::printf("\nModo: %dp, %s, %s%s\n", resolution, unpaced ? "sin limite (unpaced)" : "60 Hz",
+        widescreen ? "16:9" : "4:3", skip_intro ? ", sin videos de intro" : "");
     std::printf("Arrancando...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);

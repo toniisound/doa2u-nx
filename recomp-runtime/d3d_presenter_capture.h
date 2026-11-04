@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <new>
+#include <memory_resource>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,7 +35,7 @@ public:
     enum Kind : uint32_t { COMMAND, RELEASE, REPORT, INVALIDATE };
     struct Record { Kind kind; uint32_t base; uint32_t size; };
 
-    D3dCapturePacket() = default;
+    D3dCapturePacket();
     D3dCapturePacket(const D3dCapturePacket &) = delete;
     D3dCapturePacket &operator=(const D3dCapturePacket &) = delete;
     D3dCapturePacket(D3dCapturePacket &&) noexcept = default;
@@ -90,7 +91,7 @@ private:
     // resize() appends uninitialized words; add() overwrites the used bytes.
     std::vector<uint64_t, NoInitAllocator<uint64_t>> payload_;
     // Keyed by source, size and sampled bytes; memcmp still confirms each reuse.
-    std::unordered_multimap<uint64_t, Span> spans_;
+    std::pmr::unordered_multimap<uint64_t, Span> spans_;
     bool sealed_ = false;
     // Bumped by addInvalidate and addRelease: older spans need a compare.
     uint32_t epoch_ = 0u;

@@ -78,6 +78,18 @@ void copyCommand(RecompD3dPresenterCommand &to, const RecompD3dPresenterCommand 
 
 } // namespace
 
+namespace {
+std::pmr::unsynchronized_pool_resource &captureSpanPool()
+{
+    static std::pmr::unsynchronized_pool_resource pool;
+    return pool;
+}
+}
+
+D3dCapturePacket::D3dCapturePacket() : spans_(&captureSpanPool())
+{
+}
+
 D3dCaptureStats d3d_capture_take_stats()
 {
     const D3dCaptureStats taken = stats;
