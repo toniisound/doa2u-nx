@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <new>
 #include <memory>
@@ -108,6 +110,7 @@ struct DrawPipeline {
     bool scaled_depth_bias;
     bool sample_depth_bias;
     bool coverage_only;
+    bool projected_stages;
     ID3D11VertexShader *vertex_shader;
     ID3D11GeometryShader *geometry_shader;
     ID3D11PixelShader *pixel_shader;
@@ -979,7 +982,7 @@ RecompD3dPresenterError bindTarget(
             desc.width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
             desc.height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
             (desc.format_byte != RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 &&
-             desc.format_byte != 0x12u)) {
+             desc.format_byte != 0x07u && desc.format_byte != 0x12u)) {
             std::fprintf(stderr,
                 "recomp d3d presenter: unsupported target data=0x%08X "
                 "fmt=0x%02X size=%ux%u no_depth=%d\n",
@@ -1054,6 +1057,11 @@ RecompD3dPresenterError bindTarget(
             }
             presenter->target_bytes += bytes;
             entry = &presenter->render_targets.back();
+            // X8R8G8B8 samples alpha as 1, even before the guest's first clear.
+            if (desc.format_byte == 0x07u) {
+                const float opaque[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                presenter->context->ClearRenderTargetView(entry->render_view, opaque);
+            }
             std::fprintf(stderr,
                 "recomp d3d presenter: render target data=0x%08X "
                 "fmt=0x%02X size=%ux%u\n",
@@ -1169,10 +1177,101 @@ RecompD3dPresenterError submitClear(
     return RECOMP_D3D_PRESENTER_OK;
 }
 
-/* Compiled draw shaders, keyed by entry point and source. Shared by the boot
-   precompile thread and the render worker; blobs live until exit. */
+/* Compiled draw shaders, keyed by a hash of target, entry point and source. Shared
+   by the boot precompile thread and the render worker; blobs live until exit. */
 std::mutex compiled_shaders_lock;
-std::unordered_map<std::string, ID3DBlob *> compiled_shaders;
+std::unordered_map<uint64_t, ID3DBlob *> compiled_shaders;
+
+/* RECOMP_SHADER_CACHE keeps compiled draw shaders as <hash>.dxbc, so a later launch
+   loads them at boot instead of compiling them in the middle of a fight. */
+std::filesystem::path shaderCachePath(uint64_t hash)
+{
+    const wchar_t *folder = _wgetenv(L"RECOMP_SHADER_CACHE");
+    if (folder == nullptr || folder[0] == L'\0') return {};
+    char name[24];
+    std::snprintf(name, sizeof name, "%016llx.dxbc", static_cast<unsigned long long>(hash));
+    return std::filesystem::path(folder) / name;
+}
+
+ID3DBlob *readShaderCache(const std::filesystem::path &path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const std::streamoff size = file ? static_cast<std::streamoff>(file.tellg()) : 0;
+    ID3DBlob *blob = nullptr;
+    if (size < 32 || FAILED(D3DCreateBlob(static_cast<SIZE_T>(size), &blob))) return nullptr;
+    file.seekg(0);
+    const char *bytes = static_cast<const char *>(blob->GetBufferPointer());
+    uint32_t total = 0u;
+    // A DXBC container starts with its magic and states its own size at byte 24.
+    if (!file.read(static_cast<char *>(blob->GetBufferPointer()), size) ||
+        std::memcmp(bytes, "DXBC", 4u) != 0 ||
+        (std::memcpy(&total, bytes + 24, sizeof total), total != static_cast<uint32_t>(size)))
+        releaseCom(blob);
+    return blob;
+}
+
+void writeShaderCache(const std::filesystem::path &path, ID3DBlob *blob)
+{
+    // Written beside the entry and renamed, so a reader never sees half of one.
+    std::filesystem::path partial = path;
+    partial += L".tmp" + std::to_wstring(GetCurrentThreadId());
+    {
+        std::ofstream file(partial, std::ios::binary | std::ios::trunc);
+        file.write(static_cast<const char *>(blob->GetBufferPointer()),
+            static_cast<std::streamsize>(blob->GetBufferSize()));
+        file.close();
+        if (!file) {
+            std::error_code ignored;
+            std::filesystem::remove(partial, ignored);
+            return;
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(partial, path, error);
+    if (error) std::filesystem::remove(partial, error);
+}
+
+/* Keeps a blob for later lookups; the caller keeps its own reference. */
+void rememberShader(uint64_t hash, ID3DBlob *blob)
+{
+    std::lock_guard<std::mutex> lock(compiled_shaders_lock);
+    if (compiled_shaders.emplace(hash, blob).second) blob->AddRef();
+}
+
+/* Entries from older runtimes stay until the folder passes kShaderCacheLimit,
+   which clears it; a version uses about 40, so that is many updates. */
+constexpr unsigned kShaderCacheLimit = 1024u;
+
+unsigned loadCachedDrawShaders(const std::atomic<bool> *stop)
+{
+    const std::filesystem::path any = shaderCachePath(0u);
+    if (any.empty()) return 0u;
+    std::vector<std::filesystem::path> entries;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(any.parent_path(), error), end;
+         !error && it != end; it.increment(error)) {
+        // Only names shaderCachePath writes: 16 hex digits and .dxbc.
+        const std::wstring stem = it->path().stem().wstring();
+        if (it->path().extension() == L".dxbc" && stem.size() == 16u &&
+            stem.find_first_not_of(L"0123456789abcdef") == std::wstring::npos)
+            entries.push_back(it->path());
+    }
+    if (entries.size() > kShaderCacheLimit) {
+        for (const std::filesystem::path &path : entries) std::filesystem::remove(path, error);
+        return 0u;
+    }
+    unsigned loaded = 0u;
+    for (const std::filesystem::path &path : entries) {
+        if (stop->load()) break;
+        const uint64_t hash = std::wcstoull(path.stem().c_str(), nullptr, 16);
+        ID3DBlob *blob = readShaderCache(path);
+        if (blob == nullptr) continue;
+        rememberShader(hash, blob);
+        releaseCom(blob);
+        ++loaded;
+    }
+    return loaded;
+}
 
 bool compileDrawShader(
     const char *source,
@@ -1180,15 +1279,25 @@ bool compileDrawShader(
     const char *target,
     ID3DBlob **blob)
 {
-    std::string key = std::string(target) + '\n' + entry_point + '\n' + source;
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (const char *text : {"doa2u-d3d11-shader-1", target, entry_point, source}) {
+        for (const unsigned char *c = reinterpret_cast<const unsigned char *>(text); *c; ++c)
+            hash = (hash ^ *c) * 0x100000001b3ull;
+        hash = (hash ^ 0xffu) * 0x100000001b3ull;
+    }
     {
         std::lock_guard<std::mutex> lock(compiled_shaders_lock);
-        const auto found = compiled_shaders.find(key);
+        const auto found = compiled_shaders.find(hash);
         if (found != compiled_shaders.end()) {
             *blob = found->second;
             (*blob)->AddRef();
             return true;
         }
+    }
+    const std::filesystem::path cached = shaderCachePath(hash);
+    if (!cached.empty() && (*blob = readShaderCache(cached)) != nullptr) {
+        rememberShader(hash, *blob);
+        return true;
     }
 
     ID3DBlob *errors = nullptr;
@@ -1217,25 +1326,28 @@ bool compileDrawShader(
     }
     releaseCom(errors);
     if (SUCCEEDED(result)) {
-        std::lock_guard<std::mutex> lock(compiled_shaders_lock);
-        if (compiled_shaders.emplace(std::move(key), *blob).second) {
-            (*blob)->AddRef();
-        }
+        rememberShader(hash, *blob);
+        if (!cached.empty()) writeShaderCache(cached, *blob);
     }
     return SUCCEEDED(result);
 }
 
-// ponytail: fixed list; vertex-program shaders and unlisted FVFs still compile on first use.
+/* Loads every shader an earlier launch compiled, including vertex-program ones,
+   then compiles the fixed FVF list; anything else still compiles on first use. */
 void precompileDrawShaders(const std::atomic<bool> *stop)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
     const ULONGLONG start = GetTickCount64();
     uint32_t compiled = 0u;
+    unsigned loaded = 0u;
     try {
-        for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
+        loaded = loadCachedDrawShaders(stop);
+        std::vector<RecompD3dDrawShaderKey> keys;
+        for (const uint32_t fvf : kRecompD3dBootDrawFvfs) keys.push_back({fvf, 0u, nullptr, false, false, false});
+        keys.push_back({0x142u, 0u, nullptr, false, false, false, true});
+        for (const RecompD3dDrawShaderKey &key : keys) {
             RecompD3dVertexLayout layout;
             std::string source;
-            const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
             if (!recomp_d3d_draw_shader_source(key, layout, source)) continue;
             for (const char *stage : {"vs", "ps"}) {
                 if (stop->load()) return;
@@ -1249,8 +1361,8 @@ void precompileDrawShaders(const std::atomic<bool> *stop)
     } catch (const std::exception &) {
         return;  // Remaining shaders compile on first use.
     }
-    std::fprintf(stderr, "recomp d3d presenter: precompiled %u draw shaders in %llu ms\n",
-        compiled, static_cast<unsigned long long>(GetTickCount64() - start));
+    std::fprintf(stderr, "recomp d3d presenter: precompiled %u draw shaders (%u cached) in %llu ms\n",
+        compiled, loaded, static_cast<unsigned long long>(GetTickCount64() - start));
 }
 
 /* Builds the shader pair and input layout for one FVF from its decoded
@@ -1263,7 +1375,8 @@ bool createDrawPipeline(
     RecompD3dVertexLayout layout;
     std::string compiled_source;
     const RecompD3dDrawShaderKey key{fvf, pipeline.program_count, pipeline.program,
-        pipeline.coverage_only, pipeline.scaled_depth_bias, pipeline.sample_depth_bias};
+        pipeline.coverage_only, pipeline.scaled_depth_bias, pipeline.sample_depth_bias,
+        pipeline.projected_stages};
     if (!recomp_d3d_draw_shader_source(key, layout, compiled_source)) {
         return false;
     }
@@ -1394,8 +1507,9 @@ bool ensureSharedDrawState(RecompD3dPresenter *presenter)
        then post-filter flags, texel size and four constants (24 floats), the
        stage-1 texture matrix (16), bump matrices, bump fog and fog color (16),
        the extra reflection world-view/normal transforms (96), and the stage-2
-       texture matrix and flags (20), then scaled receiver depth bias (4). */
-    constant_desc.ByteWidth = (140u + 192u * 4u + 512u + 4u) * sizeof(float);
+       texture matrix and flags (20), then scaled receiver depth bias (4), then the
+       projected stage 1-3 matrices, count and slots (56), then table fog (8). */
+    constant_desc.ByteWidth = kRecompD3dDrawConstantFloats * sizeof(float);
     constant_desc.Usage = D3D11_USAGE_DYNAMIC;
     constant_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     constant_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -1448,6 +1562,7 @@ const DrawPipeline *lookupDrawPipeline(
         (!draw->target.offscreen || (draw->target.color.width == presenter->config.width &&
             draw->target.color.height == presenter->config.height)) &&
         draw->slope_scaled_depth_bias != 0.0f;
+    const bool projected = draw && draw->projected_stage_count != 0u;
     if (count > 136u) return nullptr;
     for (uint32_t i = 0u; i < presenter->draw_pipeline_count; ++i) {
         DrawPipeline &pipeline = presenter->draw_pipelines[i];
@@ -1455,6 +1570,7 @@ const DrawPipeline *lookupDrawPipeline(
         if (pipeline.used && pipeline.fvf == fvf && pipeline.program_count == count &&
             pipeline.coverage_only == coverage_only &&
             pipeline.scaled_depth_bias == scaled_bias &&
+            pipeline.projected_stages == projected &&
             (!count || std::memcmp(pipeline.program, draw->program, count * 16u) == 0)) {
             return pipeline.failed ? nullptr : &pipeline;
         }
@@ -1477,6 +1593,7 @@ const DrawPipeline *lookupDrawPipeline(
     pipeline.coverage_only = coverage_only;
     pipeline.scaled_depth_bias = scaled_bias;
     pipeline.sample_depth_bias = scaled_bias && presenter->msaa > 1u;
+    pipeline.projected_stages = projected;
     pipeline.program_count = count;
     if (count) std::memcpy(pipeline.program, draw->program, count * 16u);
     pipeline.used = true;
@@ -2437,7 +2554,8 @@ RecompD3dPresenterError submitDraw(
     /* A second cache lookup can evict the first entry. Keep its view alive
        until the context takes its own reference. */
     const bool has_second_texture = draw.has_alpha_mask || draw.has_reflection ||
-        draw.program_alpha_mask || draw.distortion || draw.stage1_alpha_mask || draw.bump_env;
+        draw.program_alpha_mask || draw.distortion || draw.stage1_alpha_mask || draw.bump_env ||
+        draw.projected_stage_count != 0u;
     if (has_second_texture && texture_view != nullptr) texture_view->AddRef();
     const auto release_view = [](ID3D11ShaderResourceView *view) { if (view) view->Release(); };
     std::unique_ptr<ID3D11ShaderResourceView, decltype(release_view)> retained(
@@ -2502,6 +2620,33 @@ RecompD3dPresenterError submitDraw(
         bump_view = lookupTexture(presenter, third);
         if (bump_view == nullptr || mask_view == nullptr || texture_view == nullptr)
             return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+    }
+    if (draw.projected_stage_count != 0u) {
+        if (!draw.texgen_projected || draw.projected_stage_count > 3u || texture_view == nullptr ||
+            draw.has_alpha_mask || draw.has_reflection || draw.program_count || draw.distortion ||
+            draw.stage1_alpha_mask || draw.bump_env || draw.reflection_stage2)
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        bool slots[3]{};
+        for (uint32_t i = 0u; i < draw.projected_stage_count; ++i)
+            if (draw.projected_slots[i] >= 0 && draw.projected_slots[i] < 3) slots[draw.projected_slots[i]] = true;
+        if (slots[1]) {
+            RecompD3dPresenterDrawCommand second{};
+            second.texture = draw.reflection_texture;
+            second.texture_bytes = draw.reflection_bytes;
+            second.texture_byte_count = draw.reflection_byte_count;
+            mask_view = lookupTexture(presenter, second);
+            if (mask_view == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+        if (slots[2]) {
+            if (mask_view != nullptr) mask_view->AddRef();
+            retained_mask.reset(mask_view);
+            RecompD3dPresenterDrawCommand third{};
+            third.texture = draw.reflection_stage2_texture;
+            third.texture_bytes = draw.reflection_stage2_bytes;
+            third.texture_byte_count = draw.reflection_stage2_byte_count;
+            bump_view = lookupTexture(presenter, third);
+            if (bump_view == nullptr) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
     }
     if (draw.bump_env) {
         if (!draw.program_count || draw.has_alpha_mask || draw.has_reflection || draw.program_alpha_mask ||
@@ -2603,13 +2748,14 @@ RecompD3dPresenterError submitDraw(
     presenter->context->PSSetSamplers(0u, 1u, &sampler);
     sampler = draw.program_alpha_mask ? presenter->program_mask_sampler
             : draw.has_reflection || draw.distortion || draw.stage1_alpha_mask || draw.bump_env
+                || draw.projected_stage_count != 0u
             ? lookupDrawSampler(presenter, draw.reflection_address_u,
                 draw.reflection_address_v, draw.reflection_point_mip_filter, draw.reflection_mip_lod_bias)
             : presenter->filter_sampler;
     if (sampler == nullptr) return RECOMP_D3D_PRESENTER_HOST_FAILURE;
     presenter->context->PSSetSamplers(1u, 1u, &sampler);
-    if (draw.bump_env || draw.reflection_stage2) {
-        sampler = draw.reflection_stage2
+    if (draw.bump_env || draw.reflection_stage2 || draw.projected_stage_count != 0u) {
+        sampler = draw.reflection_stage2 || draw.projected_stage_count != 0u
             ? lookupDrawSampler(presenter, draw.reflection_stage2_address_u, draw.reflection_stage2_address_v,
                 draw.reflection_stage2_point_mip_filter, draw.reflection_stage2_mip_lod_bias)
             : lookupDrawSampler(presenter, draw.bump_address_u, draw.bump_address_v, false, 0.0f);

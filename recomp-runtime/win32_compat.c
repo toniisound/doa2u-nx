@@ -11,6 +11,14 @@
 #include <fnmatch.h>
 #include <sys/file.h>
 #include <sys/xattr.h>
+#ifdef __SWITCH__
+#include <pthread.h>
+#endif
+
+#ifdef __SWITCH__
+/* newlib has no pread; serialize cursor operations while emulating it. */
+static pthread_mutex_t file_io_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 typedef struct RecompWin32FileLock {
     uint64_t offset;
@@ -32,24 +40,6 @@ typedef struct RecompWin32FileHandle {
 } RecompWin32FileHandle;
 
 static RecompWin32FileHandle *open_file_handles = NULL;
-
-#ifdef __SWITCH__
-/* The console's SD driver reports no inode numbers and cannot open a
-   directory as a file. Handles are identified by their normalized path, and
-   a directory handle keeps fd -1 and stats its path. */
-#define SAME_HANDLE_FILE(cur, st, norm) (strcmp((cur)->path, (norm)) == 0)
-static int handle_stat(const RecompWin32FileHandle *h, struct stat *st)
-{
-    return h->fd >= 0 ? fstat(h->fd, st) : stat(h->path, st);
-}
-#else
-#define SAME_HANDLE_FILE(cur, st, norm) \
-    ((cur)->dev == (st).st_dev && (cur)->ino == (st).st_ino)
-static int handle_stat(const RecompWin32FileHandle *h, struct stat *st)
-{
-    return fstat(h->fd, st);
-}
-#endif
 
 typedef struct RecompFindHandle {
     struct dirent **entries;
@@ -294,7 +284,7 @@ HANDLE CreateFileA(
         bool wants_delete = (dwDesiredAccess & DELETE) != 0;
 
         for (RecompWin32FileHandle *cur = open_file_handles; cur != NULL; cur = cur->next) {
-            if (SAME_HANDLE_FILE(cur, existing_st, norm)) {
+            if (cur->dev == existing_st.st_dev && cur->ino == existing_st.st_ino) {
                 if (wants_read && !(cur->share & FILE_SHARE_READ)) {
                     last_error = 32; // ERROR_SHARING_VIOLATION
                     return INVALID_HANDLE_VALUE;
@@ -365,16 +355,7 @@ HANDLE CreateFileA(
             fd = open(norm, O_RDONLY);
         }
     }
-#ifdef __SWITCH__
-    bool directory_without_fd = false;
-    if (fd < 0 && (dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) != 0 &&
-        stat(norm, &existing_st) == 0 && S_ISDIR(existing_st.st_mode)) {
-        directory_without_fd = true;
-    }
-    if (fd < 0 && !directory_without_fd) {
-#else
     if (fd < 0) {
-#endif
         set_last_error_for_path(norm);
         return INVALID_HANDLE_VALUE;
     }
@@ -391,7 +372,7 @@ HANDLE CreateFileA(
     h->flags = dwFlagsAndAttributes;
     
     struct stat st;
-    h->is_dir = (handle_stat(h, &st) == 0 && S_ISDIR(st.st_mode));
+    h->is_dir = (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode));
     h->dev = st.st_dev;
     h->ino = st.st_ino;
     h->access = dwDesiredAccess;
@@ -494,13 +475,78 @@ BOOL ReadFile(
             }
         }
     }
+#ifdef __SWITCH__
+    pthread_mutex_lock(&file_io_lock);
+#endif
     ssize_t ret = read(h->fd, lpBuffer, nNumberOfBytesToRead);
+#ifdef __SWITCH__
+    pthread_mutex_unlock(&file_io_lock);
+#endif
     if (ret < 0) {
         set_last_error_from_errno();
         return FALSE;
     }
     if (lpNumberOfBytesRead) {
         *lpNumberOfBytesRead = (DWORD)ret;
+    }
+    return TRUE;
+}
+
+BOOL recomp_win32_read_at(
+    HANDLE hFile,
+    uint64_t offset,
+    LPVOID lpBuffer,
+    DWORD nNumberOfBytesToRead,
+    DWORD *lpNumberOfBytesRead)
+{
+    if (hFile == INVALID_HANDLE_VALUE || hFile == NULL) {
+        last_error = ERROR_INVALID_HANDLE;
+        return FALSE;
+    }
+    RecompWin32FileHandle *h = (RecompWin32FileHandle *)hFile;
+    if ((h->access & (GENERIC_READ | 0x1u /* FILE_READ_DATA */)) == 0) {
+        last_error = ERROR_ACCESS_DENIED;
+        return FALSE;
+    }
+    DWORD total = 0;
+#ifdef __SWITCH__
+    pthread_mutex_lock(&file_io_lock);
+    off_t saved_offset = lseek(h->fd, 0, SEEK_CUR);
+    if (saved_offset == (off_t)-1 || lseek(h->fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+        pthread_mutex_unlock(&file_io_lock);
+        set_last_error_from_errno();
+        return FALSE;
+    }
+#endif
+    while (total < nNumberOfBytesToRead) {
+#ifdef __SWITCH__
+        ssize_t ret = read(h->fd, (char *)lpBuffer + total, nNumberOfBytesToRead - total);
+#else
+        ssize_t ret = pread(h->fd, (char *)lpBuffer + total,
+            nNumberOfBytesToRead - total, (off_t)(offset + total));
+#endif
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret < 0) {
+#ifdef __SWITCH__
+            (void)lseek(h->fd, saved_offset, SEEK_SET);
+            pthread_mutex_unlock(&file_io_lock);
+#endif
+            set_last_error_from_errno();
+            return FALSE;
+        }
+        if (ret == 0) break;
+        total += (DWORD)ret;
+    }
+#ifdef __SWITCH__
+    if (lseek(h->fd, saved_offset, SEEK_SET) == (off_t)-1) {
+        pthread_mutex_unlock(&file_io_lock);
+        set_last_error_from_errno();
+        return FALSE;
+    }
+    pthread_mutex_unlock(&file_io_lock);
+#endif
+    if (lpNumberOfBytesRead) {
+        *lpNumberOfBytesRead = total;
     }
     return TRUE;
 }
@@ -615,7 +661,7 @@ BOOL GetFileSizeEx(
     }
     RecompWin32FileHandle *h = (RecompWin32FileHandle *)hFile;
     struct stat st;
-    if (handle_stat(h, &st) != 0) {
+    if (fstat(h->fd, &st) != 0) {
         set_last_error_from_errno();
         return FALSE;
     }
@@ -1014,7 +1060,7 @@ BOOL GetFileInformationByHandleEx(
             return FALSE;
         }
         struct stat st;
-        if (handle_stat(h, &st) != 0) {
+        if (fstat(h->fd, &st) != 0) {
             set_last_error_from_errno();
             return FALSE;
         }
@@ -1051,7 +1097,7 @@ BOOL SetFileInformationByHandle(
         }
         FILE_BASIC_INFO *info = (FILE_BASIC_INFO *)lpFileInformation;
         struct stat st;
-        if (handle_stat(h, &st) != 0) {
+        if (fstat(h->fd, &st) != 0) {
             set_last_error_from_errno();
             return FALSE;
         }

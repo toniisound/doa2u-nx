@@ -8,6 +8,7 @@
 #include "d3d_presenter_capture.h"
 #include "d3d_presenter_backend.h"
 #include "d3d_vblank.h"
+#include "fps_overlay.h"
 
 
 #include <algorithm>
@@ -330,8 +331,10 @@ void notePresent(PresenterThread &thread)
     const double elapsed_ms = std::chrono::duration<double, std::milli>(now - guest_pacing.second_start).count();
     if (elapsed_ms < 1000.0) return;
     const uint32_t frames = guest_pacing.frames - 1u;
+    const float fps_value = static_cast<float>(frames * 1000.0 / elapsed_ms);
+    doa2u_nx_fps_value.store(fps_value, std::memory_order_relaxed);
     std::fprintf(stderr, "recomp performance: present=%llu fps=%.2f frame_ms=%.3f\n",
-        static_cast<unsigned long long>(guest_pacing.presents), frames * 1000.0 / elapsed_ms, elapsed_ms / frames);
+        static_cast<unsigned long long>(guest_pacing.presents), fps_value, elapsed_ms / frames);
     const D3dCaptureStats capture = d3d_capture_take_stats();
     const double per_frame_mb = 1.0 / (1048576.0 * frames);
     std::fprintf(stderr, "recomp capture: per frame commands=%.0f copied=%.2fMB (geometry %.2fMB)"

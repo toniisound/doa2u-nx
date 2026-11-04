@@ -126,15 +126,11 @@ Compiled shaders are kept in `sdmc:/switch/doa2u-nx/shader-cache`, so the
 first boot (and the first sight of each new effect) compiles a little; later
 boots only link.
 
-Options: for 2 seconds after launch the screen lists them; press a button to
-turn its option on (A starts at once).
-
-| Button | Effect |
-|---|---|
-| R | Run unpaced (as fast as the CPU allows) |
-| L | Original 4:3 picture instead of the game's own 16:9 mode |
-| Y | Skip the intro movies |
-| X | Render at 480p instead of 720p (lighter GPU load) |
+The graphical boot menu offers **720p** (best quality), **600p** (recommended)
+and **480p** (smoother), plus **4:3/16:9** and an **FPS: ON/OFF** overlay.
+Choices are remembered in `doa2u-nx.ini`. Use Up/Down for resolution,
+Left/Right for aspect ratio, X to toggle the FPS overlay, A to start and + to
+leave. Hold R at launch for unpaced mode or Y to skip the intro movies.
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.

@@ -69,6 +69,11 @@ constexpr char kDrawShaderPrologue[] =
     "    row_major float4x4 reflection_transform2;\n"
     "    float4 reflection_stage2_flags;\n"
     "    float4 raster_bias;\n"
+    "    row_major float4x4 projected_transform[3];\n"
+    "    float4 projected_stages;\n"
+    "    float4 projected_slots;\n"
+    "    float4 table_fog;\n"
+    "    float4 table_fog_color;\n"
     "}\n"
     "Texture2D guest_texture : register(t0);\n"
     "Texture3D guest_volume : register(t3);\n"
@@ -145,6 +150,8 @@ int buildDrawShaderSource(
         "    float3 lit_specular : TEXCOORD6;\n"
         "    float projected_q : TEXCOORD7;\n"
         "    float2 reflection_coord2 : TEXCOORD10;\n"
+        "    float3 projected_eye : TEXCOORD12;\n"
+        "    float table_fog : TEXCOORD13;\n"
         "%s"
         "};\n"
         "VSOut vs_main(VSIn input) {\n"
@@ -156,6 +163,8 @@ int buildDrawShaderSource(
         "    output.reflection_coord = float2(0, 0);\n"
         "%s"
         "%s"
+        /* Planar eye depth for table fog, from clip w. */
+        "    output.table_fog = output.position.w * table_fog.w + table_fog_color.w;\n"
         "    return output;\n"
         "}\n"
         "float4 ps_main(VSOut input) : SV_TARGET {\n"
@@ -170,14 +179,16 @@ int buildDrawShaderSource(
         "        base.a *= diffuse.a;\n"
         "        float4 env = alpha_mask.Sample(mask_sampler, input.reflection_coord);\n"
         "        if (reflection_stage2_flags.y > 0.5f && env.a == 0.0f) discard;\n"
-        /* w: bit 0 premultiplied blend, bit 1 stage-2 pass-through (no diffuse). */
+        /* w: bit 0 premultiplied blend, bit 1 stage-2 pass-through (no diffuse),
+           bit 2 color-only blend (stage-1 alpha keeps CURRENT). */
         "        shaded = (fmod(reflection_flags.w, 2.0f) > 0.5f\n"
         "            ? saturate(env + base * (1.0f - env.a)) : lerp(base, env, env.a));\n"
+        "        if (reflection_flags.w > 3.5f) shaded.a = base.a;\n"
         "        if (reflection_stage2_flags.x > 0.5f) {\n"
         "            float4 third = bump_map.Sample(bump_sampler, input.reflection_coord2);\n"
         "            shaded = lerp(shaded, third, third.a);\n"
         "        }\n"
-        "        shaded *= reflection_flags.w > 1.5f ? 1.0f : diffuse;\n"
+        "        shaded *= fmod(reflection_flags.w, 4.0f) > 1.5f ? 1.0f : diffuse;\n"
         "    } else\n"
         "%s"
         "    if (blend_flags.y == 1.0f) {\n"
@@ -205,6 +216,22 @@ int buildDrawShaderSource(
         "        else if (blend_flags.y > 2.5f) shaded.rgb = saturate(2.0f * shaded.rgb * texture_factor.rgb);\n"
         "        else if (blend_flags.y > 1.5f) shaded *= texture_factor;\n"
         "    }\n"
+        /* Projected ADD stages (0x257ee0) precede the final combiner's specular. */
+        "#ifdef RECOMP_PROJECTED_STAGES\n"
+        "    if (projected_stages.x > 0.5f) {\n"
+        "        [unroll] for (uint i = 0; i < 3; ++i) {\n"
+        "            float slot = projected_slots[i];\n"
+        "            if (i >= (uint)projected_stages.x || slot < -0.5f) continue;\n"
+        "            float3 g = mul(float4(input.projected_eye, 1), projected_transform[i]).xyz;\n"
+        "            float2 uv = g.xy / g.z;\n"
+        "            float4 t;\n"
+        "            if (slot < 0.5f) t = guest_texture.Sample(guest_sampler, uv);\n"
+        "            else if (slot < 1.5f) t = alpha_mask.Sample(mask_sampler, uv);\n"
+        "            else t = bump_map.Sample(bump_sampler, uv);\n"
+        "            shaded.rgb = saturate(shaded.rgb + t.rgb);\n"
+        "        }\n"
+        "    }\n"
+        "#endif\n"
         /* Fixed function adds specular after the texture stages, textured or not. */
         "    if (directional_flags.w > 0.5f) shaded.rgb += input.lit_specular;\n"
         /* A stage-1 mask; z > 1.5 adds its ALPHAKILL, and z > 2.5 only kills. */
@@ -212,6 +239,13 @@ int buildDrawShaderSource(
         "        float mask = alpha_mask.SampleBias(mask_sampler, input.reflection_coord, reflection_flags.w).a;\n"
         "        if (reflection_flags.z > 1.5f && mask == 0.0f) discard;\n"
         "        if (reflection_flags.z < 2.5f) shaded.a *= mask;\n"
+        "    }\n"
+        /* Table fog per pixel: x 1 linear, 2 exp, 3 exp2; y end or density, z 1/(end - start). */
+        "    if (table_fog.x > 0.5f) {\n"
+        "        float d = max(input.table_fog, 0.0f);\n"
+        "        float f = table_fog.x < 1.5f ? (table_fog.y - d) * table_fog.z\n"
+        "            : table_fog.x < 2.5f ? exp(-d * table_fog.y) : exp(-d * d * table_fog.y * table_fog.y);\n"
+        "        shaded.rgb = lerp(table_fog_color.rgb, shaded.rgb, saturate(f));\n"
         "    }\n"
         /* NV2A compares rounded 8-bit alpha. Function values follow
            RecompD3dCompareFunc, from NEVER (0) to ALWAYS (7). */
@@ -273,6 +307,7 @@ int buildDrawShaderSource(
                   "        output.texcoord = g.xy;\n"
                   "        output.volume_coord = g.z;\n"
                   "        output.projected_q = reflection_stage2_flags.z > 0.5f ? 1.0f : g.z;\n"
+                  "        output.projected_eye = mul(float4(input.position, 1), reflection_world_view).xyz;\n"
                   "    }\n"
                   "    if (abs(reflection_flags.x - 1.0f) < 0.5f || abs(filter_texel.z - 1.0f) < 0.5f ||\n"
                   "        (reflection_stage2_flags.x > 0.5f && reflection_stage2_flags.w < 0.5f)) {\n"
@@ -300,6 +335,7 @@ int buildDrawShaderSource(
                   "        output.texcoord = g.xy;\n"
                   "        output.volume_coord = g.z;\n"
                   "        output.projected_q = reflection_stage2_flags.z > 0.5f ? 1.0f : g.z;\n"
+                  "        output.projected_eye = mul(float4(input.position, 1), reflection_world_view).xyz;\n"
                   "    }\n"
                   "    if (abs(reflection_flags.x - 1.0f) < 0.5f || abs(filter_texel.z - 1.0f) < 0.5f ||\n"
                   "        (reflection_stage2_flags.x > 0.5f && reflection_stage2_flags.w < 0.5f)) {\n"
@@ -382,6 +418,7 @@ bool recomp_d3d_draw_shader_source(
     if (buildDrawShaderSource(layout, compiled_source.data(), compiled_source.size(),
             pipeline.coverage_only) != source_size) return false;
     compiled_source.resize(static_cast<size_t>(source_size));
+    if (pipeline.projected_stages) compiled_source.insert(0, "#define RECOMP_PROJECTED_STAGES\n");
     if (pipeline.coverage_only) return true;
     if (layout.blend_weight_count != 0u && !layout.pretransformed &&
         layout.texcoord_offset != RECOMP_D3D_FVF_ABSENT) {
@@ -514,6 +551,7 @@ bool recomp_d3d_draw_shader_source(
             "        if (da<0 || db<0) {\n"
             "            float t=da/(da-db); VSOut c=(VSOut)0;\n"
             "            c.position=lerp(a.position,b.position,t); c.color=lerp(a.color,b.color,t);\n"
+            "            c.table_fog=lerp(a.table_fog,b.table_fog,t);\n"
             "            if (da<0) a=c; else b=c;\n"
             "        }\n"
             "    }\n"
@@ -737,7 +775,7 @@ bool recomp_d3d_draw_constants(
         std::memcpy(constants_out + 132, draw.reflection_diffuse, 16u);
         constants_out[136] = draw.reflection_mesh_uv ? 2.0f : 1.0f;
         constants_out[139] = (draw.reflection_premultiplied ? 1.0f : 0.0f) +
-            (draw.reflection_skip_diffuse ? 2.0f : 0.0f);
+            (draw.reflection_skip_diffuse ? 2.0f : 0.0f) + (draw.reflection_color_only ? 4.0f : 0.0f);
         if (draw.texgen_reflection && !draw.reflection_mesh_uv)
             std::memcpy(constants_out + 140 + 192 * 4 + 364, draw.reflection_stage1_transform, 64u);
     }
@@ -745,6 +783,23 @@ bool recomp_d3d_draw_constants(
         std::memcpy(constants_out + 140 + 192 * 4 + 492, draw.reflection_stage2_transform, 64u);
         constants_out[140 + 192 * 4 + 508] = 1.0f;
         constants_out[140 + 192 * 4 + 511] = draw.reflection_stage2_mesh_uv ? 1.0f : 0.0f;
+    }
+    if (draw.projected_stage_count != 0u) {
+        float *projected = constants_out + 140 + 192 * 4 + 516;
+        std::memcpy(projected, draw.projected_transforms, sizeof draw.projected_transforms);
+        projected[48] = static_cast<float>(draw.projected_stage_count);
+        for (unsigned i = 0u; i < 3u; ++i) projected[52 + i] = static_cast<float>(draw.projected_slots[i]);
+    }
+    if (draw.fog_mode != 0u && !draw.program_count) {
+        float *fog = constants_out + 140 + 192 * 4 + 512 + 4 + 56;
+        fog[0] = static_cast<float>(draw.fog_mode);
+        fog[1] = draw.fog_mode == 1u ? draw.fog_end : draw.fog_density;
+        fog[2] = draw.fog_mode == 1u ? 1.0f / (draw.fog_end - draw.fog_start) : 0.0f;
+        fog[3] = draw.fog_depth[0];
+        fog[4] = ((draw.fog_color >> 16u) & 0xffu) / 255.0f;
+        fog[5] = ((draw.fog_color >> 8u) & 0xffu) / 255.0f;
+        fog[6] = (draw.fog_color & 0xffu) / 255.0f;
+        fog[7] = draw.fog_depth[1];
     }
     if (draw.stage1_alpha_mask)
         constants_out[138] = draw.stage1_kill_only ? 3.0f : draw.stage1_alpha_kill ? 2.0f : 1.0f;

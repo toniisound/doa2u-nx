@@ -88,7 +88,7 @@ const Choice kChoices[] = {
 };
 constexpr int kCount = sizeof kChoices / sizeof kChoices[0];
 
-void draw(Canvas &canvas, int selected, bool widescreen)
+void draw(Canvas &canvas, int selected, bool widescreen, bool fps_enabled)
 {
     canvas.fill(0, 0, kWidth, kHeight, kBackground);
     canvas.outline(40, 30, kWidth - 80, kHeight - 60, 36, 4, kFrame, kBackground);
@@ -109,16 +109,19 @@ void draw(Canvas &canvas, int selected, bool widescreen)
         canvas.centered(y + 8, kChoices[i].label, 4, kText);
         canvas.centered(y + 74, kChoices[i].note, 2, i == selected ? kText : kDim);
     }
-    canvas.centered(kHeight - 76, "Up/Down: resolution  Left/Right: aspect  A: confirm", 1, kDim);
+    canvas.centered(kHeight - 92, fps_enabled ? "FPS: ON  (X: toggle)" : "FPS: OFF  (X: toggle)", 2, fps_enabled ? kText : kDim);
+    canvas.centered(kHeight - 60, "Up/Down: resolution  Left/Right: aspect  A: confirm", 1, kDim);
 }
 
 } // namespace
 
 // Returns the chosen render height (720, 600 or 480), or 0 to leave.
-extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, int *selected_widescreen)
+extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, int initial_fps, int *selected_widescreen, int *selected_fps)
 {
     int selected = 0;
     bool widescreen = initial_widescreen != 0;
+    bool fps_enabled = initial_fps != 0;
+    if (selected_fps != nullptr) *selected_fps = fps_enabled ? 1 : 0;
     if (selected_widescreen != nullptr) *selected_widescreen = widescreen ? 1 : 0;
     for (int i = 0; i < kCount; ++i) {
         if (kChoices[i].height == initial_height) selected = i;
@@ -153,9 +156,14 @@ extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, in
         if (down & (HidNpadButton_Right | HidNpadButton_StickLRight)) {
             if (!widescreen) { widescreen = true; redraw = true; }
         }
+        if (down & HidNpadButton_X) {
+            fps_enabled = !fps_enabled;
+            redraw = true;
+        }
         if (down & HidNpadButton_A) {
             result = kChoices[selected].height;
             if (selected_widescreen != nullptr) *selected_widescreen = widescreen ? 1 : 0;
+            if (selected_fps != nullptr) *selected_fps = fps_enabled ? 1 : 0;
             break;
         }
         if (down & HidNpadButton_Plus) break;
@@ -164,7 +172,7 @@ extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, in
             u32 stride = 0;
             canvas.pixels = static_cast<uint32_t *>(framebufferBegin(&fb, &stride));
             canvas.stride = stride / sizeof(uint32_t);
-            draw(canvas, selected, widescreen);
+            draw(canvas, selected, widescreen, fps_enabled);
             framebufferEnd(&fb);
         }
         svcSleepThread(16'000'000);

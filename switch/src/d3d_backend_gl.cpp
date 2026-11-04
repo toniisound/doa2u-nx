@@ -29,6 +29,7 @@
 #include <glad/glad.h>
 #ifdef __SWITCH__
 #include <switch.h>
+#include "fps_overlay.h"
 #endif
 
 #include <algorithm>
@@ -350,7 +351,7 @@ struct RecompD3dPresenter {
     bool gamma_enabled = false;
     float gamma_ramp[256][4]{};
     GLuint present_program = 0u;
-    GLint present_rect = -1, present_gamma = -1;
+    GLint present_rect = -1, present_gamma = -1, present_fps_enabled = -1, present_fps = -1;
     GLuint empty_vao = 0u;
 
     // Applied raster state, so redundant changes are skipped within a segment.
@@ -2084,11 +2085,44 @@ layout(std140, binding = 4) uniform GammaRamp { vec4 ramp[256]; } g;
 uniform int u_gamma;
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
+uniform int u_fps_enabled;
+uniform float u_fps;
+int glyphRow(int ch, int row) {
+    if (ch == 0) { int a[7] = int[7](31,16,16,30,16,16,16); return a[row]; }
+    if (ch == 1) { int a[7] = int[7](30,17,17,30,16,16,16); return a[row]; }
+    if (ch == 2) { int a[7] = int[7](15,16,16,14,1,1,30); return a[row]; }
+    if (ch == 3) return row == 1 || row == 5 ? 4 : 0;
+    int d = ch - 4;
+    if (d == 0) { int a[7] = int[7](14,17,19,21,25,17,14); return a[row]; }
+    if (d == 1) { int a[7] = int[7](4,12,4,4,4,4,14); return a[row]; }
+    if (d == 2) { int a[7] = int[7](14,17,1,2,4,8,31); return a[row]; }
+    if (d == 3) { int a[7] = int[7](30,1,1,14,1,1,30); return a[row]; }
+    if (d == 4) { int a[7] = int[7](2,6,10,18,31,2,2); return a[row]; }
+    if (d == 5) { int a[7] = int[7](31,16,16,30,1,1,30); return a[row]; }
+    if (d == 6) { int a[7] = int[7](14,16,16,30,17,17,14); return a[row]; }
+    if (d == 7) { int a[7] = int[7](31,1,2,4,8,8,8); return a[row]; }
+    if (d == 8) { int a[7] = int[7](14,17,17,14,17,17,14); return a[row]; }
+    int a[7] = int[7](14,17,17,15,1,1,14); return a[row];
+}
 void main() {
     vec4 c = texture(frame, v_uv);
     if (u_gamma != 0) {
         uvec3 i = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
         c.rgb = vec3(g.ramp[i.r].r, g.ramp[i.g].g, g.ramp[i.b].b);
+    }
+    if (u_fps_enabled != 0) {
+        int x = int(v_uv.x * 1280.0) - 8;
+        int y = int(v_uv.y * 720.0) - 8;
+        if (x >= 0 && x < 92 && y >= 0 && y < 21) {
+            int cell = x / 13;
+            int px = (x % 13) / 2;
+            int py = y / 3;
+            int ch = cell < 3 ? cell : cell == 3 ? 3 :
+                cell == 5 ? 4 + int(clamp(u_fps, 0.0, 99.0) / 10.0) : cell == 6 ? 4 + int(clamp(u_fps, 0.0, 99.0)) % 10 : -1;
+            int bits = glyphRow(ch, py);
+            bool lit = ch >= 0 && cell < 7 && px < 5 && py < 7 && (bits & (1 << (4 - px))) != 0;
+            c.rgb = lit ? vec3(1.0) : mix(c.rgb, vec3(0.0), 0.62);
+        }
     }
     out_color = vec4(c.rgb, 1.0);
 }
@@ -2223,6 +2257,13 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     glUseProgram(presenter->present_program);
     glUniform4f(presenter->present_rect, -width, -height, width, height);
     glUniform1i(presenter->present_gamma, presenter->gamma_enabled ? 1 : 0);
+#ifdef __SWITCH__
+    glUniform1i(presenter->present_fps_enabled, doa2u_nx_fps_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+    glUniform1f(presenter->present_fps, doa2u_nx_fps_value.load(std::memory_order_relaxed));
+#else
+    glUniform1i(presenter->present_fps_enabled, 0);
+    glUniform1f(presenter->present_fps, 0.0f);
+#endif
     glBindBufferBase(GL_UNIFORM_BUFFER, kGammaBinding, presenter->gamma_buffer);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, presenter->main_color);
@@ -2424,6 +2465,8 @@ bool createResources(RecompD3dPresenter *presenter)
     if (presenter->present_program == 0u) return false;
     presenter->present_rect = glGetUniformLocation(presenter->present_program, "u_rect");
     presenter->present_gamma = glGetUniformLocation(presenter->present_program, "u_gamma");
+    presenter->present_fps_enabled = glGetUniformLocation(presenter->present_program, "u_fps_enabled");
+    presenter->present_fps = glGetUniformLocation(presenter->present_program, "u_fps");
     glGenVertexArrays(1, &presenter->empty_vao);
     const GLenum status = glGetError();
     if (status != GL_NO_ERROR) {

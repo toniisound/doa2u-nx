@@ -50,7 +50,9 @@
     "tools/test_function_status.py",
     "tools/test_export_function_status.py",
     "tools/doa2u/ghidra/ExportFunctionStatus.py",
-    "tools/doa2u/functions/**"
+    "tools/doa2u/functions/**",
+    "switch/src/boot_menu.cpp",
+    "switch/src/fps_overlay.h"
   ],
   "quarantine": [
     "decomp/**",

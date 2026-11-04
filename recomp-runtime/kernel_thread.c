@@ -61,6 +61,9 @@ typedef struct GuestThread {
     uint32_t wait_result;
     UserApc apcs[MAX_EVENTS];
     unsigned apc_count;
+    /* Host work this wait ends on (recomp_kernel_wait_host), or NULL. */
+    bool (*host_done)(void *context);
+    void *host_context;
 } GuestThread;
 
 /* shortcut: retain thread records until exit; add reclamation if a title
@@ -70,6 +73,7 @@ static GuestThread threads[MAX_THREADS] = {
 };
 static unsigned current_thread;
 static bool scheduler_started;
+static unsigned host_waits; /* Threads blocked in recomp_kernel_wait_host. */
 
 /* RECOMP_PERF_COUNTER frame breakdown: host QPC ticks each guest thread ran,
    and ticks the scheduler slept with nothing runnable, since the last report. */
@@ -305,7 +309,12 @@ static bool thread_ready(GuestThread *thread)
     if (thread->handle == 0u || thread->exited || thread->suspend_count != 0u)
         return false;
     if (!thread->waiting) return true;
-    if (thread->alertable && thread->apc_count != 0u) {
+    if (thread->host_done != NULL) {
+        if (!thread->host_done(thread->host_context)) return false;
+        thread->host_done = NULL;
+        --host_waits;
+        thread->wait_result = THREAD_STATUS_SUCCESS;
+    } else if (thread->alertable && thread->apc_count != 0u) {
         thread->wait_result = THREAD_STATUS_USER_APC;
     } else {
         uint32_t signaled = 0u;
@@ -375,6 +384,7 @@ static void schedule(void)
 #endif
     for (;;) {
         uint64_t earliest = UINT64_MAX;
+        bool host_wait = false;
         /* Idle time is when the real kernel would run expired timer DPCs. */
         if (recomp_kernel_expire_timers() != 0u) {
             RecompRegisters saved = recomp_runtime.registers;
@@ -394,6 +404,7 @@ static void schedule(void)
                 return;
             }
             if (target->waiting && !target->exited && target->suspend_count == 0u) {
+                if (target->host_done != NULL) host_wait = true;
                 if (target->deadline < earliest) earliest = target->deadline;
                 for (uint32_t i = 0u; i < target->object_count; ++i) {
                     uint32_t object = target->objects[i];
@@ -406,11 +417,14 @@ static void schedule(void)
                 }
             }
         }
-        /* Advance idle guest time in unpaced mode. Indefinite waits still sleep. */
-        if (earliest < UINT64_MAX / 100u &&
+        /* Advance idle guest time in unpaced mode. Indefinite waits still
+           sleep, and host work takes host time, so it is never skipped. */
+        if (!host_wait && earliest < UINT64_MAX / 100u &&
             recomp_xapi_skip_wait(earliest * 100u)) continue;
-        /* With no runnable thread, sleep until the first deadline. */
+        /* With no runnable thread, sleep until the first deadline, or poll
+           host work each millisecond. */
         uint64_t now = interrupt_time();
+        if (host_wait && earliest > now + 10000u) earliest = now + 10000u;
         charge_slice(false);
         uint64_t ms = earliest == UINT64_MAX ? 1000u
             : earliest > now ? (earliest - now + 9999u) / 10000u : 1u;
@@ -489,6 +503,29 @@ void recomp_kernel_wait_for_vblank(uint64_t deadline_ns)
     thread->deadline = deadline_ns / 100u + (deadline_ns % 100u != 0u);
     thread->waiting = true;
     if (!thread_ready(thread)) schedule();
+}
+
+bool recomp_kernel_wait_host(bool (*done)(void *context), void *context)
+{
+    if (!scheduler_started) return false;
+    GuestThread *thread = &threads[current_thread];
+    thread->host_done = done;
+    thread->host_context = context;
+    thread->object_count = 0u;
+    thread->alertable = false;
+    thread->deadline = UINT64_MAX;
+    thread->waiting = true;
+    ++host_waits;
+    if (!thread_ready(thread)) schedule();
+    return true;
+}
+
+/* Host work ends without a guest interrupt, so a thread polling for its result
+   never waits and would starve the thread that awaits it. Lock releases offer
+   the same bounded slice as clock reads while host work is pending. */
+void recomp_kernel_poll_host_waits(void)
+{
+    if (host_waits != 0u) recomp_kernel_poll();
 }
 
 static uint32_t wait_objects(uint32_t count, const uint32_t *objects,

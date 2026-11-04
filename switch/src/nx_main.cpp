@@ -34,13 +34,14 @@
 #include <vector>
 
 #include "xbe_parser.h"
+#include "fps_overlay.h"
 
 #ifndef DOA2U_NX_VERSION
 #define DOA2U_NX_VERSION "0.1.0"
 #endif
 
 int recomp_runner_main(int argc, char **argv); // runner.cpp main, renamed at compile time
-extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, int *selected_widescreen);
+extern "C" int doa2u_nx_boot_menu(int initial_height, int initial_widescreen, int initial_fps, int *selected_widescreen, int *selected_fps);
 extern "C" void __real_exit(int code) __attribute__((noreturn));
 
 extern "C" {
@@ -498,23 +499,37 @@ int readWidescreen()
     std::fclose(file);
     return widescreen;
 }
-void writeResolution(int height, int widescreen)
+int readFps()
+{
+    FILE *file = std::fopen(kResolutionOptions, "r");
+    if (file == nullptr) return 0;
+    int fps = 0;
+    char line[96];
+    while (std::fgets(line, sizeof line, file)) {
+        int value = 0;
+        if (std::sscanf(line, " fps = %d", &value) == 1 && (value == 0 || value == 1)) fps = value;
+    }
+    std::fclose(file);
+    return fps;
+}
+void writeResolution(int height, int widescreen, int fps)
 {
     FILE *file = std::fopen(kResolutionOptions, "w");
     if (file == nullptr) return;
-    std::fprintf(file, "; DOA2U NX boot menu choice\nresolution=%d\nwidescreen=%d\n", height, widescreen);
+    std::fprintf(file, "; DOA2U NX boot menu choice\nresolution=%d\nwidescreen=%d\nfps=%d\n", height, widescreen, fps);
     std::fclose(file);
 }
-int chooseResolution(int initial_height, int initial_widescreen, int *selected_widescreen)
+int chooseResolution(int initial_height, int initial_widescreen, int initial_fps, int *selected_widescreen, int *selected_fps)
 {
     consoleExit(nullptr);
     console_state = nullptr;
     console_ready = false;
-    const int height = doa2u_nx_boot_menu(initial_height, initial_widescreen, selected_widescreen);
+    const int height = doa2u_nx_boot_menu(initial_height, initial_widescreen, initial_fps, selected_widescreen, selected_fps);
     console_state = consoleInit(nullptr);
     console_ready = true;
     return height;
-}} // namespace
+}
+} // namespace
 
 int main(int argc, char **argv)
 {
@@ -564,14 +579,15 @@ int main(int argc, char **argv)
 
     const bool skip_intro = (held & HidNpadButton_Y) != 0;
     int widescreen = readWidescreen();
-    const int resolution = chooseResolution(readResolution(), widescreen, &widescreen);
+    int fps_enabled = readFps();
+    const int resolution = chooseResolution(readResolution(), widescreen, fps_enabled, &widescreen, &fps_enabled);
     if (resolution == 0) {
         std::fprintf(stderr, "[nx] left from the boot menu\n");
         consoleExit(nullptr);
         console_ready = false;
         return 0;
     }
-    writeResolution(resolution, widescreen);
+    writeResolution(resolution, widescreen, fps_enabled);
     if (unpaced) {
         setenv("RECOMP_UNPACED", "1", 1);
         std::fprintf(stderr, "[nx] RECOMP_UNPACED=1 (R held at boot)\n");
@@ -579,6 +595,7 @@ int main(int argc, char **argv)
     // The kernel's XC_VIDEO and XC_AUDIO settings follow these, as the
     // launcher sets them on PC. The console outputs stereo.
     setenv("RECOMP_D3D_WIDESCREEN", widescreen ? "1" : "0", 1);
+    doa2u_nx_fps_enabled.store(fps_enabled != 0, std::memory_order_relaxed);
     unsetenv("RECOMP_AUDIO_SURROUND");
     // Match the selected output height to the game's 480-line render target.
     char scale[16];

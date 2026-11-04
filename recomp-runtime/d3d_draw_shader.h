@@ -17,13 +17,16 @@
    then post-filter flags, texel size and four constants (24 floats), the
    stage-1 texture matrix (16), bump matrices, bump fog and fog color (16),
    the extra reflection world-view/normal transforms (96), and the stage-2
-   texture matrix and flags (20), then scaled receiver depth bias (4). */
-constexpr uint32_t kRecompD3dDrawConstantFloats = 140u + 192u * 4u + 512u + 4u;
+   texture matrix and flags (20), then scaled receiver depth bias (4), then the
+   projected stage 1-3 matrices, count and slots (56), then table fog (8). */
+constexpr uint32_t kRecompD3dDrawConstantFloats = 140u + 192u * 4u + 512u + 4u + 56u + 8u;
 
-/* Every FVF seen across all logged runs (14). Compiling them at boot keeps
-   first use of each scene from stalling ~85 ms per shader. */
+/* FVFs compiled at boot (17): those seen in the developers' logged runs plus
+   0x012, 0x102 and 0x204 from a player's log (#61). Compiling them at boot keeps
+   first use of each scene from stalling ~85 ms per shader. Tina's ending also
+   precompiles 0x142 with projected stages. */
 constexpr uint32_t kRecompD3dBootDrawFvfs[] = {
-    0x042u, 0x104u, 0x112u, 0x116u, 0x118u, 0x11Au,
+    0x012u, 0x042u, 0x102u, 0x104u, 0x112u, 0x116u, 0x118u, 0x11Au, 0x204u,
     0x142u, 0x144u, 0x212u, 0x216u, 0x21Au, 0x242u, 0x244u, 0x404u};
 
 /* What selects one draw shader: its FVF, vertex program and variant. */
@@ -34,6 +37,8 @@ struct RecompD3dDrawShaderKey {
     bool coverage_only;
     bool scaled_depth_bias;
     bool sample_depth_bias;
+    /* Tina's ending lights; only these shaders carry the projected-stage loop. */
+    bool projected_stages;
 };
 
 /* Builds the HLSL for one FVF, plus its vertex program when it has one.
