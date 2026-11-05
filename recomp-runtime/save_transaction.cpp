@@ -515,6 +515,12 @@ bool check_journal()
         /* An upgrade interrupted before its rename leaves version.tmp. */
         require(name == "version" || name == "lock" || name == "undo" ||
             (legacy && name == "version.tmp"));
+#ifdef __SWITCH__
+        /* The FAT driver can return EIO when querying a lock file that this
+           process already opened and flocked. Its successful creation and
+           exclusive open above validate the lock; don't stat it again here. */
+        if (name == "lock") continue;
+#endif
         require(exists_plain(entry.path()) && fs::is_regular_file(entry.path()));
     }
     return legacy;
