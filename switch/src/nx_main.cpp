@@ -468,27 +468,23 @@ void __wrap_exit(int code)
 
 /* ---- Resolution menu ------------------------------------------------------ */
 
-/* Draws text with the console's 16x16 font, each font pixel a scale x scale
-   block, into a linear RGBA8888 framebuffer. */
-static void drawText(u32 *pixels, u32 stride, int x, int y, int scale, const char *text, u32 color)
+/* Draws text with the console's 16x16 font scaled to size x size pixels a
+   character (16 is the font's own size), into a linear RGBA8888 framebuffer. */
+static void drawText(u32 *pixels, u32 stride, int x, int y, int size, const char *text, u32 color)
 {
     const ConsoleFont &font = consoleGetDefault()->font;
     const u16 *glyphs = static_cast<const u16 *>(font.gfx);
-    for (; *text != '\0'; ++text, x += 16 * scale) {
+    for (; *text != '\0'; ++text, x += size) {
         const int index = static_cast<unsigned char>(*text) - font.asciiOffset;
         if (index < 0 || index >= font.numChars) continue;
         const u16 *rows = glyphs + 16 * index;
-        for (int row = 0; row < 16; ++row) {
-            for (int column = 0; column < 16; ++column) {
-                if (!(rows[row] & (0x8000u >> column))) continue;
-                for (int dy = 0; dy < scale; ++dy) {
-                    const int py = y + row * scale + dy;
-                    if (py < 0 || py >= 720) continue;
-                    for (int dx = 0; dx < scale; ++dx) {
-                        const int px = x + column * scale + dx;
-                        if (px >= 0 && px < 1280) pixels[py * stride + px] = color;
-                    }
-                }
+        for (int py = 0; py < size; ++py) {
+            const int sy = y + py;
+            if (sy < 0 || sy >= 720) continue;
+            const u16 bits = rows[py * 16 / size];
+            for (int px = 0; px < size; ++px) {
+                const int sx = x + px;
+                if (sx >= 0 && sx < 1280 && (bits & (0x8000u >> (px * 16 / size)))) pixels[sy * stride + sx] = color;
             }
         }
     }
@@ -500,9 +496,9 @@ static void fillRect(u32 *pixels, u32 stride, int x, int y, int width, int heigh
         for (int px = x; px < x + width && px < 1280; ++px) pixels[py * stride + px] = color;
 }
 
-static int textWidth(const char *text, int scale)
+static int textWidth(const char *text, int size)
 {
-    return static_cast<int>(std::strlen(text)) * 16 * scale;
+    return static_cast<int>(std::strlen(text)) * size;
 }
 
 /* The boot menu, on a large-print screen with no time limit: the render
@@ -575,30 +571,36 @@ static BootChoice chooseBootOptions()
             auto *pixels = static_cast<u32 *>(framebufferBegin(&framebuffer, &stride));
             stride /= sizeof(u32);
             fillRect(pixels, stride, 0, 0, 1280, 720, kBackground);
+            // Everything stays inside the TV's safe area (about 90% of the screen).
             char title[48];
             std::snprintf(title, sizeof title, "DOA2U NX %s", DOA2U_NX_VERSION);
-            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 50, 3, title, kText);
+            drawText(pixels, stride, (1280 - textWidth(title, 24)) / 2, 60, 24, title, kDim);
             const ResolutionChoice &resolution = kResolutions[choice.resolution];
             const char *const names[3] = {"Resolution", "Aspect ratio", "Show FPS"};
             const char *const values[3] = {resolution.label, choice.widescreen ? "16:9" : "4:3",
                 choice.show_fps ? "Yes" : "No"};
             const char *const notes[3] = {resolution.note, choice.widescreen ? "Widescreen" : "Original", ""};
             for (int i = 0; i < 3; ++i) {
-                // Everything stays inside the TV's safe area (about 90% of the screen).
-                const int top = 125 + i * 120;
+                const int top = 110 + i * 120;
                 if (i == row) fillRect(pixels, stride, 100, top, 1080, 105, kSelected);
-                drawText(pixels, stride, 130, top + (notes[i][0] ? 10 : 28), 3, names[i], i == row ? kText : kDim);
-                char value[32];
-                std::snprintf(value, sizeof value, "< %s >", values[i]);
-                drawText(pixels, stride, 1150 - textWidth(value, 3), top + (notes[i][0] ? 10 : 28), 3, value, kText);
-                drawText(pixels, stride, 1150 - textWidth(notes[i], 2), top + 64, 2, notes[i],
+                // Names on the left; each value centered between fixed arrows,
+                // with its note centered below it.
+                const int text_top = top + (notes[i][0] ? 14 : 32);
+                drawText(pixels, stride, 140, text_top + 4, 40, names[i], i == row ? kText : kDim);
+                constexpr int kArrowLeft = 700, kArrowRight = 1100, kValueCenter = (kArrowLeft + 40 + kArrowRight) / 2;
+                drawText(pixels, stride, kArrowLeft, text_top, 40, "<", kText);
+                drawText(pixels, stride, kArrowRight, text_top, 40, ">", kText);
+                drawText(pixels, stride, kValueCenter - textWidth(values[i], 48) / 2, text_top - 4, 48, values[i], kText);
+                drawText(pixels, stride, kValueCenter - textWidth(notes[i], 24) / 2, top + 68, 24, notes[i],
                     i == row ? kText : kDim);
             }
-            const int start_top = 495;
-            if (row == 3) fillRect(pixels, stride, 440, start_top, 400, 80, kSelected);
-            drawText(pixels, stride, (1280 - textWidth("Start", 4)) / 2, start_top + 8, 4, "Start", kText);
-            const char *const help = "Up/Down: option   Left/Right: change   A/+: start";
-            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 605, 2, help, kDim);
+            const int start_top = 480;
+            if (row == 3) fillRect(pixels, stride, 440, start_top, 400, 90, kSelected);
+            drawText(pixels, stride, (1280 - textWidth("Start", 64)) / 2, start_top + 13, 64, "Start", kText);
+            // Two short lines: one long line ran past the screen's edges.
+            const char *const help[2] = {"Up/Down: option    Left/Right: change", "A or +: start"};
+            for (int i = 0; i < 2; ++i)
+                drawText(pixels, stride, (1280 - textWidth(help[i], 24)) / 2, 600 + i * 34, 24, help[i], kDim);
             framebufferEnd(&framebuffer);
         }
         svcSleepThread(16'000'000);
