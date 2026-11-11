@@ -76,8 +76,14 @@ static void quitPrompt(std::uint32_t port, RecompInputGamepad *gamepad)
     recomp_overlay_clear(&text);
     switch (recomp_quit_prompt_filter(port, gamepad, static_cast<std::uint64_t>(now))) {
     case RECOMP_QUIT_OPENED:
+#ifdef __SWITCH__
+        // The Switch's B and A are the pad's A and B (input_host_switch.c).
+        recomp_overlay_set_title(&text, "Quit to the home menu?");
+        recomp_overlay_set_hint(&text, "B quit   A keep playing");
+#else
         recomp_overlay_set_title(&text, "Quit to the desktop?");
         recomp_overlay_set_hint(&text, "A quit   B keep playing");
+#endif
         recomp_overlay_publish(RECOMP_OVERLAY_QUIT_PROMPT, &text);
         break;
     case RECOMP_QUIT_CANCELLED:

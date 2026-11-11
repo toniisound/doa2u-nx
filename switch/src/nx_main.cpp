@@ -36,7 +36,7 @@
 #include "xbe_parser.h"
 
 #ifndef DOA2U_NX_VERSION
-#define DOA2U_NX_VERSION "0.1.13"
+#define DOA2U_NX_VERSION "0.3.1"
 #endif
 
 int recomp_runner_main(int argc, char **argv); // runner.cpp main, renamed at compile time
@@ -641,6 +641,10 @@ int main(int argc, char **argv)
     std::vector<char *> runner_argv;
     for (std::string &argument : arguments) runner_argv.push_back(argument.data());
     runner_argv.push_back(nullptr);
+    // Netplay's sockets (BSD over the console's network service); the game
+    // runs without them when the console has no network.
+    const Result sockets = socketInitializeDefault();
+    if (R_FAILED(sockets)) std::fprintf(stderr, "[nx] sockets unavailable (0x%x): no netplay\n", sockets);
     doa2u_nx_profile_start();
     int code = 1;
     try {

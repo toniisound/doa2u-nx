@@ -38,7 +38,8 @@ extern "C" {
 
 namespace {
 
-constexpr uint32_t kVoiceCount = 256;
+// DirectSound slots 0..255 and the native movie player on 256.
+constexpr uint32_t kVoiceCount = RECOMP_AUDIO_OUTPUT_SLOTS;
 constexpr uint32_t kMaxBufferBytes = 160000;
 constexpr uint32_t kMinSampleRate = 1000;
 constexpr uint32_t kMaxSampleRate = 200000;
@@ -87,22 +88,19 @@ struct Voice {
 std::mutex mutex;
 Voice voices[kVoiceCount];
 
-/* The owner (guest) thread's per-voice calls run on the mixer thread, in
-   order, at the start of each period: 3D voices' HRTF filtering moved off
-   the guest thread with them, and keeping submit, routing and reset in one
-   queue keeps their order. */
+/* Per-voice calls (the game thread's routing and resets, the DirectSound
+   pump's and the movie player's submissions) run on the mixer thread in
+   order at the start of each period, so format conversion and resampling
+   stay off the callers' threads. */
 struct AudioCommand {
-    enum Kind { Submit, SubmitHrtf, Reset, Routing } kind = Submit;
+    enum Kind { Submit, Reset, Routing } kind = Submit;
     uint32_t slot = 0, rate = 0, channels = 0, bits = 0;
     int32_t volume = 0;
     std::vector<uint8_t> data;
     VoiceRouting route{};
-    RecompHrtfFilter filter{}, rendered{};
-    bool reset_hrtf = false;
 };
 std::mutex command_mutex;
 std::vector<AudioCommand> pending_commands;
-RecompHrtfVoice hrtf_voices[kVoiceCount];
 constexpr size_t kMaxPendingCommands = 8192;
 unsigned long long dropped_commands = 0;
 
@@ -576,26 +574,6 @@ extern "C" void recomp_audio_output_submit(
     enqueue(std::move(command));
 }
 
-extern "C" void recomp_audio_output_submit_hrtf(uint32_t slot, const int16_t *samples, uint32_t frames,
-    uint32_t source_rate, const RecompHrtfFilter *filter, const RecompHrtfFilter *rendered_reset,
-    int32_t volume_hundredth_db)
-{
-    recomp_audio_output_initialize();
-    if (!device_open || frames == 0 || samples == nullptr || filter == nullptr || slot >= kVoiceCount ||
-        source_rate < kMinSampleRate || source_rate > kMaxSampleRate) return;
-    AudioCommand command;
-    command.kind = AudioCommand::SubmitHrtf;
-    command.slot = slot;
-    command.rate = source_rate;
-    command.volume = volume_hundredth_db;
-    command.filter = *filter;
-    command.reset_hrtf = rendered_reset != nullptr;
-    if (rendered_reset != nullptr) command.rendered = *rendered_reset;
-    const auto *bytes = reinterpret_cast<const uint8_t *>(samples);
-    command.data.assign(bytes, bytes + static_cast<size_t>(frames) * sizeof(int16_t));
-    enqueue(std::move(command));
-}
-
 namespace {
 void submitNow(
     uint32_t slot, const uint8_t *pcm, uint32_t bytes,
@@ -709,8 +687,7 @@ void submitNow(
     if (nonzero) reported_nonzero[slot] = true;
 }
 
-/* Mixer thread: runs the owner thread's queued calls in order, filtering
-   3D voices as the guest thread used to (dsound_buffer_adapter.c pump). */
+/* Mixer thread: runs the queued per-voice calls in order. */
 void drainCommands()
 {
     std::vector<AudioCommand> commands;
@@ -718,12 +695,10 @@ void drainCommands()
         std::lock_guard<std::mutex> lock(command_mutex);
         commands.swap(pending_commands);
     }
-    static float ears[3u * 20000u];
     for (AudioCommand &command : commands) {
         switch (command.kind) {
         case AudioCommand::Reset:
             resetVoiceNow(command.slot);
-            hrtf_voices[command.slot] = {};
             break;
         case AudioCommand::Routing:
             setRoutingNow(command.slot, command.route);
@@ -732,27 +707,6 @@ void drainCommands()
             submitNow(command.slot, command.data.data(), static_cast<uint32_t>(command.data.size()), command.rate,
                 command.channels, command.bits, command.volume);
             break;
-        case AudioCommand::SubmitHrtf: {
-            RecompHrtfVoice &hrtf = hrtf_voices[command.slot];
-            if (command.reset_hrtf) {
-                hrtf = RecompHrtfVoice{};
-                hrtf.rendered = command.rendered;
-            }
-            hrtf.filter = command.filter;
-            const auto *samples = reinterpret_cast<const int16_t *>(command.data.data());
-            const uint32_t frames = static_cast<uint32_t>(command.data.size() / sizeof(int16_t));
-            // The APU filters 3D voices at 48 kHz; pieces keep each submission in bounds.
-            uint32_t limit = static_cast<uint32_t>(uint64_t{19000u} * command.rate / RECOMP_HRTF_RATE);
-            if (limit == 0u) limit = 1u;
-            for (uint32_t done = 0u; done < frames;) {
-                const uint32_t piece = frames - done < limit ? frames - done : limit;
-                const uint32_t rendered = recomp_hrtf_render(&hrtf, samples + done, piece, command.rate, ears, 20000u);
-                if (rendered != 0u) submitNow(command.slot, reinterpret_cast<const uint8_t *>(ears), rendered * 12u,
-                    RECOMP_HRTF_RATE, 3u, 32u, command.volume);
-                done += piece;
-            }
-            break;
-        }
         }
     }
     // Keep the swapped-out storage for the next period's calls.

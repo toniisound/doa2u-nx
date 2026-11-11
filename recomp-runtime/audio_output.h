@@ -61,19 +61,6 @@ int recomp_audio_output_set_voice_routing(uint32_t slot, uint32_t channels,
    drops the incoming chunk without waiting. A new or starved voice first
    queues 50 ms of silence as a jitter cushion, then trims its pitch by at most
    1% to hold that cushion against the device's actual consumption rate. */
-#ifdef RECOMP_AUDIO_DEFERRED_HRTF
-#include "dsound_hrtf.h"
-/* Owner thread, hosts that filter 3D voices themselves: mono 16-bit source
-   frames for slot, to be resampled and HRTF-filtered with filter (and the
-   crosstalk canceller) as recomp_hrtf_render does, then submitted as its
-   three float channels. rendered_reset, when set, restarts the voice's filter
-   state with that filter already in effect (after a voice reset). Calls on
-   the slot keep their order with submit, routing and reset. */
-void recomp_audio_output_submit_hrtf(uint32_t slot, const int16_t *samples, uint32_t frames,
-    uint32_t source_rate, const RecompHrtfFilter *filter, const RecompHrtfFilter *rendered_reset,
-    int32_t volume_hundredth_db);
-#endif
-
 void recomp_audio_output_submit(
     uint32_t slot, const uint8_t *pcm, uint32_t bytes,
     uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample,

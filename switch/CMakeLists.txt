@@ -22,7 +22,7 @@ endif()
 
 # Follows the doa2u-re release this port is built on (docs/test-release.md).
 # A plain variable, so an older value cached in a build directory cannot hide it.
-set(DOA2U_NX_VERSION "0.1.13")
+set(DOA2U_NX_VERSION "0.3.1")
 set(DOA2U_NX_ICON "" CACHE FILEPATH "Optional 256x256 JPEG icon for the .nro")
 
 set(CMAKE_C_STANDARD 11)
@@ -42,9 +42,6 @@ set(NX_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Same code generation rules as the desktop builds (see recomp-runtime):
 # IEEE operation order, no strict aliasing, 32-bit wraparound.
-# 3D voices are HRTF-filtered by the audio mixer thread (core 2) instead of the
-# guest thread: dsound_buffer_adapter.c hands it their mono source.
-add_compile_definitions(RECOMP_AUDIO_DEFERRED_HRTF)
 # Per-phase timing of the draw adapter, reported once a second in the log.
 add_compile_definitions(RECOMP_DRAW_ADAPTER_TIMING)
 # Triangle draws deep in shared buffers use a base vertex instead of a
@@ -161,19 +158,31 @@ message(STATUS "Generated ${_missing_count} fail-loud stubs for absent snapshot 
 # Runner
 # ---------------------------------------------------------------------------
 set(_runtime_sources
-    # recomp_program_runner (recomp-runtime/CMakeLists.txt), minus the
-    # Windows/SDL input host, which input_host_switch.c replaces
-    runner.cpp program_adapters.c program_manual.c
+    # recomp_runner_objects (recomp-runtime/CMakeLists.txt), minus the
+    # Windows/SDL input host, which input_host_switch.c replaces, and UPnP,
+    # which netplay_upnp_switch.c replaces
+    runner.cpp program_adapters.c program_manual.c netplay_guest.c
     d3d8_adapter.c d3d8_state_adapter.c d3d8_resource_adapter.c d3d8_draw_adapter.c
     d3d_device_model.c d3d_light_model.c d3d_render_state_model.c d3d_card_model.c
-    d3d_frame_model.c d3d_tile_model.c d3d_vertex_shader_model.c
+    d3d_frame_model.c d3d_tile_model.c d3d_vertex_shader_model.c perf_overlay.c
     dsound_api_adapter.c dsound_device_model.c dsound_buffer_adapter.c
     dsound_buffer_model.c dsound_effects_adapter.c dsound_effects_image.c dsound_mix_model.c
-    xbox_adpcm.c
+    xbox_adpcm.c mwply_adapter.c sfd_movie.c sfd_format.c movie_color_model.c adx_decoder.c stage_select.c
     input_model.c input_adapter.c input_pulse_source.c
+    synctest.c synctest_modules.c rollback.c replay.c netplay.c netplay_room.c netplay_names.c netplay_menu.cpp
+    netplay_menu_room.cpp netplay_menu_find.cpp cpu_costume.c unlock_profile.c pc_settings.c
+    pc_settings_store.cpp runner_assets.c menu_quit.c quit_icon.c
+    netplay_settings.cpp netplay_profile.cpp netplay_session.cpp game_state.c overlay.c
+    free_camera.c free_camera_adapter.c scene_freeze.c scene_freeze_adapter.c quit_prompt.c
     host_diagnostics.cpp
+    # recomp_keyboard: portable despite its name; no keys are ever down here
+    input_keyboard_win32.c
+    # recomp_portable_math
+    musl_math/sin.c musl_math/cos.c musl_math/tan.c musl_math/__sin.c musl_math/__cos.c musl_math/__tan.c
+    musl_math/__rem_pio2.c musl_math/__rem_pio2_large.c musl_math/atan.c musl_math/atan2.c
+    musl_math/log2.c musl_math/log1p.c musl_math/expm1.c
     # recomp_kernel
-    runtime.c stop_report.c guest_heap.c xapi_clock.cpp native_fiber.c
+    runtime.c stop_report.c guest_heap.c guest_snapshot.c xapi_clock.cpp native_fiber.c
     fiber_model.c fiber_adapter.c
     kernel_config.c kernel_crypto.c kernel_debug.c kernel_device.c
     kernel_dispatch.c kernel_file.c kernel_interrupt.c kernel_memory.c
@@ -186,8 +195,22 @@ set(_runtime_sources
     audio_reverb.cpp dsound_hrtf.c
     # recomp_d3d_presenter's shared draw pieces; the presenter driver and
     # backend come with DOA2U_NX_PRESENTER below
-    d3d_draw_model.c d3d_texture_model.c d3d_vblank.cpp)
+    d3d_draw_model.c d3d_texture_model.c d3d_vblank.cpp overlay_text.c screenshot.c)
 list(TRANSFORM _runtime_sources PREPEND "${RUNTIME}/")
+
+# Sofdec movies decode their MPEG-1 video with pl_mpeg (MIT), patched for
+# TMPGEnc's 11-bit intra DC exactly as the desktop build does.
+file(DOWNLOAD https://raw.githubusercontent.com/phoboslab/pl_mpeg/c871f2be022ece7ef4f64230b4fb8e1fb9eb6023/pl_mpeg.h
+    "${CMAKE_CURRENT_BINARY_DIR}/pl_mpeg_upstream.h"
+    EXPECTED_HASH SHA256=3a8cb30c83c2a1147719c30fe0c8b93da2987aa43140077c575b39aaa75fc2c9)
+include("${RUNTIME}/pl_mpeg_patch.cmake")
+recomp_patch_pl_mpeg("${CMAKE_CURRENT_BINARY_DIR}/pl_mpeg_upstream.h" "${CMAKE_CURRENT_BINARY_DIR}/pl_mpeg/pl_mpeg.h")
+set_source_files_properties("${RUNTIME}/sfd_movie.c" PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/pl_mpeg")
+
+# Netplay pairs runners of one release and one program; a Switch build only
+# pairs with Switch builds of the same version.
+set(_netplay_version "doa2u-nx ${DOA2U_NX_VERSION}")
+string(SHA256 _netplay_build "${_netplay_version}\n${RECOMP_PROGRAM_MANIFEST_SHA256}\n${_xbe_sha256}\n")
 
 # gl: the OpenGL 4.3 renderer (stage 2) on its own thread on core 1, behind
 # a portable copy of upstream's threaded presenter driver. probe: no
@@ -299,6 +322,7 @@ add_executable(doa2u-nx
     "${NX_SRC}/profile.cpp"
     "${NX_SRC}/input_host_switch.c"
     "${NX_SRC}/audio_output_switch.cpp"
+    "${NX_SRC}/netplay_upnp_switch.c"
     ${DOA2U_NX_PRESENTER_SOURCES}
     "${_missing_source}"
     ${_recomp_program_sources}
@@ -307,6 +331,8 @@ add_executable(doa2u-nx
 
 target_compile_definitions(doa2u-nx PRIVATE
     RECOMP_XBE_SHA256="${_xbe_sha256}"
+    # Every host gets the same transcendentals and RCPSS/RSQRTSS, as upstream.
+    RECOMP_PORTABLE_MATH
     DOA2U_NX_VERSION="${DOA2U_NX_VERSION}")
 # DirectSound drops audio spans after a longer gap between the game's pumps.
 # Bring-up frames still take 100-150 ms, so keep their audio instead of
@@ -321,7 +347,7 @@ target_include_directories(doa2u-nx BEFORE PRIVATE
     "${XBE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/program")
 set_source_files_properties("${RUNTIME}/runner.cpp" PROPERTIES
-    COMPILE_DEFINITIONS "main=recomp_runner_main")
+    COMPILE_DEFINITIONS "main=recomp_runner_main;RECOMP_NETPLAY_BUILD=\"${_netplay_build}\"")
 # The generated chunks are ~140k lines each; -O2 keeps the build time sane
 # while still giving the register allocation the lifted code needs.
 set_source_files_properties(${_recomp_program_sources} PROPERTIES

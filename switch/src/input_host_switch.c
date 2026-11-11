@@ -114,3 +114,40 @@ void recomp_input_host_set_vibration(uint32_t port, uint16_t left_motor, uint16_
 void recomp_input_host_stop_vibration(void)
 {
 }
+
+/* Desktop-only pieces of input_host_win32.h: the Switch has no keyboard or
+   mouse, so no runtime key is ever down and no drag starts. The capture hook
+   (the free camera's) is kept but never called: its toggle is a desktop key
+   or the right stick's click, which this host passes to the game as before. */
+static RecompInputCaptureHook capture_hook;
+
+bool recomp_input_host_pad_connected(uint32_t port)
+{
+    if (port >= NX_PORT_COUNT) return false;
+    initialize();
+    padUpdate(&pads[port]);
+    return padIsConnected(&pads[port]) || port == 0u;
+}
+
+void recomp_input_host_set_capture_hook(RecompInputCaptureHook hook)
+{
+    capture_hook = hook;
+}
+
+void recomp_input_host_keyboard_buttons(RecompInputGamepad *pressed_buttons)
+{
+    if (pressed_buttons != NULL) memset(pressed_buttons, 0, sizeof *pressed_buttons);
+}
+
+bool recomp_input_host_key(RecompInputHostKey key)
+{
+    (void)key;
+    return false;
+}
+
+bool recomp_input_host_mouse_drag(float *dx, float *dy)
+{
+    if (dx != NULL) *dx = 0.0f;
+    if (dy != NULL) *dy = 0.0f;
+    return false;
+}

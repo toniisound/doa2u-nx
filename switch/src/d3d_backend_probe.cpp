@@ -225,6 +225,18 @@ RecompD3dPresenterError d3d_backend_destroy(RecompD3dPresenter **presenter)
     return RECOMP_D3D_PRESENTER_OK;
 }
 
+void d3d_backend_set_quality(float, uint32_t, bool) {}
+
+bool d3d_backend_quality_live()
+{
+    return false;
+}
+
+bool d3d_backend_present_ready(RecompD3dPresenter *)
+{
+    return true;
+}
+
 void d3d_backend_set_immediate_present(bool enabled)
 {
     immediate_present_setting = enabled;

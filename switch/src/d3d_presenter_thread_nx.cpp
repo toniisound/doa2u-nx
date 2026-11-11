@@ -588,3 +588,24 @@ void recomp_d3d_presenter_report_draw_textures()
         fail(thread, thread.packets[thread.open].addReport());
     }
 }
+
+/* True when a PRESENT would not wait for the render thread; Swap keeps the
+   guest's vblank threads running while this is false (d3d8_adapter.c). */
+bool recomp_d3d_presenter_present_ready(RecompD3dPresenter *presenter)
+{
+    if (validate(presenter) != RECOMP_D3D_PRESENTER_OK) return true;
+    PresenterThread &thread = *active_thread;
+    std::lock_guard<std::mutex> lock(thread.mutex);
+    return thread.pending < 2 || thread.status != RECOMP_D3D_PRESENTER_OK;
+}
+
+/* PC Settings' live quality: the Switch picks its scale at boot. */
+void recomp_d3d_presenter_set_quality(float scale, uint32_t msaa, bool smaa)
+{
+    d3d_backend_set_quality(scale, msaa, smaa);
+}
+
+bool recomp_d3d_presenter_quality_live()
+{
+    return d3d_backend_quality_live();
+}

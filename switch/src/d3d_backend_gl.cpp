@@ -24,6 +24,8 @@
 #include "d3d_shader_compiler.h"
 #include "d3d_texture_model.h"
 #include "shader_specialize.h"
+#include "overlay_text.h"
+#include "widescreen.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -415,6 +417,7 @@ struct RecompD3dPresenter {
     uint32_t window_width = 1280u, window_height = 720u;
     bool close_requested = false;
     bool widescreen = false;
+    unsigned aspect_w = 16u, aspect_h = 9u;  // the widescreen shape (widescreen.h)
     bool flip_winding = false;
     bool s3tc = false;
     float scale = 1.0f;
@@ -526,7 +529,7 @@ bool immediate_present;
 uint32_t presentClientWidth(const RecompD3dPresenter *presenter, uint64_t height)
 {
     return static_cast<uint32_t>(presenter->widescreen
-        ? (height * 16u + 8u) / 9u
+        ? (height * presenter->aspect_w + presenter->aspect_h - 1u) / presenter->aspect_h
         : (height * 4u + 1u) / 3u);
 }
 
@@ -2364,7 +2367,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     }
     if (draw.stage1_alpha_mask) {
         if (draw.has_alpha_mask || draw.has_reflection || draw.program_count || draw.distortion ||
-            draw.four_tap_filter || (draw.stage1_kill_only ? layout.texcoord_count == 0u
+            draw.four_tap_filter || (draw.stage1_kill_only || draw.stage1_mask_transform ? layout.texcoord_count == 0u
                 : layout.texcoord_count != 2u)) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
         mask = reflectionLookup(draw.reflection_texture, draw.reflection_bytes, draw.reflection_byte_count);
         if (mask == 0u || texture == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
@@ -2675,6 +2678,125 @@ void pollHost(RecompD3dPresenter *presenter)
 #endif
 }
 
+/* The runtime's window overlay (overlay_text.h: the quit prompt, the free
+   camera's panel), drawn on the window after the game's picture as the SDL
+   backend does, in overlay.c's 5 x 7 font: each dot is a scissored clear,
+   cheap for a panel that is only up while asked for. */
+const char kOverlayFont[65][42] = {
+    ".....|.....|.....|.....|.....|.....|.....", /* space */
+    "..#..|..#..|..#..|..#..|..#..|.....|..#..", /* ! */
+    ".#.#.|.#.#.|.....|.....|.....|.....|.....", /* " */
+    ".#.#.|#####|.#.#.|.#.#.|#####|.#.#.|.....", /* # */
+    "..#..|.####|#.#..|.###.|..#.#|####.|..#..", /* $ */
+    "##...|##..#|...#.|..#..|.#...|#..##|...##", /* % */
+    ".##..|#..#.|#.#..|.#...|#.#.#|#..#.|.##.#", /* & */
+    "..#..|..#..|.....|.....|.....|.....|.....", /* ' */
+    "...#.|..#..|.#...|.#...|.#...|..#..|...#.", /* ( */
+    ".#...|..#..|...#.|...#.|...#.|..#..|.#...", /* ) */
+    ".....|..#..|#.#.#|.###.|#.#.#|..#..|.....", /* * */
+    ".....|..#..|..#..|#####|..#..|..#..|.....", /* + */
+    ".....|.....|.....|.....|.##..|..#..|.#...", /* , */
+    ".....|.....|.....|#####|.....|.....|.....", /* - */
+    ".....|.....|.....|.....|.....|.##..|.##..", /* . */
+    "....#|....#|...#.|..#..|.#...|#....|#....", /* / */
+    ".###.|#...#|#..##|#.#.#|##..#|#...#|.###.", /* 0 */
+    "..#..|.##..|..#..|..#..|..#..|..#..|.###.", /* 1 */
+    ".###.|#...#|....#|...#.|..#..|.#...|#####", /* 2 */
+    "#####|...#.|..#..|...#.|....#|#...#|.###.", /* 3 */
+    "...#.|..##.|.#.#.|#..#.|#####|...#.|...#.", /* 4 */
+    "#####|#....|####.|....#|....#|#...#|.###.", /* 5 */
+    "..##.|.#...|#....|####.|#...#|#...#|.###.", /* 6 */
+    "#####|....#|...#.|..#..|.#...|.#...|.#...", /* 7 */
+    ".###.|#...#|#...#|.###.|#...#|#...#|.###.", /* 8 */
+    ".###.|#...#|#...#|.####|....#|...#.|.##..", /* 9 */
+    ".....|.##..|.##..|.....|.##..|.##..|.....", /* : */
+    ".....|.##..|.##..|.....|.##..|..#..|.#...", /* ; */
+    "...#.|..#..|.#...|#....|.#...|..#..|...#.", /* < */
+    ".....|.....|#####|.....|#####|.....|.....", /* = */
+    ".#...|..#..|...#.|....#|...#.|..#..|.#...", /* > */
+    ".###.|#...#|....#|...#.|..#..|.....|..#..", /* ? */
+    ".###.|#...#|....#|.##.#|#.#.#|#.#.#|.###.", /* @ */
+    ".###.|#...#|#...#|#...#|#####|#...#|#...#", /* A */
+    "####.|#...#|#...#|####.|#...#|#...#|####.", /* B */
+    ".###.|#...#|#....|#....|#....|#...#|.###.", /* C */
+    "###..|#..#.|#...#|#...#|#...#|#..#.|###..", /* D */
+    "#####|#....|#....|####.|#....|#....|#####", /* E */
+    "#####|#....|#....|####.|#....|#....|#....", /* F */
+    ".###.|#...#|#....|#.###|#...#|#...#|.####", /* G */
+    "#...#|#...#|#...#|#####|#...#|#...#|#...#", /* H */
+    ".###.|..#..|..#..|..#..|..#..|..#..|.###.", /* I */
+    "..###|...#.|...#.|...#.|...#.|#..#.|.##..", /* J */
+    "#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#", /* K */
+    "#....|#....|#....|#....|#....|#....|#####", /* L */
+    "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#", /* M */
+    "#...#|#...#|##..#|#.#.#|#..##|#...#|#...#", /* N */
+    ".###.|#...#|#...#|#...#|#...#|#...#|.###.", /* O */
+    "####.|#...#|#...#|####.|#....|#....|#....", /* P */
+    ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#", /* Q */
+    "####.|#...#|#...#|####.|#.#..|#..#.|#...#", /* R */
+    ".####|#....|#....|.###.|....#|....#|####.", /* S */
+    "#####|..#..|..#..|..#..|..#..|..#..|..#..", /* T */
+    "#...#|#...#|#...#|#...#|#...#|#...#|.###.", /* U */
+    "#...#|#...#|#...#|#...#|#...#|.#.#.|..#..", /* V */
+    "#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#.", /* W */
+    "#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#", /* X */
+    "#...#|#...#|#...#|.#.#.|..#..|..#..|..#..", /* Y */
+    "#####|....#|...#.|..#..|.#...|#....|#####", /* Z */
+    ".###.|.#...|.#...|.#...|.#...|.#...|.###.", /* [ */
+    "#....|#....|.#...|..#..|...#.|....#|....#", /* backslash */
+    ".###.|...#.|...#.|...#.|...#.|...#.|.###.", /* ] */
+    "..#..|.#.#.|#...#|.....|.....|.....|.....", /* ^ */
+    ".....|.....|.....|.....|.....|.....|#####", /* _ */
+    ".....|.....|.#...|#.#.#|...#.|.....|.....", /* ~ */
+};
+
+void drawOverlayText(int x, int y, int dot, const char *text, const float color[4])
+{
+    for (; *text != '\0'; ++text, x += 6 * dot) {
+        int c = static_cast<unsigned char>(*text);
+        if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+        const int index = c >= ' ' && c <= '_' ? c - ' ' : c == '~' ? 64 : '?' - ' ';
+        const char *glyph = kOverlayFont[index];
+        for (int row = 0; row < 7; ++row) {
+            for (int column = 0; column < 5; ++column) {
+                if (glyph[row * 6 + column] != '#') continue;
+                // Window rows count up from the bottom.
+                glScissor(x + column * dot, y - (row + 1) * dot, dot, dot);
+                glClearBufferfv(GL_COLOR, 0, color);
+            }
+        }
+    }
+}
+
+void drawWindowOverlay(RecompD3dPresenter *presenter)
+{
+    RecompOverlayText overlay;
+    recomp_overlay_take(&overlay);
+    if (recomp_overlay_empty(&overlay)) return;
+    const int width = static_cast<int>(presenter->window_width), height = static_cast<int>(presenter->window_height);
+    const int dot = std::max(2, height / 180);
+    const int line = 10 * dot;
+    const int rows = 1 + static_cast<int>(overlay.count) + 2;
+    const int panel_height = rows * line + 2 * dot;
+    const int panel_top = (height + panel_height) / 2;  // window rows count up
+    glEnable(GL_SCISSOR_TEST);
+    const float shade[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glScissor(0, panel_top - panel_height, width, panel_height);
+    glClearBufferfv(GL_COLOR, 0, shade);
+    const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f}, grey[4] = {0.7f, 0.7f, 0.7f, 1.0f};
+    const auto centered = [&](const char *text, int top, int size, const float color[4]) {
+        const int text_width = static_cast<int>(std::strlen(text)) * 6 * size;
+        drawOverlayText((width - text_width) / 2, top, size, text, color);
+    };
+    int top = panel_top - dot;
+    centered(overlay.title, top, dot + dot / 2, white);
+    top -= line + dot;
+    for (unsigned i = 0u; i < overlay.count; ++i, top -= line) centered(overlay.line[i], top, dot, white);
+    centered(overlay.hint, top - dot, dot, grey);
+    glDisable(GL_SCISSOR_TEST);
+    presenter->applied_valid = false;
+}
+
 /* Once a second, with the render line: GPU milliseconds per frame by target
    size (largest first), with the draws and draw kinds that went to it. The
    timestamps bracket each segment's draw loop as the GPU runs it. */
@@ -2788,8 +2910,9 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     presenter->applied_valid = false;
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     glClearBufferfv(GL_COLOR, 0, black);
-    const float source_aspect = static_cast<float>(presentClientWidth(presenter, mainHeight(presenter))) /
-        mainHeight(presenter);
+    // The game's own shape for this frame, which a netplay session may set apart from the window's.
+    const float source_aspect = present.aspect > 0.0f ? present.aspect
+        : presenter->widescreen ? static_cast<float>(presenter->aspect_w) / presenter->aspect_h : 4.0f / 3.0f;
     const float window_aspect = static_cast<float>(presenter->window_width) / presenter->window_height;
     float width = 1.0f, height = 1.0f;
     if (window_aspect > source_aspect) width = source_aspect / window_aspect;
@@ -2815,6 +2938,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
                 presenter->present_count);
         }
     }
+    drawWindowOverlay(presenter);
     stage("eglSwapBuffers");
     eglSwapBuffers(presenter->display, presenter->surface);
     stage("present done");
@@ -3055,7 +3179,7 @@ RecompD3dPresenterError d3d_backend_create(const RecompD3dPresenterConfig *confi
     if (created == nullptr) return RECOMP_D3D_PRESENTER_OUT_OF_MEMORY;
     created->config = *config;
     created->owner_thread = std::this_thread::get_id();
-    created->widescreen = envFlag("RECOMP_D3D_WIDESCREEN");
+    created->widescreen = recomp_widescreen(&created->aspect_w, &created->aspect_h);
     created->flip_winding = envFlag("RECOMP_GL_FLIP_WINDING");
     if (const char *scale = std::getenv("RECOMP_D3D_SCALE")) {
         const float value = static_cast<float>(std::atof(scale));
@@ -3343,6 +3467,23 @@ RecompD3dPresenterError d3d_backend_destroy(RecompD3dPresenter **presenter)
     releasePresenter(destroyed);
     delete destroyed;
     return RECOMP_D3D_PRESENTER_OK;
+}
+
+/* PC Settings' quality is not applied live: the Switch picks its scale at boot. */
+void d3d_backend_set_quality(float scale, uint32_t msaa, bool smaa)
+{
+    std::fprintf(stderr, "recomp d3d presenter: quality scale=%.2f msaa=%u smaa=%d applies at the next start\n",
+        scale, msaa, smaa ? 1 : 0);
+}
+
+bool d3d_backend_quality_live()
+{
+    return false;
+}
+
+bool d3d_backend_present_ready(RecompD3dPresenter *)
+{
+    return true;
 }
 
 void d3d_backend_set_immediate_present(bool enabled)

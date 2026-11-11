@@ -7,6 +7,12 @@ This repository keeps its full history and code; everything Switch-specific live
 [`switch/`](switch), and the upstream README is kept as
 [`README.doa2u-re.md`](README.doa2u-re.md).
 
+Based on doa2u-re **0.3.1 Alpha**: Sofdec movies play on their own host
+thread, DirectSound mixes off the game thread, and the quit prompt (hold
+**-** for two seconds; **B** quits, **A** keeps playing) is drawn by the
+Switch renderer. Netplay is built in; UPnP is not, so a host forwards its
+port by hand.
+
 Sister project: [DOA3 NX](https://github.com/toniisound/doa3-nx), whose Switch
 host layer this port started from.
 
