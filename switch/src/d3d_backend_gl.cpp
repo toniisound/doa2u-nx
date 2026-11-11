@@ -114,6 +114,7 @@ struct RenderReport {
     std::chrono::steady_clock::time_point start{};
     unsigned frames = 0u;
     uint64_t draws = 0u, segments = 0u, texture_uploads = 0u;
+    uint64_t upload_bytes = 0u, ring_waits = 0u;
     double gpu_ms = 0.0;
     unsigned gpu_frames = 0u;
 } render_report;
@@ -135,10 +136,11 @@ unsigned noteRenderFrame()
     std::sort(sorted, sorted + stage_time_count, [](const StageTime &a, const StageTime &b) { return a.ms > b.ms; });
     char line[640];
     int used = std::snprintf(line, sizeof line,
-        "recomp render: per frame %.2fms gpu=%.2fms draws=%.0f segments=%.1f uploads=%.1f |",
+        "recomp render: per frame %.2fms gpu=%.2fms draws=%.0f segments=%.1f uploads=%.1f ring=%.0fKB waits=%.1f |",
         elapsed / frames, render_report.gpu_frames ? render_report.gpu_ms / render_report.gpu_frames : -1.0,
         double(render_report.draws) / frames, double(render_report.segments) / frames,
-        double(render_report.texture_uploads) / frames);
+        double(render_report.texture_uploads) / frames, double(render_report.upload_bytes) / frames / 1024.0,
+        double(render_report.ring_waits) / frames);
     for (unsigned i = 0u; i < stage_time_count && i < 8u && used > 0 && used < int(sizeof line); ++i)
         used += std::snprintf(line + used, sizeof line - used, " %s=%.2f", sorted[i].name, sorted[i].ms / frames);
     std::fprintf(stderr, "%s\n", line);
@@ -146,6 +148,7 @@ unsigned noteRenderFrame()
     render_report.start = now;
     stage_time_count = 0u;
     render_report.draws = render_report.segments = render_report.texture_uploads = 0u;
+    render_report.upload_bytes = render_report.ring_waits = 0u;
     render_report.gpu_ms = 0.0;
     render_report.gpu_frames = 0u;
     return frames;
@@ -194,6 +197,10 @@ constexpr float kRowTieBias = 1.0f / 256.0f;
 
 using ClipControlFn = void (*)(GLenum origin, GLenum depth);
 ClipControlFn clipControl = nullptr;
+// ARB_buffer_storage (GL 4.4), outside the GL 4.3 loader.
+using BufferStorageFn = void (*)(GLenum target, GLsizeiptr size, const void *data, GLbitfield flags);
+BufferStorageFn bufferStorage = nullptr;
+constexpr GLbitfield kMapPersistent = 0x0040u, kMapCoherent = 0x0080u;
 
 bool envFlag(const char *name)
 {
@@ -442,6 +449,15 @@ struct RecompD3dPresenter {
 
     GLuint vertex_buffer = 0u, index_buffer = 0u, uniform_buffer = 0u, gamma_buffer = 0u;
     uint32_t vertex_used = 0u, index_used = 0u, uniform_used = 0u;
+    /* Persistently mapped rings (ARB_buffer_storage): segments are copied
+       straight into them, without a map and unmap per upload. Positions
+       count every byte ever written (wraps included), so a fence after each
+       segment records how far the GPU may still read. */
+    uint8_t *ring_memory[3] = {nullptr, nullptr, nullptr};
+    uint64_t ring_written[3] = {0u, 0u, 0u};
+    uint64_t ring_safe[3] = {0u, 0u, 0u};  // bytes the GPU is known to be done with
+    struct RingFence { GLsync sync; uint64_t written[3]; };
+    std::deque<RingFence> ring_fences;
 
     Segment segment;
     std::unordered_map<FramebufferKey, GLuint, FramebufferKeyHash> framebuffers;
@@ -1758,6 +1774,64 @@ uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const std:
     return base;
 }
 
+/* The persistent path of uploadRing: ring 0 vertices, 1 indices, 2 uniforms.
+   Overwriting a ring's bytes needs the GPU done with what they held, which a
+   fence after the segment that last read them records. */
+uint32_t uploadPersistent(RecompD3dPresenter *presenter, int ring, uint32_t capacity,
+    const std::vector<uint8_t> &bytes, uint32_t alignment)
+{
+    stage("upload ring");
+    const uint32_t size = static_cast<uint32_t>(bytes.size());
+    uint64_t &written = presenter->ring_written[ring];
+    uint32_t head = static_cast<uint32_t>(written % capacity);
+    uint32_t base = (head + alignment - 1u) / alignment * alignment;
+    if (base + size > capacity) base = 0u;  // wrap: the tail stays unused
+    written += (base >= head ? base - head : capacity - head + base);
+    // Bytes up to here held data from one lap ago; the GPU must be past it.
+    const uint64_t needed = written + size > capacity ? written + size - capacity : 0u;
+    while (needed > presenter->ring_safe[ring]) {
+        if (presenter->ring_fences.empty()) {
+            // Everything written so far is drawn from already: fence it now.
+            glFinish();
+            break;
+        }
+        RecompD3dPresenter::RingFence &oldest = presenter->ring_fences.front();
+        if (oldest.written[ring] >= needed) {
+            // The first fence that covers the bytes: wait for it (often signaled).
+            if (glClientWaitSync(oldest.sync, 0, 0) == GL_TIMEOUT_EXPIRED) {
+                ++render_report.ring_waits;
+                glClientWaitSync(oldest.sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            }
+            break;
+        }
+        // Older than needed: done with by the time a later fence is.
+        glDeleteSync(oldest.sync);
+        presenter->ring_fences.pop_front();
+    }
+    if (needed > presenter->ring_safe[ring]) presenter->ring_safe[ring] = needed;
+    if (size != 0u) std::memcpy(presenter->ring_memory[ring] + base, bytes.data(), size);
+    written += size;
+    render_report.upload_bytes += size;
+    return base;
+}
+
+void fenceRings(RecompD3dPresenter *presenter)
+{
+    if (presenter->ring_memory[0] == nullptr) return;
+    // Retire signaled fences so the queue stays short.
+    while (!presenter->ring_fences.empty() &&
+        glClientWaitSync(presenter->ring_fences.front().sync, 0, 0) != GL_TIMEOUT_EXPIRED) {
+        for (int i = 0; i < 3; ++i)
+            presenter->ring_safe[i] = std::max(presenter->ring_safe[i], presenter->ring_fences.front().written[i]);
+        glDeleteSync(presenter->ring_fences.front().sync);
+        presenter->ring_fences.pop_front();
+    }
+    RecompD3dPresenter::RingFence fence;
+    fence.sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    std::copy(presenter->ring_written, presenter->ring_written + 3, fence.written);
+    presenter->ring_fences.push_back(fence);
+}
+
 void flushSegment(RecompD3dPresenter *presenter)
 {
     Segment &segment = presenter->segment;
@@ -1773,12 +1847,18 @@ void flushSegment(RecompD3dPresenter *presenter)
         std::fprintf(stderr, "recomp d3d presenter: dropped %zu draws: segment exceeds the upload rings\n",
             segment.draws.size());
     } else {
-        const uint32_t vertex_base = uploadRing(presenter->vertex_buffer, presenter->vertex_used, kVertexRingBytes,
-            segment.vertex_data, 256u);
-        const uint32_t index_base = uploadRing(presenter->index_buffer, presenter->index_used, kIndexRingBytes,
-            segment.index_data, 256u);
-        const uint32_t uniform_base = uploadRing(presenter->uniform_buffer, presenter->uniform_used,
-            kUniformRingBytes, segment.uniform_data, static_cast<uint32_t>(presenter->uniform_align));
+        const bool persistent = presenter->ring_memory[0] != nullptr;
+        const uint32_t vertex_base = persistent
+            ? uploadPersistent(presenter, 0, kVertexRingBytes, segment.vertex_data, 256u)
+            : uploadRing(presenter->vertex_buffer, presenter->vertex_used, kVertexRingBytes, segment.vertex_data, 256u);
+        const uint32_t index_base = persistent
+            ? uploadPersistent(presenter, 1, kIndexRingBytes, segment.index_data, 256u)
+            : uploadRing(presenter->index_buffer, presenter->index_used, kIndexRingBytes, segment.index_data, 256u);
+        const uint32_t uniform_alignment = static_cast<uint32_t>(presenter->uniform_align);
+        const uint32_t uniform_base = persistent
+            ? uploadPersistent(presenter, 2, kUniformRingBytes, segment.uniform_data, uniform_alignment)
+            : uploadRing(presenter->uniform_buffer, presenter->uniform_used, kUniformRingBytes, segment.uniform_data,
+                uniform_alignment);
         stage("draw loop");
         GLuint timestamps[2] = {0u, 0u};
         if (presenter->segment_timings.size() < 64u) {
@@ -1903,6 +1983,7 @@ void flushSegment(RecompD3dPresenter *presenter)
     }
     segment.draws.clear();
     std::fill(segment.kinds, segment.kinds + kKindCount, 0u);
+    fenceRings(presenter);
     segment.vertex_data.clear();
     segment.index_data.clear();
     segment.uniform_data.clear();
@@ -3029,6 +3110,7 @@ bool initEgl(RecompD3dPresenter *presenter)
         std::fprintf(stderr, "recomp d3d presenter: swap interval %d\n", swap_interval);
     }
     clipControl = reinterpret_cast<ClipControlFn>(eglGetProcAddress("glClipControl"));
+    bufferStorage = reinterpret_cast<BufferStorageFn>(eglGetProcAddress("glBufferStorage"));
     if (clipControl == nullptr) {
         std::fprintf(stderr, "recomp d3d presenter: glClipControl unavailable\n");
         return false;
@@ -3075,6 +3157,8 @@ void releasePresenter(RecompD3dPresenter *presenter)
             if (texture != 0u) glDeleteTextures(1, &texture);
         }
         if (presenter->main_depth != 0u) glDeleteRenderbuffers(1, &presenter->main_depth);
+        for (const auto &fence : presenter->ring_fences) glDeleteSync(fence.sync);
+        presenter->ring_fences.clear();
         for (GLuint buffer : {presenter->vertex_buffer, presenter->index_buffer, presenter->uniform_buffer,
                  presenter->gamma_buffer}) {
             if (buffer != 0u) glDeleteBuffers(1, &buffer);
@@ -3135,9 +3219,39 @@ bool createResources(RecompD3dPresenter *presenter)
         glBindBuffer(GL_COPY_WRITE_BUFFER, buffer);
         glBufferData(GL_COPY_WRITE_BUFFER, bytes, nullptr, usage);
     };
-    allocate(presenter->vertex_buffer, kVertexRingBytes, GL_STREAM_DRAW);
-    allocate(presenter->index_buffer, kIndexRingBytes, GL_STREAM_DRAW);
-    allocate(presenter->uniform_buffer, kUniformRingBytes, GL_STREAM_DRAW);
+    // Persistent, coherent rings where the driver has ARB_buffer_storage
+    // (RECOMP_GL_PERSISTENT=0 keeps the mapped-per-upload rings).
+    const char *persistent_env = std::getenv("RECOMP_GL_PERSISTENT");
+    const bool want_persistent = bufferStorage != nullptr && !(persistent_env && std::strcmp(persistent_env, "0") == 0);
+    bool persistent = want_persistent;
+    if (persistent) {
+        GLuint *const buffers[3] = {&presenter->vertex_buffer, &presenter->index_buffer, &presenter->uniform_buffer};
+        const uint32_t sizes[3] = {kVertexRingBytes, kIndexRingBytes, kUniformRingBytes};
+        const GLbitfield flags = GL_MAP_WRITE_BIT | kMapPersistent | kMapCoherent;
+        for (int i = 0; i < 3 && persistent; ++i) {
+            glGenBuffers(1, buffers[i]);
+            glBindBuffer(GL_COPY_WRITE_BUFFER, *buffers[i]);
+            bufferStorage(GL_COPY_WRITE_BUFFER, sizes[i], nullptr, flags);
+            presenter->ring_memory[i] =
+                static_cast<uint8_t *>(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, sizes[i], flags));
+            persistent = glGetError() == GL_NO_ERROR && presenter->ring_memory[i] != nullptr;
+        }
+        if (!persistent) {
+            for (int i = 0; i < 3; ++i) {
+                if (*buffers[i] != 0u) glDeleteBuffers(1, buffers[i]);
+                *buffers[i] = 0u;
+                presenter->ring_memory[i] = nullptr;
+            }
+        }
+    }
+    std::fprintf(stderr, "recomp d3d presenter: upload rings %s\n",
+        persistent ? "persistently mapped" : want_persistent ? "mapped per upload (persistent mapping failed)"
+                                                             : "mapped per upload");
+    if (!persistent) {
+        allocate(presenter->vertex_buffer, kVertexRingBytes, GL_STREAM_DRAW);
+        allocate(presenter->index_buffer, kIndexRingBytes, GL_STREAM_DRAW);
+        allocate(presenter->uniform_buffer, kUniformRingBytes, GL_STREAM_DRAW);
+    }
     allocate(presenter->gamma_buffer, sizeof presenter->gamma_ramp, GL_DYNAMIC_DRAW);
 
     const GLuint vs = compileStage(GL_VERTEX_SHADER, kPresentVertex, sizeof kPresentVertex - 1u, "present");
