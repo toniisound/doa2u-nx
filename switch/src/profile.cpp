@@ -56,6 +56,9 @@ struct FiberStack {
     void *fiber = nullptr;
     int depth = 0;
     Scope scopes[kDepth];
+    uint64_t resumed = 0;   // when this fiber last got the guest thread
+    uint64_t run_ticks = 0; // wall time on the guest thread this second
+    uint64_t switches = 0;  // times switched away from this second
 };
 
 Slot slots[kSlots];
@@ -200,6 +203,10 @@ RecompFunction instrument(uint32_t address, RecompFunction target, Kind kind)
 
 extern "C" {
 
+// dsound_buffer_adapter.c under RECOMP_DSOUND_LOCK_STATS.
+__attribute__((weak)) void recomp_dsound_lock_stats_take(uint64_t *wait_ns, uint64_t *waits, uint64_t *pump_ns,
+    uint64_t *pump_max_ns, uint64_t *passes);
+
 RecompFunction __real_recomp_lookup_manual(uint32_t guest_address);
 RecompFunction __wrap_recomp_lookup_manual(uint32_t guest_address)
 {
@@ -231,12 +238,36 @@ void __wrap_recomp_native_fiber_switch(void *target)
     FiberStack *own = current_stack;
     if (own->fiber == nullptr) own->fiber = recomp_native_fiber_current();
     const uint64_t out = now();
+    if (own->resumed != 0) own->run_ticks += out - own->resumed;
+    ++own->switches;
     current_stack = stackFor(target);
+    current_stack->resumed = out;
     __real_recomp_native_fiber_switch(target);
     current_stack = own;
-    const uint64_t away = now() - out;
+    const uint64_t back = now();
+    own->resumed = back;
+    const uint64_t away = back - out;
     if (own->depth != 0) own->scopes[own->depth - 1].child += away;
 }
+
+/* The x87 transcendentals the lifted code calls (musl_math under
+   RECOMP_PORTABLE_MATH): calls and time per frame. */
+uint64_t math_calls = 0, math_ticks = 0;
+#define DOA2U_NX_TIMED_MATH1(name) \
+    double __real_##name(double); \
+    double __wrap_##name(double x) { const uint64_t t = now(); const double r = __real_##name(x); \
+        math_ticks += now() - t; ++math_calls; return r; }
+#define DOA2U_NX_TIMED_MATH2(name) \
+    double __real_##name(double, double); \
+    double __wrap_##name(double y, double x) { const uint64_t t = now(); const double r = __real_##name(y, x); \
+        math_ticks += now() - t; ++math_calls; return r; }
+DOA2U_NX_TIMED_MATH1(recomp_sin)
+DOA2U_NX_TIMED_MATH1(recomp_cos)
+DOA2U_NX_TIMED_MATH1(recomp_tan)
+DOA2U_NX_TIMED_MATH2(recomp_atan2)
+DOA2U_NX_TIMED_MATH1(recomp_log2)
+DOA2U_NX_TIMED_MATH1(recomp_log1p)
+DOA2U_NX_TIMED_MATH1(recomp_expm1)
 
 int __real_nanosleep(const struct timespec *request, struct timespec *remaining);
 int __wrap_nanosleep(const struct timespec *request, struct timespec *remaining)
@@ -407,6 +438,34 @@ void doa2u_nx_profile_report(uint32_t frames, double wall_ms, int console_row)
             s.ticks * tick_ms * per_frame, (unsigned long long)(s.calls / frames));
         if (used >= (int)sizeof top) break;
         ++shown;
+    }
+
+    // Guest threads: the guest thread's wall time by fiber, busiest first.
+    {
+        FiberStack *current = current_stack;
+        const uint64_t t = now();
+        if (current->resumed != 0) { current->run_ticks += t - current->resumed; current->resumed = t; }
+        int fiber_order[kFibers];
+        for (int i = 0; i < kFibers; ++i) fiber_order[i] = i;
+        std::sort(fiber_order, fiber_order + kFibers,
+            [](int a, int b) { return fiber_stacks[a].run_ticks > fiber_stacks[b].run_ticks; });
+        char fibers[256];
+        int fused = 0;
+        for (int i = 0; i < 5 && fused < (int)sizeof fibers; ++i) {
+            FiberStack &f = fiber_stacks[fiber_order[i]];
+            if (f.run_ticks == 0) break;
+            fused += std::snprintf(fibers + fused, sizeof fibers - fused, " #%d=%.2fms/%llu", fiber_order[i],
+                f.run_ticks * tick_ms * per_frame, (unsigned long long)(f.switches / frames));
+        }
+        for (FiberStack &f : fiber_stacks) f.run_ticks = f.switches = 0;
+        uint64_t wait_ns = 0, waits = 0, pump_ns = 0, pump_max_ns = 0, passes = 0;
+        if (recomp_dsound_lock_stats_take) recomp_dsound_lock_stats_take(&wait_ns, &waits, &pump_ns, &pump_max_ns, &passes);
+        std::fprintf(stderr,
+            "recomp profile: fibers:%s | math=%.2fms(%llu) | dsound lock wait=%.2fms(%llu) pump=%.2fms/s max=%.2fms passes=%llu\n",
+            fused ? fibers : " -", math_ticks * tick_ms * per_frame, (unsigned long long)(math_calls / frames),
+            wait_ns / 1e6 * per_frame, (unsigned long long)(waits / frames), pump_ns / 1e6 * (1000.0 / wall_ms),
+            pump_max_ns / 1e6, (unsigned long long)passes);
+        math_calls = math_ticks = 0;
     }
 
     std::fprintf(stderr,

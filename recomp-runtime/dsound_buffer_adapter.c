@@ -60,6 +60,39 @@ static _Thread_local bool output_held;
 static bool output_lock_held(void) { return output_held; }
 void recomp_dsound_output_lock(void) { AcquireSRWLockExclusive(&output_lock); output_held = true; }
 void recomp_dsound_output_unlock(void) { output_held = false; ReleaseSRWLockExclusive(&output_lock); }
+#elif defined(RECOMP_DSOUND_LOCK_STATS)
+/* The Switch port's measurement: how long other threads wait on the pump
+   and how long each pump pass holds the lock. */
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local bool output_held;
+static _Thread_local bool is_pump_thread;
+static uint64_t stats_wait_ns, stats_waits, stats_pump_ns, stats_pump_max_ns, stats_passes;
+static uint64_t stats_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static bool output_lock_held(void) { return output_held; }
+void recomp_dsound_output_lock(void)
+{
+    if (pthread_mutex_trylock(&output_lock) != 0) {
+        const uint64_t start = stats_now_ns();
+        pthread_mutex_lock(&output_lock);
+        if (!is_pump_thread) { stats_wait_ns += stats_now_ns() - start; ++stats_waits; }
+    }
+    output_held = true;
+}
+void recomp_dsound_output_unlock(void) { output_held = false; pthread_mutex_unlock(&output_lock); }
+void recomp_dsound_lock_stats_take(uint64_t *wait_ns, uint64_t *waits, uint64_t *pump_ns, uint64_t *pump_max_ns,
+    uint64_t *passes)
+{
+    pthread_mutex_lock(&output_lock);
+    *wait_ns = stats_wait_ns; *waits = stats_waits; *pump_ns = stats_pump_ns;
+    *pump_max_ns = stats_pump_max_ns; *passes = stats_passes;
+    stats_wait_ns = stats_waits = stats_pump_ns = stats_pump_max_ns = stats_passes = 0u;
+    pthread_mutex_unlock(&output_lock);
+}
 #else
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local bool output_held;
@@ -452,12 +485,24 @@ static bool pump_started; /* under the output lock; a failed start retries at th
 /* Returns false once reset has stopped the pump. */
 static bool pump_pass(void)
 {
+#ifdef RECOMP_DSOUND_LOCK_STATS
+    is_pump_thread = true;
+#endif
     recomp_dsound_output_lock();
+#ifdef RECOMP_DSOUND_LOCK_STATS
+    const uint64_t pass_start = stats_now_ns();
+#endif
     const bool running = !pump_stopping;
     if (running && !game_thread_pump) {
         const uint64_t now = now_ms();
         for (uint32_t i = 0; i < BUFFER_COUNT; ++i) if (buffers[i].root) pump(&buffers[i], now, true);
     }
+#ifdef RECOMP_DSOUND_LOCK_STATS
+    const uint64_t pass_ns = stats_now_ns() - pass_start;
+    stats_pump_ns += pass_ns;
+    ++stats_passes;
+    if (pass_ns > stats_pump_max_ns) stats_pump_max_ns = pass_ns;
+#endif
     if (!running) pump_started = false; /* the next buffer after a reboot starts another */
     recomp_dsound_output_unlock();
     return running;
@@ -495,6 +540,12 @@ static void start_pump(void)
     if (thread) { SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL); CloseHandle(thread); }
 #else
     pthread_t thread;
+#ifdef __SWITCH__
+    /* Core 1: the renderer there mostly waits for the game, while core 2
+       already runs the audio mixer. */
+    extern void doa2u_nx_set_next_thread_core(int core);
+    doa2u_nx_set_next_thread_core(1);
+#endif
     pump_started = pthread_create(&thread, NULL, pump_thread, NULL) == 0;
     if (pump_started) pthread_detach(thread);
 #endif

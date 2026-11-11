@@ -340,6 +340,9 @@ target_compile_definitions(doa2u-nx PRIVATE
 # never recompiles the generated program.
 set_source_files_properties("${RUNTIME}/dsound_buffer_model.c" PROPERTIES
     COMPILE_DEFINITIONS "RECOMP_DSOUND_STALL_MS=250u")
+# The profile line reports how long the game waits on the output pump.
+set_source_files_properties("${RUNTIME}/dsound_buffer_adapter.c" PROPERTIES
+    COMPILE_DEFINITIONS "RECOMP_DSOUND_LOCK_STATS")
 # switch/include comes first: it supplies the POSIX headers newlib lacks.
 target_include_directories(doa2u-nx BEFORE PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -360,7 +363,8 @@ target_link_options(doa2u-nx PRIVATE "-Wl,--wrap=exit" "-Wl,--wrap=abort" "-Wl,-
     "-Wl,--wrap=recomp_dispatch"
     "-Wl,--wrap=recomp_lookup_manual" "-Wl,--wrap=recomp_lookup_kernel"
     "-Wl,--wrap=recomp_program_lookup" "-Wl,--wrap=recomp_native_fiber_switch"
-    "-Wl,--wrap=nanosleep" "-Wl,--wrap=recomp_stop_note_kernel_call" "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/doa2u-nx.map")
+    "-Wl,--wrap=nanosleep" "-Wl,--wrap=recomp_sin" "-Wl,--wrap=recomp_cos" "-Wl,--wrap=recomp_tan"
+    "-Wl,--wrap=recomp_atan2" "-Wl,--wrap=recomp_log2" "-Wl,--wrap=recomp_log1p" "-Wl,--wrap=recomp_expm1" "-Wl,--wrap=recomp_stop_note_kernel_call" "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/doa2u-nx.map")
 target_include_directories(doa2u-nx SYSTEM PRIVATE "${DEVKITPRO}/portlibs/switch/include")
 target_link_libraries(doa2u-nx PRIVATE ${DOA2U_NX_PRESENTER_LIBS} nx m)
 
