@@ -413,6 +413,7 @@ Thread sampler_thread;
 
 void samplerLoop(void *)
 {
+    std::fprintf(stderr, "recomp sampler: indexing the lifted functions\n");
     // Entry points: every lifted function the dispatch table knows.
     for (uint32_t va = 0x00010000u; va < 0x00400000u; ++va) {
         if (RecompFunction f = recomp_lookup(va)) entries.push_back({reinterpret_cast<uintptr_t>(f), va});
@@ -441,11 +442,24 @@ void samplerLoop(void *)
         svcSleepThread(1'000'000);
         const Handle target = guest_thread;
         if (target == INVALID_HANDLE) continue;
-        if (R_FAILED(svcSetThreadActivity(target, ThreadActivity_Paused))) { ++missed; continue; }
+        static Result first_error = 0;
+        const Result paused = svcSetThreadActivity(target, ThreadActivity_Paused);
         ThreadContext context;
-        const Result got = svcGetThreadContext3(&context, target);
-        svcSetThreadActivity(target, ThreadActivity_Runnable);
-        if (R_FAILED(got)) { ++missed; continue; }
+        const Result got = R_SUCCEEDED(paused) ? svcGetThreadContext3(&context, target) : paused;
+        if (R_SUCCEEDED(paused)) svcSetThreadActivity(target, ThreadActivity_Runnable);
+        if (R_FAILED(got)) {
+            if (first_error == 0) {
+                first_error = got;
+                std::fprintf(stderr, "recomp sampler: cannot read the guest thread (0x%x)\n", (unsigned)got);
+            }
+            ++missed;
+            if (now() - window_start >= window) {
+                window_start = now();
+                std::fprintf(stderr, "recomp sampler: 0 samples (%u missed)\n", missed);
+                missed = 0;
+            }
+            continue;
+        }
         const uintptr_t pc = context.pc.x;
         ++total;
         if (pc >= lifted_low && pc < lifted_high) {
@@ -507,9 +521,12 @@ void doa2u_nx_profile_start(void)
     if (R_SUCCEEDED(threadCreate(&stall_thread, stallWatcher, nullptr, nullptr, 0x8000, 0x2E, 2))) {
         threadStart(&stall_thread);
     }
-    if (R_SUCCEEDED(threadCreate(&sampler_thread, samplerLoop, nullptr, nullptr, 0x10000, 0x2D, 2))) {
-        threadStart(&sampler_thread);
-    }
+    // Core 1 at a high priority: the renderer there waits for the game half
+    // of each frame, and nothing on core 2 can starve the samples.
+    Result sampler = threadCreate(&sampler_thread, samplerLoop, nullptr, nullptr, 0x10000, 0x28, 1);
+    if (R_SUCCEEDED(sampler)) sampler = threadStart(&sampler_thread);
+    std::fprintf(stderr, "recomp sampler: thread %s (0x%x)\n", R_SUCCEEDED(sampler) ? "started" : "failed",
+        (unsigned)sampler);
 }
 
 // Called once a second by the presenter with the frames and wall time of
