@@ -577,28 +577,28 @@ static BootChoice chooseBootOptions()
             fillRect(pixels, stride, 0, 0, 1280, 720, kBackground);
             char title[48];
             std::snprintf(title, sizeof title, "DOA2U NX %s", DOA2U_NX_VERSION);
-            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 36, 3, title, kText);
+            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 50, 3, title, kText);
             const ResolutionChoice &resolution = kResolutions[choice.resolution];
             const char *const names[3] = {"Resolution", "Aspect ratio", "Show FPS"};
             const char *const values[3] = {resolution.label, choice.widescreen ? "16:9" : "4:3",
-                choice.show_fps ? "On" : "Off"};
-            const char *const notes[3] = {resolution.note, choice.widescreen ? "Widescreen" : "Original",
-                choice.show_fps ? "Top left corner" : "Hidden"};
+                choice.show_fps ? "Yes" : "No"};
+            const char *const notes[3] = {resolution.note, choice.widescreen ? "Widescreen" : "Original", ""};
             for (int i = 0; i < 3; ++i) {
-                const int top = 120 + i * 135;
-                if (i == row) fillRect(pixels, stride, 100, top, 1080, 120, kSelected);
-                drawText(pixels, stride, 130, top + 12, 3, names[i], i == row ? kText : kDim);
+                // Everything stays inside the TV's safe area (about 90% of the screen).
+                const int top = 125 + i * 120;
+                if (i == row) fillRect(pixels, stride, 100, top, 1080, 105, kSelected);
+                drawText(pixels, stride, 130, top + (notes[i][0] ? 10 : 28), 3, names[i], i == row ? kText : kDim);
                 char value[32];
                 std::snprintf(value, sizeof value, "< %s >", values[i]);
-                drawText(pixels, stride, 1150 - textWidth(value, 3), top + 12, 3, value, kText);
-                drawText(pixels, stride, 1150 - textWidth(notes[i], 2), top + 76, 2, notes[i],
+                drawText(pixels, stride, 1150 - textWidth(value, 3), top + (notes[i][0] ? 10 : 28), 3, value, kText);
+                drawText(pixels, stride, 1150 - textWidth(notes[i], 2), top + 64, 2, notes[i],
                     i == row ? kText : kDim);
             }
-            const int start_top = 540;
-            if (row == 3) fillRect(pixels, stride, 440, start_top, 400, 90, kSelected);
-            drawText(pixels, stride, (1280 - textWidth("Start", 4)) / 2, start_top + 13, 4, "Start", kText);
+            const int start_top = 495;
+            if (row == 3) fillRect(pixels, stride, 440, start_top, 400, 80, kSelected);
+            drawText(pixels, stride, (1280 - textWidth("Start", 4)) / 2, start_top + 8, 4, "Start", kText);
             const char *const help = "Up/Down: option   Left/Right: change   A/+: start";
-            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 665, 2, help, kDim);
+            drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 605, 2, help, kDim);
             framebufferEnd(&framebuffer);
         }
         svcSleepThread(16'000'000);
@@ -665,7 +665,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "[nx] boot options: widescreen=%d scale=%s (%s) fps=%d\n", choice.widescreen ? 1 : 0, scale,
         resolution, choice.show_fps ? 1 : 0);
     std::printf("DOA2U NX %s\n\nResolution: %s  Aspect: %s  FPS: %s\n", DOA2U_NX_VERSION, resolution,
-        choice.widescreen ? "16:9" : "4:3", choice.show_fps ? "on" : "off");
+        choice.widescreen ? "16:9" : "4:3", choice.show_fps ? "yes" : "no");
     std::printf("Starting...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);

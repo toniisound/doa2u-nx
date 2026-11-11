@@ -157,7 +157,7 @@ At launch a large-print boot menu waits for the player, with three options:
 - **Resolution**: **720p** (1.5x, sharpest), **600p** (1.25x, recommended) or
   **480p** (smoothest).
 - **Aspect ratio**: the game's own **16:9** mode or the original **4:3**.
-- **Show FPS**: a frame counter in the top left corner.
+- **Show FPS**: **Yes** or **No**, a frame counter in the top left corner.
 
 Up/down picks an option, left/right changes it, and A on Start (or +) starts.
 
