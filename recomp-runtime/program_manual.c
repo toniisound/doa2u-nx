@@ -155,9 +155,12 @@ static void floor_mirror_camera_at(void) { with_mirror_shape(sub_0027A070); }
 static void floor_mirror_render(void) { with_mirror_shape(sub_0027A430); }
 static void plane_mirror_camera(void) { with_mirror_shape(sub_00280460); }
 
+static void manual_cache_clear(void);
+
 void recomp_program_manual_reset(void)
 {
     boot_opening_pending = true;
+    manual_cache_clear();
 }
 
 static void movie_scene_tick(void)
@@ -208,7 +211,7 @@ static void launch_new_image(void)
     recomp_stop(2, "xapi:launch-new-image:%s", name);
 }
 
-RecompFunction recomp_lookup_manual(uint32_t guest_address)
+static RecompFunction manual_chain(uint32_t guest_address)
 {
     RecompFunction stage = recomp_stage_select_lookup_manual(guest_address);
     if (stage != NULL) return stage;
@@ -251,5 +254,45 @@ RecompFunction recomp_lookup_manual(uint32_t guest_address)
     if (function == NULL) function = recomp_menu_quit_lookup_manual(guest_address);
     /* The runner's own sprites (PC Settings' label, Quit Game's). */
     if (function == NULL) function = recomp_runner_assets_lookup_manual(guest_address);
+    return function;
+}
+
+/* RECOMP_ABI_CALL asks this for every direct call the lifted code makes, so
+   the whole chain above ran millions of times a second; on the Switch it was
+   a tenth of a fight frame. Answers are fixed for an address, except for the
+   few routes that follow boot settings or session state, which always ask the
+   chain. A reboot clears the cache with the rest of the program state. */
+enum { MANUAL_CACHE_SIZE = 16384u };
+static struct { uint32_t address; uint32_t valid; RecompFunction function; } manual_cache[MANUAL_CACHE_SIZE];
+
+static void manual_cache_clear(void)
+{
+    memset(manual_cache, 0, sizeof manual_cache);
+}
+
+static bool manual_route_varies(uint32_t guest_address)
+{
+    switch (guest_address) {
+    case 0x000d9300u: /* skip_startup_logo, with the intro skip */
+    case 0x00069180u: /* movie_scene_tick, with the intro skip */
+    case 0x0012b460u: /* netplay fight names */
+    case 0x000244f0u: /* netplay side profiles */
+    case 0x000399d0u: /* free camera build, while installed and offline */
+    case 0x000c6b00u: /* CPU costume, offline */
+        return true;
+    default:
+        return false;
+    }
+}
+
+RecompFunction recomp_lookup_manual(uint32_t guest_address)
+{
+    if (manual_route_varies(guest_address)) return manual_chain(guest_address);
+    const uint32_t slot = (guest_address ^ (guest_address >> 14)) & (MANUAL_CACHE_SIZE - 1u);
+    if (manual_cache[slot].valid && manual_cache[slot].address == guest_address) return manual_cache[slot].function;
+    RecompFunction function = manual_chain(guest_address);
+    manual_cache[slot].address = guest_address;
+    manual_cache[slot].function = function;
+    manual_cache[slot].valid = 1u;
     return function;
 }
