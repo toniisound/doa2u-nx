@@ -186,6 +186,22 @@ constexpr uint32_t kMaxVolumeSize = 2048u;
 constexpr float kMipLodBiasMin = -16.0f, kMipLodBiasMax = 15.99f;
 constexpr uint32_t kProgramFloats = 192u * 4u;
 constexpr uint32_t kTransformFloats = kRecompD3dDrawConstantFloats - kProgramFloats;
+/* Segment bytes are always written right after they are sized, so growing
+   them need not zero them first (std::vector's resize would). */
+template <typename T>
+struct UninitializedAllocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = UninitializedAllocator<U>; };
+    UninitializedAllocator() = default;
+    template <typename U> UninitializedAllocator(const UninitializedAllocator<U> &) {}
+    template <typename U> void construct(U *p) noexcept { ::new (static_cast<void *>(p)) U; }
+    template <typename U, typename... Args> void construct(U *p, Args &&...args)
+    {
+        ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+    }
+};
+using SegmentBytes = std::vector<uint8_t, UninitializedAllocator<uint8_t>>;
+
+constexpr uint32_t kTextureMemoSize = 1024u;
 constexpr uint32_t kVertexRingBytes = 32u * 1024u * 1024u;
 constexpr uint32_t kIndexRingBytes = 8u * 1024u * 1024u;
 constexpr uint32_t kUniformRingBytes = 16u * 1024u * 1024u;
@@ -375,9 +391,9 @@ struct Segment {
     GLuint depth = 0u;
     uint32_t width = 0u, height = 0u;
     uint32_t kinds[kKindCount]{};
-    std::vector<uint8_t> vertex_data;
-    std::vector<uint8_t> index_data;
-    std::vector<uint8_t> uniform_data;
+    SegmentBytes vertex_data;
+    SegmentBytes index_data;
+    SegmentBytes uniform_data;
     std::vector<QueuedDraw> draws;
 };
 
@@ -500,6 +516,15 @@ struct RecompD3dPresenter {
     std::vector<GLuint> retired_textures;
 
     std::vector<RenderTargetEntry> render_targets;
+    struct TextureMemo {
+        uint64_t key = 0u;
+        uint32_t data = 0u;
+        const void *texture_bytes = nullptr, *palette_bytes = nullptr;
+        uint32_t frame = 0u, generation = 0u;
+        GLuint texture = 0u;
+    };
+    TextureMemo texture_memo[1024];
+    uint32_t texture_generation = 1u;  // bumped by any change to the texture cache
     std::vector<DepthTargetEntry> depth_targets;
     uint64_t target_bytes = 0u;
 
@@ -664,6 +689,7 @@ void releaseRetiredTextures(RecompD3dPresenter *presenter)
 
 void unindexTexture(RecompD3dPresenter *presenter, uint32_t slot)
 {
+    ++presenter->texture_generation;
     const auto range = presenter->texture_index.equal_range(presenter->textures[slot].data);
     for (auto it = range.first; it != range.second; ++it) {
         if (it->second == slot) {
@@ -1136,6 +1162,21 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
         static_cast<uint64_t>(desc.height - 1u) * desc.pitch + desc.width * 4u > draw.texture_byte_count)) {
         return 0u;
     }
+    /* Draws in a frame sample the same few textures over and over: a small
+       memo answers a repeat of this frame's lookups without the index walk,
+       the palette compare and the field checks. Any change to the texture
+       cache invalidates it; render targets and dynamic (linear) textures are
+       answered before it or never memoized. */
+    const uint32_t memo_frame = presenter->present_count + 1u;
+    const uint64_t memo_key = (static_cast<uint64_t>(desc.data) << 32 ^ static_cast<uint64_t>(desc.format_byte) << 24 ^
+        static_cast<uint64_t>(desc.width) << 12 ^ desc.height ^ static_cast<uint64_t>(desc.volume_depth) << 40 ^
+        static_cast<uint64_t>(desc.mip_levels) << 52 ^ (draw.bump_env ? 1ull << 63 : 0ull)) * 0x9e3779b97f4a7c15ull;
+    RecompD3dPresenter::TextureMemo &memo = presenter->texture_memo[(memo_key >> 54) & (kTextureMemoSize - 1u)];
+    if (!linear_bgra && memo.frame == memo_frame && memo.generation == presenter->texture_generation &&
+        memo.key == memo_key && memo.data == desc.data && memo.texture_bytes == draw.texture_bytes &&
+        memo.palette_bytes == draw.palette_bytes) {
+        return memo.texture;
+    }
     const auto cached = presenter->texture_index.equal_range(desc.data);
     const bool fingerprinted = !linear_bgra && draw.texture_bytes != nullptr;
     /* The fingerprint reads 128 words spread over the texture in guest memory,
@@ -1181,6 +1222,9 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(desc.width),
                     static_cast<GLsizei>(desc.height), GL_BGRA, GL_UNSIGNED_BYTE, draw.texture_bytes);
                 glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            } else if (!every_draw) {
+                memo = {memo_key, desc.data, draw.texture_bytes, draw.palette_bytes, memo_frame,
+                    presenter->texture_generation, entry.texture};
             }
             return entry.texture;
         }
@@ -1223,6 +1267,7 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
     entry.checked_frame = frame;
     entry.texture = texture;
     presenter->texture_index.emplace(desc.data, slot);
+    ++presenter->texture_generation;
     return texture;
 }
 
@@ -1742,7 +1787,7 @@ void applyRaster(RecompD3dPresenter *presenter, const RasterState &s)
 
 /* ---- Recording ------------------------------------------------------------------ */
 
-uint32_t appendAligned(std::vector<uint8_t> &data, const void *bytes, size_t size, size_t alignment)
+uint32_t appendAligned(SegmentBytes &data, const void *bytes, size_t size, size_t alignment)
 {
     const size_t offset = (data.size() + alignment - 1u) / alignment * alignment;
     data.resize(offset + size);
@@ -1752,7 +1797,7 @@ uint32_t appendAligned(std::vector<uint8_t> &data, const void *bytes, size_t siz
 
 /* Uploads one segment's bytes into a ring buffer, wrapping (and orphaning,
    so the driver need not wait for draws still reading it) when full. */
-uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const std::vector<uint8_t> &bytes,
+uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const SegmentBytes &bytes,
     uint32_t alignment)
 {
     stage("upload ring");
@@ -1786,7 +1831,7 @@ uint32_t uploadRing(GLuint buffer, uint32_t &used, uint32_t capacity, const std:
    Overwriting a ring's bytes needs the GPU done with what they held, which a
    fence after the segment that last read them records. */
 uint32_t uploadPersistent(RecompD3dPresenter *presenter, int ring, uint32_t capacity,
-    const std::vector<uint8_t> &bytes, uint32_t alignment)
+    const SegmentBytes &bytes, uint32_t alignment)
 {
     stage("upload ring");
     const uint32_t size = static_cast<uint32_t>(bytes.size());
@@ -2099,7 +2144,7 @@ void queueDraw(RecompD3dPresenter *presenter, GLuint program, GLuint vao, const 
     /* As upstream: the Transform buffer is the draw constants without vc[]
        (buildTransform), which goes to its own buffer; draws often repeat both. */
     constexpr size_t transform_bytes = kTransformFloats * sizeof(float);
-    std::vector<uint8_t> &uniforms = segment.uniform_data;
+    SegmentBytes &uniforms = segment.uniform_data;
     const size_t alignment = static_cast<size_t>(presenter->uniform_align);
     /* Reuse any of the segment's last few distinct blocks: draws often
        alternate between a handful of objects with identical constants. */
