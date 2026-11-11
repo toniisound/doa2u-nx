@@ -46,6 +46,11 @@ typedef struct Buffer {
 } Buffer;
 static Buffer buffers[BUFFER_COUNT];
 static void update_3d(Buffer *buffer);
+#if defined(RECOMP_DSOUND_QUERY_PUMP_MS) && !defined(RECOMP_DSOUND_TEST_CLOCK)
+static void pump_query(Buffer *buffer, uint64_t now);
+#else
+#define pump_query(buffer, now) pump((buffer), (now), false)
+#endif
 
 /* Guards buffers[] and host output calls shared with the output pump thread.
    Never held across generated code. Synthetic tests are single-threaded and
@@ -425,7 +430,9 @@ static void update_3d(Buffer *buffer)
     static const float *front_table, *center_table;
     float listener[6], d[3], n[3] = {0.0f, 0.0f, 0.0f}, u = 0.0f, azimuth, elevation;
     if (!buffer->is3d) return;
-    pump(buffer, now_ms(), false);
+    /* Audio before the change keeps the old filters; up to the query limit
+       of it may take the new ones when the pump thread is keeping up. */
+    pump_query(buffer, now_ms());
     recomp_dsound_listener_vectors(listener);
     for (int i = 0; i < 3; ++i) d[i] = buffer->position[i] - listener[i];
     const float distance = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
@@ -741,8 +748,6 @@ static void pump_query(Buffer *buffer, uint64_t now)
     }
     pump(buffer, now, false);
 }
-#else
-#define pump_query(buffer, now) pump((buffer), (now), false)
 #endif
 
 static void buffer_call(enum Operation operation, uint32_t arguments)
