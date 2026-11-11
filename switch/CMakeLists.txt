@@ -342,7 +342,7 @@ set_source_files_properties("${RUNTIME}/dsound_buffer_model.c" PROPERTIES
     COMPILE_DEFINITIONS "RECOMP_DSOUND_STALL_MS=250u")
 # The profile line reports how long the game waits on the output pump.
 set_source_files_properties("${RUNTIME}/dsound_buffer_adapter.c" PROPERTIES
-    COMPILE_DEFINITIONS "RECOMP_DSOUND_LOCK_STATS;RECOMP_DSOUND_QUERY_PUMP_MS=8u")
+    COMPILE_DEFINITIONS "RECOMP_DSOUND_LOCK_STATS;RECOMP_DSOUND_QUERY_PUMP_MS=20u")
 # switch/include comes first: it supplies the POSIX headers newlib lacks.
 target_include_directories(doa2u-nx BEFORE PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

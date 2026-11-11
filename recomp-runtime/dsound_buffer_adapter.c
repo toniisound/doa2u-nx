@@ -728,7 +728,9 @@ enum Operation { RELEASE, DATA, LOCK, UNLOCK, PLAY, STOP, STOP_EX, STATUS, POSIT
    buffer (ADPCM decoding, the output submit, HRTF for 3D voices) on the game
    thread. While the background pump runs, a poll within this many ms of the
    buffer's last pump answers from that state and leaves the audio to the
-   pump thread; Play, Stop, Seek and the rest still pump at once. */
+   pump thread; Play, Stop, Seek and the rest still pump at once. The pump
+   thread runs every 5 ms and pumps a buffer once 10 ms have passed, so a
+   limit under 15 ms would still leave most polls pumping. */
 static void pump(Buffer *buffer, uint64_t now, bool background);
 static void pump_query(Buffer *buffer, uint64_t now)
 {
