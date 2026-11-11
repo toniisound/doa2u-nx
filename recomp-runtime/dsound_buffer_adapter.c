@@ -482,6 +482,7 @@ void recomp_dsound_buffers_pump(void)
 #ifndef RECOMP_DSOUND_TEST_CLOCK
 static bool pump_started; /* under the output lock; a failed start retries at the next buffer */
 
+
 /* Returns false once reset has stopped the pump. */
 static bool pump_pass(void)
 {
@@ -721,6 +722,27 @@ static uint32_t release_buffer(Buffer *buffer)
 
 enum Operation { RELEASE, DATA, LOCK, UNLOCK, PLAY, STOP, STOP_EX, STATUS, POSITION, SEEK, LOOP, FREQUENCY, VOLUME, HEADROOM, MIX_BINS, MIX_VOLUMES,
     POSITION_3D, VELOCITY_3D, MIN_DISTANCE, MAX_DISTANCE, DISTANCE_FACTOR, ROLLOFF };
+#if defined(RECOMP_DSOUND_QUERY_PUMP_MS) && !defined(RECOMP_DSOUND_TEST_CLOCK)
+/* The Switch port's game-thread saving: DOA2U polls GetStatus and
+   GetCurrentPosition hundreds of times a frame, and each poll pumped its
+   buffer (ADPCM decoding, the output submit, HRTF for 3D voices) on the game
+   thread. While the background pump runs, a poll within this many ms of the
+   buffer's last pump answers from that state and leaves the audio to the
+   pump thread; Play, Stop, Seek and the rest still pump at once. */
+static void pump(Buffer *buffer, uint64_t now, bool background);
+static void pump_query(Buffer *buffer, uint64_t now)
+{
+    if (pump_started && !game_thread_pump && recomp_audio_output_ready() &&
+        now < buffer->model.last_ms + RECOMP_DSOUND_QUERY_PUMP_MS) {
+        game_pump_ms = now;
+        return;
+    }
+    pump(buffer, now, false);
+}
+#else
+#define pump_query(buffer, now) pump((buffer), (now), false)
+#endif
+
 static void buffer_call(enum Operation operation, uint32_t arguments)
 {
     recomp_dsound_output_lock();
@@ -801,14 +823,14 @@ static void buffer_call(enum Operation operation, uint32_t arguments)
         reset_output(buffer); break;
     case STATUS:
         if (!span(value, 4u)) { result = RECOMP_DSOUND_POINTER_ERROR; break; }
-        pump(buffer, now, false);
+        pump_query(buffer, now);
         write32(value, buffer->model.playing ? 1u | ((buffer->model.play_flags & 1u) ? 4u : 0u) : 0u); break;
     case POSITION: {
         uint32_t write = kernel_arg(3u);
         if ((!value && !write) || (value && !span(value, 4u)) || (write && !span(write, 4u))) {
             result = RECOMP_DSOUND_POINTER_ERROR; break;
         }
-        pump(buffer, now, false);
+        pump_query(buffer, now);
         if (value) write32(value, source_cursor(buffer));
         if (write) write32(write, source_cursor(buffer));
         break;
