@@ -482,7 +482,9 @@ void recomp_dsound_buffers_pump(void)
     recomp_dsound_output_lock();
     if (pump_failure) recomp_stop(2, "%s", pump_failure);
     uint64_t now = now_ms();
-    for (uint32_t i = 0; i < BUFFER_COUNT; ++i) if (buffers[i].root) pump(&buffers[i], now, false);
+    /* DirectSoundDoWork, once a frame: with the pump thread keeping up, the
+       buffers it ran recently are left to it (pump_query). */
+    for (uint32_t i = 0; i < BUFFER_COUNT; ++i) if (buffers[i].root) pump_query(&buffers[i], now);
     recomp_dsound_output_unlock();
 }
 
