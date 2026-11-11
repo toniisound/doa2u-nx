@@ -4,6 +4,8 @@
 #include "overlay.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <SDL3/SDL.h>
 
 const char *recomp_perf_meter_frame(RecompPerfMeter *meter, double now_ms, bool f3_down)
@@ -29,6 +31,13 @@ const char *recomp_perf_meter_frame(RecompPerfMeter *meter, double now_ms, bool 
 void recomp_perf_overlay(const RecompD3dPresenterTarget *target)
 {
     static RecompPerfMeter meter;
+    static bool configured;
+    if (!configured) {
+        /* A launcher can show the counter from the start (the Switch boot menu). */
+        const char *shown = getenv("RECOMP_PERF_OVERLAY");
+        meter.shown = shown != NULL && strcmp(shown, "0") != 0;
+        configured = true;
+    }
     /* SDL's clock is monotonic, so clock changes cannot skew it. */
     const char *line = recomp_perf_meter_frame(&meter, (double)SDL_GetTicksNS() / 1e6,
         recomp_input_host_key(RECOMP_INPUT_HOST_KEY_F3));

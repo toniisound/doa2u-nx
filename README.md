@@ -152,9 +152,14 @@ Compiled shaders are kept in `sdmc:/switch/doa2u-nx/shader-cache`, so the
 first boot (and the first sight of each new effect) compiles a little; later
 boots only link.
 
-At launch a large-print screen asks for the render resolution and waits:
-**720p** (1.5x, sharpest), **600p** (1.25x, recommended) or **480p**
-(smoothest). Up/down picks, A starts. The game runs in its own 16:9 mode with its intro movies.
+At launch a large-print boot menu waits for the player, with three options:
+
+- **Resolution**: **720p** (1.5x, sharpest), **600p** (1.25x, recommended) or
+  **480p** (smoothest).
+- **Aspect ratio**: the game's own **16:9** mode or the original **4:3**.
+- **Show FPS**: a frame counter in the top left corner.
+
+Up/down picks an option, left/right changes it, and A on Start (or +) starts.
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.

@@ -88,7 +88,7 @@ std::string findGameXbe(std::vector<std::string> &rejected)
     std::sort(names.begin(), names.end());
     for (const std::string &name : names) {
         const std::string path = std::string(kDisc) + "/" + name;
-        std::printf("Comprobando %s...\n", name.c_str());
+        std::printf("Checking %s...\n", name.c_str());
         consoleUpdate(nullptr);
         const auto parsed = doaxbv::XbeParser().parse(std::filesystem::u8path(path));
         if (parsed.ok() && parsed.metadata.fileSha256 == RECOMP_XBE_SHA256) return name;
@@ -165,8 +165,8 @@ bool seedHddCache()
         const long long size = fileSize(source);
         if (size < 0 || fileSize(target) == size) continue;
         if (!announced) {
-            std::printf("\nPrimer arranque: copiando los archivos que el juego\n");
-            std::printf("instala en su disco duro (unos 700 MB). Solo esta vez.\n");
+            std::printf("\nFirst boot: copying the files the game installs\n");
+            std::printf("to its hard disk (about 700 MB). Only this once.\n");
             announced = true;
         }
         mkdir(storage.c_str(), 0777);
@@ -177,8 +177,8 @@ bool seedHddCache()
         int row = 1;
         if (console_state != nullptr) row = console_state->cursorY;
         if (!copyWithProgress(source, target, row)) {
-            std::printf("\n\x1b[31mNo se pudo copiar %s (errno %d).\x1b[0m\n", name, errno);
-            std::printf("Comprueba el espacio libre en la SD.\n");
+            std::printf("\n\x1b[31mCould not copy %s (errno %d).\x1b[0m\n", name, errno);
+            std::printf("Check the free space on the SD card.\n");
             std::fprintf(stderr, "[nx] hdd cache copy failed: %s errno=%d\n", name, errno);
             return false;
         }
@@ -191,7 +191,7 @@ void waitForPlus()
 {
     PadState pad;
     padInitializeDefault(&pad);
-    std::printf("\nPulsa (+) para salir.\n");
+    std::printf("\nPress (+) to exit.\n");
     consoleUpdate(nullptr);
     while (appletMainLoop()) {
         padUpdate(&pad);
@@ -222,7 +222,7 @@ void printLogTail(int lines)
         if (pos == std::string::npos) { pos = 0; break; }
         ++found;
     }
-    std::printf("\n--- final del log ---\n%s\n", text.c_str() + (pos ? pos + 1 : 0));
+    std::printf("\n--- end of the log ---\n%s\n", text.c_str() + (pos ? pos + 1 : 0));
 }
 
 } // namespace
@@ -444,7 +444,7 @@ static void heartbeat(void *arg)
         char line[sizeof last_line];
         std::memcpy(line, last_line, sizeof line);
         line[sizeof line - 1] = '\0';
-        std::printf("\x1b[6;1HArrancando... %5.1f s   llamadas al kernel: %llu\x1b[K\n\x1b[K%.78s\n",
+        std::printf("\x1b[6;1HStarting... %5.1f s   kernel calls: %llu\x1b[K\n\x1b[K%.78s\n",
             seconds, (unsigned long long)doa2u_nx_kernel_calls(), line);
         consoleUpdate(nullptr);
         mutexUnlock(&console_mutex);
@@ -456,8 +456,8 @@ static void heartbeat(void *arg)
 void __wrap_exit(int code)
 {
     if (code != 0 && console_ready) {
-        std::printf("\n\x1b[31mEl juego se ha detenido (codigo %d).\x1b[0m\n", code);
-        std::printf("Log completo: %s\n", kLog);
+        std::printf("\n\x1b[31mThe game has stopped (code %d).\x1b[0m\n", code);
+        std::printf("Full log: %s\n", kLog);
         printLogTail(12);
         waitForPlus();
     }
@@ -505,9 +505,11 @@ static int textWidth(const char *text, int scale)
     return static_cast<int>(std::strlen(text)) * 16 * scale;
 }
 
-/* The render scale the player picks: 720p (1.5x), 600p (1.25x, selected at
-   first) or 480p (1x). Up/down (or the stick) moves, A confirms; there is no
-   time limit. The text console is closed meanwhile and opened again. */
+/* The boot menu, on a large-print screen with no time limit: the render
+   resolution (720p 1.5x, 600p 1.25x, 480p 1x), the picture's shape (the
+   game's own 16:9 mode or 4:3) and the frame counter. Up/down picks a row,
+   left/right (or A) changes it, A on Start or + starts. The text console is
+   closed meanwhile and opened again. */
 struct ResolutionChoice {
     const char *label, *note, *scale;
 };
@@ -518,7 +520,13 @@ constexpr ResolutionChoice kResolutions[] = {
 };
 constexpr int kResolutionCount = sizeof kResolutions / sizeof kResolutions[0];
 
-static const ResolutionChoice &chooseResolution()
+struct BootChoice {
+    int resolution = 1;      // 600p
+    bool widescreen = true;  // 16:9
+    bool show_fps = false;
+};
+
+static BootChoice chooseBootOptions()
 {
     consoleExit(nullptr);
     console_ready = false;
@@ -531,7 +539,9 @@ static const ResolutionChoice &chooseResolution()
     padInitializeDefault(&pad);
     constexpr u32 kBackground = 0xff201410u, kText = 0xffffffffu, kDim = 0xffa0a0a0u;
     constexpr u32 kSelected = 0xff3060e0u;  // ABGR: orange box
-    int selected = 1;
+    constexpr int kRows = 4;                // resolution, aspect, fps, start
+    BootChoice choice;
+    int row = 0;
     bool redraw = true;
     // Ignore a press still held from the homebrew menu.
     padUpdate(&pad);
@@ -541,9 +551,24 @@ static const ResolutionChoice &chooseResolution()
         const u64 held = padGetButtons(&pad);
         const u64 down = padGetButtonsDown(&pad) & ~ignore;
         ignore &= held;
-        if ((down & HidNpadButton_AnyUp) && selected > 0) { --selected; redraw = true; }
-        if ((down & HidNpadButton_AnyDown) && selected < kResolutionCount - 1) { ++selected; redraw = true; }
-        if (down & HidNpadButton_A) break;
+        if ((down & HidNpadButton_AnyUp) && row > 0) { --row; redraw = true; }
+        if ((down & HidNpadButton_AnyDown) && row < kRows - 1) { ++row; redraw = true; }
+        if (down & HidNpadButton_Plus) break;
+        const bool left = down & HidNpadButton_AnyLeft;
+        const bool right = (down & HidNpadButton_AnyRight) || (row < 3 && (down & HidNpadButton_A));
+        if (row == 3 && (down & HidNpadButton_A)) break;
+        if (left || right) {
+            if (row == 0) {
+                // Left is sharper, right smoother, wrapping with A.
+                const int step = left ? -1 : 1;
+                choice.resolution = (choice.resolution + step + kResolutionCount) % kResolutionCount;
+            } else if (row == 1) {
+                choice.widescreen = !choice.widescreen;
+            } else if (row == 2) {
+                choice.show_fps = !choice.show_fps;
+            }
+            redraw = true;
+        }
         if (drawn && redraw) {
             redraw = false;
             u32 stride = 0;
@@ -552,18 +577,27 @@ static const ResolutionChoice &chooseResolution()
             fillRect(pixels, stride, 0, 0, 1280, 720, kBackground);
             char title[48];
             std::snprintf(title, sizeof title, "DOA2U NX %s", DOA2U_NX_VERSION);
-            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 40, 3, title, kText);
-            const char *const prompt = "Choose the resolution";
-            drawText(pixels, stride, (1280 - textWidth(prompt, 3)) / 2, 120, 3, prompt, kDim);
-            for (int i = 0; i < kResolutionCount; ++i) {
-                const int top = 200 + i * 145;
-                if (i == selected) fillRect(pixels, stride, 290, top, 700, 130, kSelected);
-                drawText(pixels, stride, (1280 - textWidth(kResolutions[i].label, 4)) / 2, top + 10, 4,
-                    kResolutions[i].label, kText);
-                drawText(pixels, stride, (1280 - textWidth(kResolutions[i].note, 2)) / 2, top + 86, 2,
-                    kResolutions[i].note, i == selected ? kText : kDim);
+            drawText(pixels, stride, (1280 - textWidth(title, 3)) / 2, 36, 3, title, kText);
+            const ResolutionChoice &resolution = kResolutions[choice.resolution];
+            const char *const names[3] = {"Resolution", "Aspect ratio", "Show FPS"};
+            const char *const values[3] = {resolution.label, choice.widescreen ? "16:9" : "4:3",
+                choice.show_fps ? "On" : "Off"};
+            const char *const notes[3] = {resolution.note, choice.widescreen ? "Widescreen" : "Original",
+                choice.show_fps ? "Top left corner" : "Hidden"};
+            for (int i = 0; i < 3; ++i) {
+                const int top = 120 + i * 135;
+                if (i == row) fillRect(pixels, stride, 100, top, 1080, 120, kSelected);
+                drawText(pixels, stride, 130, top + 12, 3, names[i], i == row ? kText : kDim);
+                char value[32];
+                std::snprintf(value, sizeof value, "< %s >", values[i]);
+                drawText(pixels, stride, 1150 - textWidth(value, 3), top + 12, 3, value, kText);
+                drawText(pixels, stride, 1150 - textWidth(notes[i], 2), top + 76, 2, notes[i],
+                    i == row ? kText : kDim);
             }
-            const char *const help = "Up/Down: choose   A: start";
+            const int start_top = 540;
+            if (row == 3) fillRect(pixels, stride, 440, start_top, 400, 90, kSelected);
+            drawText(pixels, stride, (1280 - textWidth("Start", 4)) / 2, start_top + 13, 4, "Start", kText);
+            const char *const help = "Up/Down: option   Left/Right: change   A/+: start";
             drawText(pixels, stride, (1280 - textWidth(help, 2)) / 2, 665, 2, help, kDim);
             framebufferEnd(&framebuffer);
         }
@@ -572,7 +606,7 @@ static const ResolutionChoice &chooseResolution()
     if (drawn) framebufferClose(&framebuffer);
     console_state = consoleInit(nullptr);
     console_ready = true;
-    return kResolutions[selected];
+    return choice;
 }
 
 int main(int argc, char **argv)
@@ -589,11 +623,11 @@ int main(int argc, char **argv)
     std::vector<std::string> rejected;
     const std::string xbe = findGameXbe(rejected);
     if (xbe.empty()) {
-        std::printf("\nNo se encuentra el ejecutable del juego en %s/\n\n", kDisc);
-        std::printf("Copia ahi el contenido del Disco 2 USA de Dead or Alive\n");
-        std::printf("Ultimate (Xbox), extraido con extract-xiso.\n");
+        std::printf("\nThe game executable was not found in %s/\n\n", kDisc);
+        std::printf("Copy there the contents of Dead or Alive Ultimate Disc 2\n");
+        std::printf("(USA, Xbox), extracted with extract-xiso.\n");
         for (const std::string &name : rejected) {
-            std::printf("  %s: no es la version USA esperada\n", name.c_str());
+            std::printf("  %s: not the expected USA version\n", name.c_str());
         }
         std::fprintf(stderr, "[nx] no authenticated xbe in %s (%zu rejected)\n", kDisc, rejected.size());
         waitForPlus();
@@ -609,15 +643,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // The only boot choice is the render resolution, picked on a large-print
-    // screen that waits for the player: 720p, 600p (selected at first) or 480p.
-    const ResolutionChoice &choice = chooseResolution();
-    const char *const scale = choice.scale;
-    const char *const resolution = choice.label;
-    // The game's own 16:9 mode, with its intro movies, paced at 60 Hz. The
-    // kernel's XC_VIDEO and XC_AUDIO settings follow these, as the launcher
-    // sets them on PC. The console outputs stereo.
-    setenv("RECOMP_D3D_WIDESCREEN", "1", 1);
+    // The boot choices, picked on a large-print screen that waits for the
+    // player: resolution, aspect ratio and the frame counter.
+    const BootChoice choice = chooseBootOptions();
+    const char *const scale = kResolutions[choice.resolution].scale;
+    const char *const resolution = kResolutions[choice.resolution].label;
+    // The game's own 16:9 mode or its 4:3 one, paced at 60 Hz. The kernel's
+    // XC_VIDEO and XC_AUDIO settings follow these, as the launcher sets them
+    // on PC. The console outputs stereo.
+    setenv("RECOMP_D3D_WIDESCREEN", choice.widescreen ? "1" : "0", 1);
+    // The runtime's frame counter (F3 on PC), shown from the start.
+    if (choice.show_fps) setenv("RECOMP_PERF_OVERLAY", "1", 1);
+    else unsetenv("RECOMP_PERF_OVERLAY");
     unsetenv("RECOMP_AUDIO_SURROUND");
     // The game renders 480 lines: 1.5x is 720, 1.25x is 600.
     setenv("RECOMP_D3D_SCALE", scale, 1);
@@ -625,8 +662,10 @@ int main(int argc, char **argv)
     // glslang and SPIRV-Cross and only link them.
     mkdir(kShaderCache, 0777);
     setenv("RECOMP_SHADER_CACHE", kShaderCache, 1);
-    std::fprintf(stderr, "[nx] boot options: widescreen=1 scale=%s (%s)\n", scale, resolution);
-    std::printf("DOA2U NX %s\n\nResolution: %s\n", DOA2U_NX_VERSION, resolution);
+    std::fprintf(stderr, "[nx] boot options: widescreen=%d scale=%s (%s) fps=%d\n", choice.widescreen ? 1 : 0, scale,
+        resolution, choice.show_fps ? 1 : 0);
+    std::printf("DOA2U NX %s\n\nResolution: %s  Aspect: %s  FPS: %s\n", DOA2U_NX_VERSION, resolution,
+        choice.widescreen ? "16:9" : "4:3", choice.show_fps ? "on" : "off");
     std::printf("Starting...\n");
     consoleUpdate(nullptr);
     mutexInit(&console_mutex);
@@ -651,7 +690,7 @@ int main(int argc, char **argv)
         code = recomp_runner_main(static_cast<int>(arguments.size()), runner_argv.data());
     } catch (const std::exception &error) {
         std::fprintf(stderr, "[nx] uncaught exception: %s\n", error.what());
-        std::printf("\n\x1b[31mExcepcion: %s\x1b[0m\n", error.what());
+        std::printf("\n\x1b[31mException: %s\x1b[0m\n", error.what());
         waitForPlus();
         return 1;
     }
