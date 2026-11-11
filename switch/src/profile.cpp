@@ -427,7 +427,18 @@ void samplerLoop(void *)
 
     constexpr int kHot = 2048;
     struct Hot { uintptr_t key; uint32_t count; };
-    static Hot lifted[kHot], host[kHot];
+    static Hot lifted[kHot], host[kHot], waits[kHot];
+    // libnx's SVC stubs sit together: a PC among them is the guest thread
+    // inside the kernel (sleeping, waiting on a lock), so those samples are
+    // charged to their callers instead, two frames up.
+    const uintptr_t stubs[] = {reinterpret_cast<uintptr_t>(&svcSleepThread), reinterpret_cast<uintptr_t>(&svcWaitSynchronization),
+        reinterpret_cast<uintptr_t>(&svcArbitrateLock), reinterpret_cast<uintptr_t>(&svcWaitProcessWideKeyAtomic),
+        reinterpret_cast<uintptr_t>(&svcQueryMemory), reinterpret_cast<uintptr_t>(&svcSignalProcessWideKey),
+        reinterpret_cast<uintptr_t>(&svcWaitForAddress), reinterpret_cast<uintptr_t>(&svcSendSyncRequest)};
+    uintptr_t stub_low = UINTPTR_MAX, stub_high = 0;
+    for (uintptr_t stub : stubs) { stub_low = std::min(stub_low, stub); stub_high = std::max(stub_high, stub); }
+    stub_high += 0x40u;
+    uint32_t in_kernel = 0;
     uint32_t total = 0, missed = 0, host_total = 0;
     const auto charge = [](Hot *table, uintptr_t key) {
         uint32_t h = static_cast<uint32_t>((key >> 2) * 2654435761u) & (kHot - 1);
@@ -462,6 +473,16 @@ void samplerLoop(void *)
         }
         const uintptr_t pc = context.pc.x;
         ++total;
+        if (pc >= stub_low && pc < stub_high) {
+            ++in_kernel;
+            // Return addresses: lr, then the caller's frame record [fp] = {fp, lr}.
+            const uintptr_t base = reinterpret_cast<uintptr_t>(__start__);
+            uintptr_t caller = context.lr, outer = 0;
+            const uintptr_t fp = context.fp, sp = context.sp;
+            if (fp >= sp && fp - sp < 0x100000u && (fp & 7u) == 0u) outer = reinterpret_cast<const uintptr_t *>(fp)[1];
+            charge(waits, ((caller - base) & ~uintptr_t(0xf)) << 0);
+            if (outer != 0) charge(waits, (((outer - base) & ~uintptr_t(0xf))) | 1u);
+        }
         if (pc >= lifted_low && pc < lifted_high) {
             auto it = std::upper_bound(entries.begin(), entries.end(), pc,
                 [](uintptr_t value, const Entry &e) { return value < e.host; });
@@ -487,9 +508,20 @@ void samplerLoop(void *)
             }
             std::memset(table, 0, sizeof(Hot) * kHot);
         };
-        Hot best[16], best_host[8];
+        Hot best[16], best_host[8], best_waits[8];
         top(lifted, 16, best);
         top(host, 8, best_host);
+        top(waits, 8, best_waits);
+        char wait_text[320];
+        int wait_used = 0;
+        for (const Hot &h : best_waits) {
+            if (h.count == 0 || wait_used >= (int)sizeof wait_text) break;
+            wait_used += std::snprintf(wait_text + wait_used, sizeof wait_text - wait_used, " %s+%zx=%.1f%%",
+                (h.key & 1u) ? "outer" : "lr", static_cast<size_t>(h.key & ~uintptr_t(1)), 100.0 * h.count / total);
+        }
+        std::fprintf(stderr, "recomp sampler: in kernel %.1f%% | callers:%s\n",
+            total ? 100.0 * in_kernel / total : 0.0, wait_used ? wait_text : " -");
+        in_kernel = 0;
         char text[640];
         int used = 0;
         for (const Hot &h : best) {
