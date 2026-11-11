@@ -521,12 +521,22 @@ void doa2u_nx_profile_start(void)
     if (R_SUCCEEDED(threadCreate(&stall_thread, stallWatcher, nullptr, nullptr, 0x8000, 0x2E, 2))) {
         threadStart(&stall_thread);
     }
-    // Core 1 at a high priority: the renderer there waits for the game half
-    // of each frame, and nothing on core 2 can starve the samples.
+}
+
+/* Core 1 at a high priority: the renderer there waits for the game half of
+   each frame, and nothing on core 2 can starve the samples. Started from the
+   first report rather than at boot, where creating it failed with
+   InvalidMemoryState (0xd401), as the BSD sockets do. */
+static void startSampler()
+{
+    static int attempts = 0;
+    static bool started = false;
+    if (started || attempts >= 5) return;
+    ++attempts;
     Result sampler = threadCreate(&sampler_thread, samplerLoop, nullptr, nullptr, 0x10000, 0x28, 1);
     if (R_SUCCEEDED(sampler)) sampler = threadStart(&sampler_thread);
-    std::fprintf(stderr, "recomp sampler: thread %s (0x%x)\n", R_SUCCEEDED(sampler) ? "started" : "failed",
-        (unsigned)sampler);
+    started = R_SUCCEEDED(sampler);
+    std::fprintf(stderr, "recomp sampler: thread %s (0x%x)\n", started ? "started" : "failed", (unsigned)sampler);
 }
 
 // Called once a second by the presenter with the frames and wall time of
@@ -534,6 +544,7 @@ void doa2u_nx_profile_start(void)
 void doa2u_nx_profile_report(uint32_t frames, double wall_ms, int console_row)
 {
     if (frames == 0) return;
+    startSampler();
     const double tick_ms = 1000.0 / armGetSystemTickFreq();
     const double per_frame = 1.0 / frames;
 
