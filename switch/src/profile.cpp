@@ -26,7 +26,6 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
-#include <vector>
 
 typedef void (*RecompFunction)(void);
 extern "C" void *recomp_native_fiber_current(void);
@@ -57,9 +56,6 @@ struct FiberStack {
     void *fiber = nullptr;
     int depth = 0;
     Scope scopes[kDepth];
-    uint64_t resumed = 0;   // when this fiber last got the guest thread
-    uint64_t run_ticks = 0; // wall time on the guest thread this second
-    uint64_t switches = 0;  // times switched away from this second
 };
 
 Slot slots[kSlots];
@@ -204,10 +200,6 @@ RecompFunction instrument(uint32_t address, RecompFunction target, Kind kind)
 
 extern "C" {
 
-// dsound_buffer_adapter.c under RECOMP_DSOUND_LOCK_STATS.
-__attribute__((weak)) void recomp_dsound_lock_stats_take(uint64_t *wait_ns, uint64_t *waits, uint64_t *pump_ns,
-    uint64_t *pump_max_ns, uint64_t *passes);
-
 RecompFunction __real_recomp_lookup_manual(uint32_t guest_address);
 RecompFunction __wrap_recomp_lookup_manual(uint32_t guest_address)
 {
@@ -239,36 +231,12 @@ void __wrap_recomp_native_fiber_switch(void *target)
     FiberStack *own = current_stack;
     if (own->fiber == nullptr) own->fiber = recomp_native_fiber_current();
     const uint64_t out = now();
-    if (own->resumed != 0) own->run_ticks += out - own->resumed;
-    ++own->switches;
     current_stack = stackFor(target);
-    current_stack->resumed = out;
     __real_recomp_native_fiber_switch(target);
     current_stack = own;
-    const uint64_t back = now();
-    own->resumed = back;
-    const uint64_t away = back - out;
+    const uint64_t away = now() - out;
     if (own->depth != 0) own->scopes[own->depth - 1].child += away;
 }
-
-/* The x87 transcendentals the lifted code calls (musl_math under
-   RECOMP_PORTABLE_MATH): calls and time per frame. */
-uint64_t math_calls = 0, math_ticks = 0;
-#define DOA2U_NX_TIMED_MATH1(name) \
-    double __real_##name(double); \
-    double __wrap_##name(double x) { const uint64_t t = now(); const double r = __real_##name(x); \
-        math_ticks += now() - t; ++math_calls; return r; }
-#define DOA2U_NX_TIMED_MATH2(name) \
-    double __real_##name(double, double); \
-    double __wrap_##name(double y, double x) { const uint64_t t = now(); const double r = __real_##name(y, x); \
-        math_ticks += now() - t; ++math_calls; return r; }
-DOA2U_NX_TIMED_MATH1(recomp_sin)
-DOA2U_NX_TIMED_MATH1(recomp_cos)
-DOA2U_NX_TIMED_MATH1(recomp_tan)
-DOA2U_NX_TIMED_MATH2(recomp_atan2)
-DOA2U_NX_TIMED_MATH1(recomp_log2)
-DOA2U_NX_TIMED_MATH1(recomp_log1p)
-DOA2U_NX_TIMED_MATH1(recomp_expm1)
 
 int __real_nanosleep(const struct timespec *request, struct timespec *remaining);
 int __wrap_nanosleep(const struct timespec *request, struct timespec *remaining)
@@ -395,153 +363,6 @@ static void stallWatcher(void *)
     }
 }
 
-/* Sampling profiler of the lifted code. Once a millisecond, from core 2, the
-   guest thread is paused for an instant and its program counter read; each
-   sample is charged to the lifted function it falls in, found among the
-   program's entry points (recomp_lookup over the guest code range, built once
-   before sampling starts). Every 5 s the busiest functions are logged by guest
-   address; samples outside the program are "host" code, logged as offsets in
-   the .nro for doa2u-nx.map. Nothing that can take a lock runs while the
-   guest is paused. */
-RecompFunction recomp_lookup(uint32_t guest_address);  // generated dispatch
-extern char __start__[];                               // the .nro's first byte
-
-namespace {
-struct Entry { uintptr_t host; uint32_t guest; };
-std::vector<Entry> entries;
-Thread sampler_thread;
-
-void samplerLoop(void *)
-{
-    std::fprintf(stderr, "recomp sampler: indexing the lifted functions\n");
-    // Entry points: every lifted function the dispatch table knows.
-    for (uint32_t va = 0x00010000u; va < 0x00400000u; ++va) {
-        if (RecompFunction f = recomp_lookup(va)) entries.push_back({reinterpret_cast<uintptr_t>(f), va});
-    }
-    std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) { return a.host < b.host; });
-    if (entries.empty()) return;
-    const uintptr_t lifted_low = entries.front().host, lifted_high = entries.back().host + 0x10000u;
-    std::fprintf(stderr, "recomp sampler: %zu lifted functions at nro+0x%zx..0x%zx\n", entries.size(),
-        static_cast<size_t>(lifted_low - reinterpret_cast<uintptr_t>(__start__)),
-        static_cast<size_t>(lifted_high - reinterpret_cast<uintptr_t>(__start__)));
-
-    constexpr int kHot = 2048;
-    struct Hot { uintptr_t key; uint32_t count; };
-    static Hot lifted[kHot], host[kHot], waits[kHot];
-    // libnx's SVC stubs sit together: a PC among them is the guest thread
-    // inside the kernel (sleeping, waiting on a lock), so those samples are
-    // charged to their callers instead, two frames up.
-    const uintptr_t stubs[] = {reinterpret_cast<uintptr_t>(&svcSleepThread), reinterpret_cast<uintptr_t>(&svcWaitSynchronization),
-        reinterpret_cast<uintptr_t>(&svcArbitrateLock), reinterpret_cast<uintptr_t>(&svcWaitProcessWideKeyAtomic),
-        reinterpret_cast<uintptr_t>(&svcQueryMemory), reinterpret_cast<uintptr_t>(&svcSignalProcessWideKey),
-        reinterpret_cast<uintptr_t>(&svcWaitForAddress), reinterpret_cast<uintptr_t>(&svcSendSyncRequest)};
-    uintptr_t stub_low = UINTPTR_MAX, stub_high = 0;
-    for (uintptr_t stub : stubs) { stub_low = std::min(stub_low, stub); stub_high = std::max(stub_high, stub); }
-    stub_high += 0x40u;
-    uint32_t in_kernel = 0;
-    uint32_t total = 0, missed = 0, host_total = 0;
-    const auto charge = [](Hot *table, uintptr_t key) {
-        uint32_t h = static_cast<uint32_t>((key >> 2) * 2654435761u) & (kHot - 1);
-        for (int probe = 0; probe < 64; ++probe, h = (h + 1) & (kHot - 1)) {
-            if (table[h].count == 0) { table[h].key = key; table[h].count = 1; return; }
-            if (table[h].key == key) { ++table[h].count; return; }
-        }
-    };
-    uint64_t window_start = now();
-    const uint64_t window = armGetSystemTickFreq() * 5;
-    for (;;) {
-        svcSleepThread(1'000'000);
-        const Handle target = guest_thread;
-        if (target == INVALID_HANDLE) continue;
-        static Result first_error = 0;
-        const Result paused = svcSetThreadActivity(target, ThreadActivity_Paused);
-        ThreadContext context;
-        const Result got = R_SUCCEEDED(paused) ? svcGetThreadContext3(&context, target) : paused;
-        if (R_SUCCEEDED(paused)) svcSetThreadActivity(target, ThreadActivity_Runnable);
-        if (R_FAILED(got)) {
-            if (first_error == 0) {
-                first_error = got;
-                std::fprintf(stderr, "recomp sampler: cannot read the guest thread (0x%x)\n", (unsigned)got);
-            }
-            ++missed;
-            if (now() - window_start >= window) {
-                window_start = now();
-                std::fprintf(stderr, "recomp sampler: 0 samples (%u missed)\n", missed);
-                missed = 0;
-            }
-            continue;
-        }
-        const uintptr_t pc = context.pc.x;
-        ++total;
-        if (pc >= stub_low && pc < stub_high) {
-            ++in_kernel;
-            // Return addresses: lr, then the caller's frame record [fp] = {fp, lr}.
-            const uintptr_t base = reinterpret_cast<uintptr_t>(__start__);
-            uintptr_t caller = context.lr, outer = 0;
-            const uintptr_t fp = context.fp, sp = context.sp;
-            if (fp >= sp && fp - sp < 0x100000u && (fp & 7u) == 0u) outer = reinterpret_cast<const uintptr_t *>(fp)[1];
-            charge(waits, ((caller - base) & ~uintptr_t(0xf)) << 0);
-            if (outer != 0) charge(waits, (((outer - base) & ~uintptr_t(0xf))) | 1u);
-        }
-        if (pc >= lifted_low && pc < lifted_high) {
-            auto it = std::upper_bound(entries.begin(), entries.end(), pc,
-                [](uintptr_t value, const Entry &e) { return value < e.host; });
-            charge(lifted, it == entries.begin() ? 0u : (it - 1)->guest);
-        } else {
-            ++host_total;
-            // 256-byte buckets of host code, as .nro offsets.
-            charge(host, (pc - reinterpret_cast<uintptr_t>(__start__)) & ~static_cast<uintptr_t>(0xff));
-        }
-        if (now() - window_start < window) continue;
-        window_start = now();
-        const auto top = [](Hot *table, int n, Hot *out) {
-            for (int i = 0; i < n; ++i) out[i] = Hot{0, 0};
-            for (int k = 0; k < kHot; ++k) {
-                if (table[k].count == 0) continue;
-                for (int i = 0; i < n; ++i) {
-                    if (table[k].count > out[i].count) {
-                        for (int j = n - 1; j > i; --j) out[j] = out[j - 1];
-                        out[i] = table[k];
-                        break;
-                    }
-                }
-            }
-            std::memset(table, 0, sizeof(Hot) * kHot);
-        };
-        Hot best[16], best_host[8], best_waits[8];
-        top(lifted, 16, best);
-        top(host, 8, best_host);
-        top(waits, 8, best_waits);
-        char wait_text[320];
-        int wait_used = 0;
-        for (const Hot &h : best_waits) {
-            if (h.count == 0 || wait_used >= (int)sizeof wait_text) break;
-            wait_used += std::snprintf(wait_text + wait_used, sizeof wait_text - wait_used, " %s+%zx=%.1f%%",
-                (h.key & 1u) ? "outer" : "lr", static_cast<size_t>(h.key & ~uintptr_t(1)), 100.0 * h.count / total);
-        }
-        std::fprintf(stderr, "recomp sampler: in kernel %.1f%% | callers:%s\n",
-            total ? 100.0 * in_kernel / total : 0.0, wait_used ? wait_text : " -");
-        in_kernel = 0;
-        char text[640];
-        int used = 0;
-        for (const Hot &h : best) {
-            if (h.count == 0 || used >= (int)sizeof text) break;
-            used += std::snprintf(text + used, sizeof text - used, " %08x=%.1f%%", (unsigned)h.key, 100.0 * h.count / total);
-        }
-        char host_text[320];
-        int host_used = 0;
-        for (const Hot &h : best_host) {
-            if (h.count == 0 || host_used >= (int)sizeof host_text) break;
-            host_used += std::snprintf(host_text + host_used, sizeof host_text - host_used, " +%zx=%.1f%%",
-                static_cast<size_t>(h.key), 100.0 * h.count / total);
-        }
-        std::fprintf(stderr, "recomp sampler: %u samples (%u missed), host %.1f%% | lifted:%s | host:%s\n",
-            total, missed, total ? 100.0 * host_total / total : 0.0, text, host_text);
-        total = missed = host_total = 0;
-    }
-}
-} // namespace
-
 // The guest runs on the thread that calls recomp_runner_main.
 void doa2u_nx_profile_start(void)
 {
@@ -555,28 +376,11 @@ void doa2u_nx_profile_start(void)
     }
 }
 
-/* Core 1 at a high priority: the renderer there waits for the game half of
-   each frame, and nothing on core 2 can starve the samples. Started from the
-   first report rather than at boot, where creating it failed with
-   InvalidMemoryState (0xd401), as the BSD sockets do. */
-static void startSampler()
-{
-    static int attempts = 0;
-    static bool started = false;
-    if (started || attempts >= 5) return;
-    ++attempts;
-    Result sampler = threadCreate(&sampler_thread, samplerLoop, nullptr, nullptr, 0x10000, 0x28, 1);
-    if (R_SUCCEEDED(sampler)) sampler = threadStart(&sampler_thread);
-    started = R_SUCCEEDED(sampler);
-    std::fprintf(stderr, "recomp sampler: thread %s (0x%x)\n", started ? "started" : "failed", (unsigned)sampler);
-}
-
 // Called once a second by the presenter with the frames and wall time of
 // that second. Prints the breakdown per frame and resets the counters.
 void doa2u_nx_profile_report(uint32_t frames, double wall_ms, int console_row)
 {
     if (frames == 0) return;
-    startSampler();
     const double tick_ms = 1000.0 / armGetSystemTickFreq();
     const double per_frame = 1.0 / frames;
 
@@ -603,34 +407,6 @@ void doa2u_nx_profile_report(uint32_t frames, double wall_ms, int console_row)
             s.ticks * tick_ms * per_frame, (unsigned long long)(s.calls / frames));
         if (used >= (int)sizeof top) break;
         ++shown;
-    }
-
-    // Guest threads: the guest thread's wall time by fiber, busiest first.
-    {
-        FiberStack *current = current_stack;
-        const uint64_t t = now();
-        if (current->resumed != 0) { current->run_ticks += t - current->resumed; current->resumed = t; }
-        int fiber_order[kFibers];
-        for (int i = 0; i < kFibers; ++i) fiber_order[i] = i;
-        std::sort(fiber_order, fiber_order + kFibers,
-            [](int a, int b) { return fiber_stacks[a].run_ticks > fiber_stacks[b].run_ticks; });
-        char fibers[256];
-        int fused = 0;
-        for (int i = 0; i < 5 && fused < (int)sizeof fibers; ++i) {
-            FiberStack &f = fiber_stacks[fiber_order[i]];
-            if (f.run_ticks == 0) break;
-            fused += std::snprintf(fibers + fused, sizeof fibers - fused, " #%d=%.2fms/%llu", fiber_order[i],
-                f.run_ticks * tick_ms * per_frame, (unsigned long long)(f.switches / frames));
-        }
-        for (FiberStack &f : fiber_stacks) f.run_ticks = f.switches = 0;
-        uint64_t wait_ns = 0, waits = 0, pump_ns = 0, pump_max_ns = 0, passes = 0;
-        if (recomp_dsound_lock_stats_take) recomp_dsound_lock_stats_take(&wait_ns, &waits, &pump_ns, &pump_max_ns, &passes);
-        std::fprintf(stderr,
-            "recomp profile: fibers:%s | math=%.2fms(%llu) | dsound lock wait=%.2fms(%llu) pump=%.2fms/s max=%.2fms passes=%llu\n",
-            fused ? fibers : " -", math_ticks * tick_ms * per_frame, (unsigned long long)(math_calls / frames),
-            wait_ns / 1e6 * per_frame, (unsigned long long)(waits / frames), pump_ns / 1e6 * (1000.0 / wall_ms),
-            pump_max_ns / 1e6, (unsigned long long)passes);
-        math_calls = math_ticks = 0;
     }
 
     std::fprintf(stderr,

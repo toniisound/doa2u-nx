@@ -42,8 +42,6 @@ set(NX_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Same code generation rules as the desktop builds (see recomp-runtime):
 # IEEE operation order, no strict aliasing, 32-bit wraparound.
-# Per-phase timing of the draw adapter, reported once a second in the log.
-add_compile_definitions(RECOMP_DRAW_ADAPTER_TIMING)
 # Triangle draws deep in shared buffers use a base vertex instead of a
 # rebased copy of their indices (d3d8_draw_adapter.c, the GL backend).
 add_compile_definitions(RECOMP_DRAW_INDEX_BASE)
@@ -344,9 +342,10 @@ set_source_files_properties("${RUNTIME}/dsound_buffer_model.c" PROPERTIES
 # frame (d3d_backend_gl.cpp; RECOMP_GL_FINGERPRINT_FRAMES overrides it).
 set_source_files_properties("${NX_SRC}/d3d_backend_gl.cpp" PROPERTIES
     COMPILE_DEFINITIONS "DOA2U_NX_FINGERPRINT_FRAMES=4ul")
-# The profile line reports how long the game waits on the output pump.
+# DirectSound polls and updates leave the audio to the pump thread when it
+# ran the buffer within 20 ms (dsound_buffer_adapter.c).
 set_source_files_properties("${RUNTIME}/dsound_buffer_adapter.c" PROPERTIES
-    COMPILE_DEFINITIONS "RECOMP_DSOUND_LOCK_STATS;RECOMP_DSOUND_QUERY_PUMP_MS=20u")
+    COMPILE_DEFINITIONS "RECOMP_DSOUND_QUERY_PUMP_MS=20u")
 # switch/include comes first: it supplies the POSIX headers newlib lacks.
 target_include_directories(doa2u-nx BEFORE PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -367,8 +366,7 @@ target_link_options(doa2u-nx PRIVATE "-Wl,--wrap=exit" "-Wl,--wrap=abort" "-Wl,-
     "-Wl,--wrap=recomp_dispatch"
     "-Wl,--wrap=recomp_lookup_manual" "-Wl,--wrap=recomp_lookup_kernel"
     "-Wl,--wrap=recomp_program_lookup" "-Wl,--wrap=recomp_native_fiber_switch"
-    "-Wl,--wrap=nanosleep" "-Wl,--wrap=recomp_sin" "-Wl,--wrap=recomp_cos" "-Wl,--wrap=recomp_tan"
-    "-Wl,--wrap=recomp_atan2" "-Wl,--wrap=recomp_log2" "-Wl,--wrap=recomp_log1p" "-Wl,--wrap=recomp_expm1" "-Wl,--wrap=recomp_stop_note_kernel_call" "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/doa2u-nx.map")
+    "-Wl,--wrap=nanosleep" "-Wl,--wrap=recomp_stop_note_kernel_call" "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/doa2u-nx.map")
 target_include_directories(doa2u-nx SYSTEM PRIVATE "${DEVKITPRO}/portlibs/switch/include")
 target_link_libraries(doa2u-nx PRIVATE ${DOA2U_NX_PRESENTER_LIBS} nx m)
 

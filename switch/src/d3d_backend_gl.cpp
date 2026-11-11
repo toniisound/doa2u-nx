@@ -115,8 +115,6 @@ struct RenderReport {
     unsigned frames = 0u;
     uint64_t draws = 0u, segments = 0u, texture_uploads = 0u;
     uint64_t upload_bytes = 0u, ring_waits = 0u;
-    // GL calls the draw loop made: program, VAO, uniform range, texture, sampler binds.
-    uint64_t gl_programs = 0u, gl_vaos = 0u, gl_uniforms = 0u, gl_textures = 0u, gl_samplers = 0u, gl_other = 0u;
     double gpu_ms = 0.0;
     unsigned gpu_frames = 0u;
 } render_report;
@@ -136,22 +134,16 @@ unsigned noteRenderFrame()
     StageTime sorted[24];
     std::copy(stage_times, stage_times + stage_time_count, sorted);
     std::sort(sorted, sorted + stage_time_count, [](const StageTime &a, const StageTime &b) { return a.ms > b.ms; });
-    char line[1024];
+    char line[640];
     int used = std::snprintf(line, sizeof line,
         "recomp render: per frame %.2fms gpu=%.2fms draws=%.0f segments=%.1f uploads=%.1f ring=%.0fKB waits=%.1f |",
         elapsed / frames, render_report.gpu_frames ? render_report.gpu_ms / render_report.gpu_frames : -1.0,
         double(render_report.draws) / frames, double(render_report.segments) / frames,
         double(render_report.texture_uploads) / frames, double(render_report.upload_bytes) / frames / 1024.0,
         double(render_report.ring_waits) / frames);
-    for (unsigned i = 0u; i < stage_time_count && i < 16u && used > 0 && used < int(sizeof line); ++i)
+    for (unsigned i = 0u; i < stage_time_count && i < 8u && used > 0 && used < int(sizeof line); ++i)
         used += std::snprintf(line + used, sizeof line - used, " %s=%.2f", sorted[i].name, sorted[i].ms / frames);
     std::fprintf(stderr, "%s\n", line);
-    std::fprintf(stderr, "recomp render: gl binds per frame programs=%.0f vaos=%.0f uniforms=%.0f textures=%.0f"
-        " samplers=%.0f state=%.0f\n", double(render_report.gl_programs) / frames, double(render_report.gl_vaos) / frames,
-        double(render_report.gl_uniforms) / frames, double(render_report.gl_textures) / frames,
-        double(render_report.gl_samplers) / frames, double(render_report.gl_other) / frames);
-    render_report.gl_programs = render_report.gl_vaos = render_report.gl_uniforms = 0u;
-    render_report.gl_textures = render_report.gl_samplers = render_report.gl_other = 0u;
     render_report.frames = 1u;
     render_report.start = now;
     stage_time_count = 0u;
@@ -1952,12 +1944,10 @@ void flushSegment(RecompD3dPresenter *presenter)
         int32_t scissor[4] = {-1, -1, -1, -1};
         for (const QueuedDraw &draw : segment.draws) {
             if (draw.program != program) {
-                ++render_report.gl_programs;
                 glUseProgram(draw.program);
                 program = draw.program;
             }
             if (draw.vao != vao) {
-                ++render_report.gl_vaos;
                 glBindVertexArray(draw.vao);
                 // The element buffer and vertex buffer bindings are VAO state.
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, presenter->index_buffer);
@@ -1972,14 +1962,12 @@ void flushSegment(RecompD3dPresenter *presenter)
             }
             if (draw.uniform_offset != uniforms) {
                 uniforms = draw.uniform_offset;
-                ++render_report.gl_uniforms;
                 const GLintptr at = uniform_base + uniforms;
                 glBindBufferRange(GL_UNIFORM_BUFFER, kTransformBinding, presenter->uniform_buffer, at,
                     kTransformFloats * sizeof(float));
             }
             if (draw.program_offset != UINT32_MAX && draw.program_offset != constants_offset) {
                 constants_offset = draw.program_offset;
-                ++render_report.gl_uniforms;
                 const GLintptr at = uniform_base + constants_offset;
                 glBindBufferRange(GL_UNIFORM_BUFFER, kProgramBinding, presenter->uniform_buffer, at,
                     kProgramFloats * sizeof(float));
@@ -1987,19 +1975,16 @@ void flushSegment(RecompD3dPresenter *presenter)
             for (unsigned slot = 0u; slot < 4u; ++slot) {
                 if (draw.textures[slot] != textures[slot]) {
                     textures[slot] = draw.textures[slot];
-                    ++render_report.gl_textures;
                     glActiveTexture(GL_TEXTURE0 + slot);
                     glBindTexture(slot == 3u ? GL_TEXTURE_3D : GL_TEXTURE_2D, textures[slot]);
                 }
                 if (draw.samplers[slot] != samplers[slot]) {
                     samplers[slot] = draw.samplers[slot];
-                    ++render_report.gl_samplers;
                     glBindSampler(slot, samplers[slot]);
                 }
             }
             if (std::memcmp(draw.blend_constants, blend, sizeof blend) != 0) {
                 std::memcpy(blend, draw.blend_constants, sizeof blend);
-                ++render_report.gl_other;
                 glBlendColor(blend[0], blend[1], blend[2], blend[3]);
             }
             if (draw.raster.stencil) {
@@ -2012,13 +1997,11 @@ void flushSegment(RecompD3dPresenter *presenter)
             }
             if (std::memcmp(draw.viewport, viewport, sizeof viewport) != 0) {
                 std::memcpy(viewport, draw.viewport, sizeof viewport);
-                ++render_report.gl_other;
                 glViewportIndexedf(0u, viewport[0], viewport[1] - kRowTieBias, viewport[2], viewport[3]);
                 glDepthRangef(viewport[4], viewport[5]);
             }
             if (std::memcmp(draw.scissor, scissor, sizeof scissor) != 0) {
                 std::memcpy(scissor, draw.scissor, sizeof scissor);
-                ++render_report.gl_other;
                 glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
             }
             if (draw.base_vertex != 0) {
@@ -2402,7 +2385,6 @@ bool triangleCovers(const float (&clip)[3][4], RecompD3dCullMode cull, const flo
 
 RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3dPresenterDrawCommand &draw)
 {
-    stage("draw: validate");
     const bool screen_offset = draw.screen_space_offset[0] != 0.0f || draw.screen_space_offset[1] != 0.0f;
     const bool geometry_line = recomp_d3d_draw_geometry_line(draw);
     if (draw.vertex_bytes == nullptr || draw.index_bytes == nullptr ||
@@ -2450,11 +2432,9 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     // Single-sampled, so the sample-position variant of the scaled bias never applies.
     const RecompD3dDrawShaderKey shader_key{shader_fvf, draw.program_count,
         draw.program_count ? draw.program : nullptr, false, scaled_bias, false, draw.projected_stage_count != 0u};
-    stage("draw: program");
     const ProgramEntry &program = lookupProgram(presenter, shader_key);
     if (program.program == 0u) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
 
-    stage("draw: target");
     BoundTarget bound;
     const RecompD3dPresenterError target_error = bindTarget(presenter, draw.target, bound);
     if (target_error != RECOMP_D3D_PRESENTER_OK) return target_error;
@@ -2488,7 +2468,6 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     }
     useTarget(presenter, bound);
 
-    stage("draw: textures");
     const GLuint texture = draw.has_texture ? lookupTexture(presenter, draw) : 0u;
     GLuint mask = 0u, bump = 0u;
     if (draw.has_alpha_mask) {
@@ -2642,7 +2621,6 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
 
     const RasterState raster = rasterState(draw, primitive, geometry_line ? RECOMP_D3D_CULL_NONE : draw.cull_mode,
         scaled_bias ? 0.0f : draw.slope_scaled_depth_bias);
-    stage("draw: state");
     const GLuint vao = lookupVertexArray(presenter, shader_fvf, program.layout);
 
     const bool volume = draw.texture.volume_depth != 0u;
@@ -2697,11 +2675,8 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         // openQuery flushed the segment; this draw records into the same target again.
     }
     float transform[kTransformFloats];
-    stage("draw: constants");
     buildTransform(constants, transform);
-    stage("draw: variant");
     const GLuint chosen = chooseProgram(presenter, shader_key, program.program, transform);
-    stage("draw: queue");
     queueDraw(presenter, chosen, vao, raster, vertices, vertex_bytes, stride, indices, index_count,
         constants, transform, draw.program_count != 0u, bindings, static_cast<uint8_t>(draw.depth.stencil_ref),
         geometry_line ? 0 : -static_cast<GLint>(draw.index_base));

@@ -26,15 +26,16 @@ host layer this port started from.
 ## Status
 
 **Stage 3 of 3: performance.** The game runs as a libnx homebrew with an
-OpenGL 4.3 renderer on its own core, audio, input and saves. In Eden it shows
-a correct picture at 35–57 fps in menus and about 20–25 fps in fights; it has
-not yet been measured on the console.
+OpenGL 4.3 renderer on its own core, audio, input, saves and Sofdec movies.
+On a Switch with the CPU overclocked to about 1700 MHz (sys-clk), at 600p, fights run at about
+55–58 fps in typical scenes; the busiest ones (over 1000 draws a frame) still
+drop to the 30s–40s.
 
 | Stage | Goal | State |
 |---|---|---|
 | 1. CPU bring-up | Boot, audio, input, saves, frame-rate probe | Done (Eden) |
 | 2. Renderer | OpenGL 4.3 backend on core 1; upstream's run-time HLSL shaders compiled to GLSL with glslang + SPIRV-Cross, cached on the SD card | Done (Eden) |
-| 3. Performance | Guest-thread costs (visibility waits, 3D audio, draw capture), then real hardware tuning and Sofdec movies | **In progress** |
+| 3. Performance | Guest-thread costs (manual lookups, DirectSound pumping on the game thread, draw capture), renderer costs (persistent upload rings, texture checks), Sofdec movies | **In progress** (console) |
 
 | Area | Switch host layer | State |
 |---|---|---|
