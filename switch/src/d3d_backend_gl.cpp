@@ -1199,7 +1199,20 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
             entry.height == desc.height && entry.volume_depth == desc.volume_depth &&
             entry.mip_levels == levels &&
             (!palettized || std::memcmp(entry.palette, draw.palette_bytes, kPaletteBytes) == 0)) {
-            const bool checked = !every_draw && entry.checked_frame == frame;
+            /* A texture checked within the last few frames is trusted: each
+               check is ~128 cache misses in guest memory, a fight frame
+               resolves a few hundred textures, and DOA2U rewrites texels
+               rarely (RECOMP_GL_FINGERPRINT_FRAMES; the Switch build checks
+               every 4th frame, others every frame). A change shows at most that many frames late. */
+            static const uint32_t check_frames = [] {
+                const char *value = std::getenv("RECOMP_GL_FINGERPRINT_FRAMES");
+#ifndef DOA2U_NX_FINGERPRINT_FRAMES
+#define DOA2U_NX_FINGERPRINT_FRAMES 1ul
+#endif
+                const unsigned long frames = value ? std::strtoul(value, nullptr, 10) : DOA2U_NX_FINGERPRINT_FRAMES;
+                return static_cast<uint32_t>(frames == 0ul ? 1ul : frames > 60ul ? 60ul : frames);
+            }();
+            const bool checked = !every_draw && entry.checked_frame != 0u && frame - entry.checked_frame < check_frames;
             if (fingerprinted && !checked && entry.fingerprint != currentFingerprint()) {
                 static unsigned reported;
                 if (reported < 32u) {
@@ -1212,7 +1225,7 @@ GLuint lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDraw
                 entry.used = false;
                 break;
             }
-            if (fingerprinted) entry.checked_frame = frame;
+            if (fingerprinted && !checked) entry.checked_frame = frame;  // the frame it was last verified
             if (linear_bgra) {
                 // Queued draws sampled the old pixels; record them before this upload.
                 flushSegment(presenter);

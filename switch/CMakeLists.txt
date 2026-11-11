@@ -340,6 +340,10 @@ target_compile_definitions(doa2u-nx PRIVATE
 # never recompiles the generated program.
 set_source_files_properties("${RUNTIME}/dsound_buffer_model.c" PROPERTIES
     COMPILE_DEFINITIONS "RECOMP_DSOUND_STALL_MS=250u")
+# Each cached texture's texels are re-verified every 4th frame, not every
+# frame (d3d_backend_gl.cpp; RECOMP_GL_FINGERPRINT_FRAMES overrides it).
+set_source_files_properties("${NX_SRC}/d3d_backend_gl.cpp" PROPERTIES
+    COMPILE_DEFINITIONS "DOA2U_NX_FINGERPRINT_FRAMES=4ul")
 # The profile line reports how long the game waits on the output pump.
 set_source_files_properties("${RUNTIME}/dsound_buffer_adapter.c" PROPERTIES
     COMPILE_DEFINITIONS "RECOMP_DSOUND_LOCK_STATS;RECOMP_DSOUND_QUERY_PUMP_MS=20u")
