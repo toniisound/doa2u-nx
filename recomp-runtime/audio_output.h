@@ -7,9 +7,13 @@
 extern "C" {
 #endif
 
+/* DirectSound buffers use slots 0..255; native movie audio plays on 256. */
+enum { RECOMP_AUDIO_OUTPUT_MOVIE_SLOT = 256, RECOMP_AUDIO_OUTPUT_SLOTS = 257 };
+
 /* 6 when RECOMP_AUDIO_SURROUND is set and not "0", otherwise 2. Reads the
    environment only, so it is valid before initialize and without a device.
-   Keep this in step with the kernel's XC_AUDIO speaker setting. */
+   The game's own setting (XC_AUDIO) may differ in a netplay session; the
+   mix folds it to these speakers. */
 uint32_t recomp_audio_output_speakers(void);
 /* Call on the runtime thread. Initialization is attempted once per process;
    an unavailable device or shutdown leaves guest audio timing unchanged.
@@ -50,8 +54,9 @@ int recomp_audio_output_set_voice_routing(uint32_t slot, uint32_t channels,
     const float *dry, const float *wet);
 
 /* Copies PCM before returning; never retains a guest-memory pointer.
-   Slots: 0..255. PCM: 1000..200000 Hz, 1-3 channels, unsigned 8 bit, signed
-   16 bit, or 32-bit IEEE float (1.0 = full scale; values beyond +/-1 allowed).
+   Slots: below RECOMP_AUDIO_OUTPUT_SLOTS. PCM: 1000..200000 Hz, 1-3 channels,
+   unsigned 8 bit, signed 16 bit, or 32-bit IEEE float (1.0 = full scale;
+   values beyond +/-1 allowed).
    Each submission is frame-aligned and at most 160000 bytes. A full queue
    drops the incoming chunk without waiting. A new or starved voice first
    queues 50 ms of silence as a jitter cushion, then trims its pitch by at most

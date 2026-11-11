@@ -14,12 +14,21 @@ static uint32_t guest_stack[32];
 static uint32_t guest_calls[4], guest_call_count, finished;
 static uint8_t scene[8];
 static char guest_path[16];
+static uint32_t launch_reason; /* at 0x3100: the launch data's first field */
+static uint32_t aix_handle; /* 0xa94454: the logo clip's AIX, or 0 */
+static uint8_t aix[2];      /* at 0x4000; byte 1 is its state, 1 while preparing */
 static jmp_buf stopped;
 static int stop_code;
 static char stop_id[64];
+static float nine_sixteenths = 0.5625f, seen_shape; /* 0x3c2cec */
+static float back_buffer_shape = 1.5f, seen_reflection; /* 0x877ea0 */
+static uint32_t video_flags;
+static float screen_aspect = 16.0f / 9.0f;
 uint32_t *recomp_memory_u32_checked(uint32_t address)
 {
     if (address == XBOX_KERNEL_DATA_BASE + 0x40u) return &tick;
+    if (address == 0x00a94454u) return &aix_handle;
+    if (address == 0x3100u) return &launch_reason;
     if (address >= 0xfc0u && address < 0xfc0u + sizeof guest_stack && address % 4u == 0u)
         return &guest_stack[(address - 0xfc0u) / 4u];
     abort();
@@ -28,6 +37,9 @@ uint8_t *recomp_memory(uint32_t address, size_t width)
 {
     if (address >= 0x3000u && address + width <= 0x3000u + sizeof guest_path)
         return (uint8_t *)&guest_path[address - 0x3000u];
+    if (address >= 0x4000u && address + width <= 0x4000u + sizeof aix) return &aix[address - 0x4000u];
+    if (address == 0x003c2cecu && width == sizeof nine_sixteenths) return (uint8_t *)&nine_sixteenths;
+    if (address == 0x00877ea0u && width == sizeof back_buffer_shape) return (uint8_t *)&back_buffer_shape;
     if (address < 0x2000u || address + width > 0x2000u + sizeof scene) abort();
     return &scene[address - 0x2000u];
 }
@@ -50,6 +62,7 @@ void recomp_dispatch_indirect_site(uint32_t address, uint32_t saved_esp, const c
     (void)line;
     if (guest_call_count == 4u) abort();
     guest_calls[guest_call_count++] = address;
+    if (address == 0x000fa3d0u) aix[1] = 2u; /* a yielded frame lets CRI's server start the AIX */
     recomp_runtime.registers.eax = address == 0x000fa170u ? finished : 0u;
 }
 
@@ -83,7 +96,19 @@ RecompFunction recomp_dsound_api_lookup_manual(uint32_t address)
     return NULL;
 }
 
+RecompFunction recomp_netplay_guest_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+
 RecompFunction recomp_fiber_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+
+RecompFunction recomp_stage_select_lookup_manual(uint32_t address)
 {
     (void)address;
     return NULL;
@@ -93,6 +118,83 @@ RecompFunction recomp_input_lookup_manual(uint32_t address)
 {
     (void)address;
     return NULL;
+}
+
+RecompFunction recomp_mwply_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+
+RecompFunction recomp_free_camera_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+RecompFunction recomp_cpu_costume_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+RecompFunction recomp_unlock_profile_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+RecompFunction recomp_pc_settings_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+RecompFunction recomp_menu_quit_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+RecompFunction recomp_runner_assets_lookup_manual(uint32_t address)
+{
+    (void)address;
+    return NULL;
+}
+
+uint32_t recomp_kernel_video_flags(void) { return video_flags; }
+float recomp_kernel_widescreen_aspect(void) { return screen_aspect; }
+void sub_00034280(void) {}
+void sub_00034E10(void) { seen_shape = nine_sixteenths; }
+void sub_00036490(void) { seen_shape = nine_sixteenths; }
+void sub_0026C2E0(void) { seen_reflection = back_buffer_shape; }
+void sub_00279D60(void) { seen_reflection = back_buffer_shape; }
+void sub_0027A070(void) { seen_reflection = back_buffer_shape; }
+void sub_0027A430(void) { seen_reflection = back_buffer_shape; }
+void sub_00280460(void) { seen_reflection = back_buffer_shape; }
+
+/* The culling views see the screen's shape during the call; the shared values come back after. */
+static int test_culling_shape(void)
+{
+    const struct { uint32_t flags; float aspect, seen, reflection; } cases[] = {
+        {0x004e0000u, 32.0f / 9.0f, 0.5625f, 1.5f},     /* 4:3 mode reads 3/4 elsewhere */
+        {0x004f0000u, 16.0f / 9.0f, 0.5625f, 1.5f},
+        {0x004f0000u, 32.0f / 9.0f, 9.0f / 32.0f, 32.0f / 9.0f},
+    };
+    const uint32_t wrapped[] = {0x00034e10u, 0x00036490u};
+    const uint32_t mirrors[] = {0x0026c2e0u, 0x00279d60u, 0x0027a070u, 0x0027a430u, 0x00280460u};
+    for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
+        video_flags = cases[i].flags;
+        screen_aspect = cases[i].aspect;
+        for (unsigned j = 0u; j < 2u; ++j) {
+            seen_shape = 0.0f;
+            recomp_lookup_manual(wrapped[j])();
+            if (fabsf(seen_shape - cases[i].seen) > 1e-7f || nine_sixteenths != 0.5625f) return 0;
+        }
+        for (unsigned j = 0u; j < sizeof mirrors / sizeof mirrors[0]; ++j) {
+            seen_reflection = 0.0f;
+            recomp_lookup_manual(mirrors[j])();
+            if (seen_reflection != cases[i].reflection || back_buffer_shape != 1.5f) return 0;
+        }
+    }
+    video_flags = 0u;
+    screen_aspect = 16.0f / 9.0f;
+    return 1;
 }
 
 static int test_fmod(void)
@@ -159,11 +261,20 @@ static int test_startup_logo_skip(void)
 {
     RecompFunction function = recomp_lookup_manual(0x000d9300u);
     if (function == NULL) return 0;
+    aix_handle = 0u;
     guest_call_count = 0u;
     recomp_runtime.registers.esp = 0x1000u;
     function();
-    return guest_call_count == 2u && guest_calls[0] == 0x000f9e10u &&
-        guest_calls[1] == 0x000f9a10u && recomp_runtime.registers.esp == 0x1004u;
+    if (!(guest_call_count == 2u && guest_calls[0] == 0x000f9e10u &&
+            guest_calls[1] == 0x000f9a10u && recomp_runtime.registers.esp == 0x1004u)) return 0;
+    /* With 5.1 the clip's AIX must leave its preparing state before the close. */
+    aix_handle = 0x4000u;
+    aix[1] = 1u;
+    guest_call_count = 0u;
+    recomp_runtime.registers.esp = 0x1000u;
+    function();
+    return guest_call_count == 3u && guest_calls[0] == 0x000f9e10u && guest_calls[1] == 0x000fa3d0u &&
+        guest_calls[2] == 0x000f9a10u && recomp_runtime.registers.esp == 0x1004u;
 }
 
 /* Boot's first movie-scene tick ends the opening at once; later ticks wait for the movie. */
@@ -191,21 +302,26 @@ static int test_boot_opening_skip(void)
     return 1;
 }
 
-/* Only the game's own relaunch asks the launcher for a fresh runner. */
+/* Only the game's own relaunch asks the launcher for a fresh runner; a chosen
+   Dashboard ends the game normally and an error Dashboard still fails. */
 static int test_launch_new_image(void)
 {
     RecompFunction function = recomp_lookup_manual(0x002bab9du);
     if (function == NULL) return 0;
-    const struct { const char *path; int code; const char *id; } cases[] = {
-        {"D:\\DOA2.xbe", 4, "xapi:relaunch-title"},
-        {"D:\\doa1.xbe", 2, "xapi:launch-new-image:d:\\doa1.xbe"},
-        {NULL, 2, "xapi:launch-new-image:dashboard"},
+    const struct { const char *path; uint32_t reason; int code; const char *id; } cases[] = {
+        {"D:\\DOA2.xbe", 0u, 4, "xapi:relaunch-title"},
+        {"D:\\doa1.xbe", 0u, 2, "xapi:launch-new-image:d:\\doa1.xbe"},
+        {NULL, 7u, 0, "xapi:dashboard"},
+        {NULL, 1u, 2, "xapi:launch-new-image:dashboard"},
+        {NULL, UINT32_MAX, 0, "xapi:dashboard"}, /* no launch data */
     };
-    for (unsigned i = 0u; i < 3u; ++i) {
+    for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
         memset(guest_path, 0, sizeof guest_path);
         if (cases[i].path != NULL) strcpy(guest_path, cases[i].path);
         recomp_runtime.registers.esp = 0x1000u;
         *recomp_memory_u32(0x1004u) = cases[i].path != NULL ? 0x3000u : 0u;
+        *recomp_memory_u32(0x1008u) = cases[i].reason == UINT32_MAX ? 0u : 0x3100u;
+        *recomp_memory_u32(0x3100u) = cases[i].reason;
         if (setjmp(stopped) == 0) {
             function();
             return 0;
@@ -224,7 +340,7 @@ int main(void)
     if (recomp_lookup_manual(0x000d9300u) != NULL || recomp_lookup_manual(0x00069180u) != NULL) return 1;
     recomp_skip_intro = true;
     if (!test_fmod() || !test_startup_legal_skip() || !test_startup_logo_skip() ||
-        !test_boot_opening_skip() || !test_launch_new_image()) return 1;
+        !test_boot_opening_skip() || !test_launch_new_image() || !test_culling_shape()) return 1;
     RecompFunction init_segment = recomp_lookup_manual(0x002bd531u);
     if (init_segment == NULL) return 1;
     recomp_runtime.registers.esp = 0x1000u;

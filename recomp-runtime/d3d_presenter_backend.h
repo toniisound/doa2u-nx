@@ -21,6 +21,9 @@ RecompD3dPresenterError d3d_backend_release_memory(
     RecompD3dPresenter *presenter, uint32_t base, uint32_t size, bool targets);
 RecompD3dPresenterError d3d_backend_destroy(RecompD3dPresenter **presenter);
 void d3d_backend_set_immediate_present(bool enabled);
+/* recomp_d3d_presenter_set_quality, from any thread. */
+void d3d_backend_set_quality(float scale, uint32_t msaa, bool smaa);
+bool d3d_backend_quality_live();
 void d3d_backend_report_draw_textures();
 
 enum D3dBackendVisibilityPoll {
@@ -33,5 +36,8 @@ enum D3dBackendVisibilityPoll {
    its index and count. Queries resolve in submission order. */
 D3dBackendVisibilityPoll d3d_backend_poll_visibility(
     RecompD3dPresenter *presenter, uint32_t *index, uint32_t *pixels);
+/* Inline backends only: true when the next swapchain acquire would not wait
+   for the GPU to finish an earlier frame. */
+bool d3d_backend_present_ready(RecompD3dPresenter *presenter);
 
 #endif

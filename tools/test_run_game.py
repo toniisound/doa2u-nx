@@ -6,10 +6,19 @@ import unittest
 import json
 import os
 import subprocess
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
+from extract_iso import private_pattern, redact_private
 from package_test import build_launchers
-from run_game import prepare_disc, run, runner_path, saved_settings, seed_hdd_cache
+from run_game import keyboard_map, prepare_disc, run, runner_path, saved_settings, seed_hdd_cache
+
+
+def runner(code, output=()):
+    """A subprocess.Popen double for the runner: prints output, then exits with code."""
+    child = MagicMock(stdout=list(output))
+    child.__enter__.return_value = child
+    child.wait.return_value = code
+    return child
 
 
 class DiscTests(unittest.TestCase):
@@ -22,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Web.Extensions
 $type = [Reflection.Assembly]::LoadFile($env:RECOMP_LAUNCHER_TEST_EXE).GetType('LauncherForm')
 $form = $type.GetConstructor([type[]]@([string])).Invoke(@($null))
-foreach ($name in 'resolution', 'msaa', 'smaa', 'screen', 'surround', 'intro', 'unlock') {
+foreach ($name in 'resolution', 'msaa', 'smaa', 'screen', 'renderer', 'vrr', 'surround', 'intro', 'unlock', 'cpuCostumes', 'freeCamera') {
     $row = $type.GetField($name, [Reflection.BindingFlags]'NonPublic, Instance').GetValue($form)
     $row.Index = if ($env:RECOMP_LAUNCHER_TEST_LAST -eq '1') { $row.Names.Length - 1 } else { 0 }
 }
@@ -35,10 +44,12 @@ $json = (New-Object Web.Script.Serialization.JavaScriptSerializer).Serialize($ty
             build_launchers(root)
             self.assertTrue((root / "DOA2U.exe").is_file())
             (root / "private").mkdir()
-            for last, expected in ((True, dict(resolution=2160, msaa=32, smaa=True, widescreen=True,
-                                                skip_intro=True, surround=True, unlock_all=False)),
-                                   (False, dict(resolution=480, msaa=1, smaa=False, widescreen=False,
-                                                skip_intro=False, surround=False, unlock_all=True))):
+            for last, expected in ((True, dict(resolution=2160, msaa=32, smaa=True, vrr=True,
+                                                skip_intro=True, surround=True, unlock_all=False, vulkan=True,
+                                                free_camera=True, random_cpu_costumes=True)),
+                                   (False, dict(resolution=480, msaa=1, smaa=False, widescreen=False, vrr=False,
+                                                skip_intro=False, surround=False, unlock_all=True, vulkan=False,
+                                                free_camera=False, random_cpu_costumes=False))):
                 env = dict(os.environ, RECOMP_LAUNCHER_TEST_EXE=str(root / "Launcher.exe"),
                            RECOMP_LAUNCHER_TEST_OUT=str(root / "private/launcher.json"),
                            RECOMP_LAUNCHER_TEST_LAST="1" if last else "0")
@@ -47,7 +58,10 @@ $json = (New-Object Web.Script.Serialization.JavaScriptSerializer).Serialize($ty
                                         env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 with patch("run_game.ROOT", root):
-                    self.assertEqual(saved_settings(), expected)
+                    saved = saved_settings()
+                if last:
+                    self.assertEqual(saved.pop("widescreen"), "32:9")  # the last Screen choice
+                self.assertEqual(saved, expected)
 
     @unittest.skipUnless(os.name == "nt", "The launchers are Windows executables")
     def test_launcher_held_down_enters_a_page_without_changing_a_value(self):
@@ -80,6 +94,48 @@ $keyDown.Invoke($form, @($down))
             # Entered the page; the repeat left 1080p alone; a fresh press stepped down to 720p.
             self.assertEqual(result.stdout.split(), ["True", "2", "1"])
 
+    @unittest.skipUnless(os.name == "nt", "The launchers are Windows executables")
+    def test_launcher_logs_show_the_home_folder_and_user_as_tilde(self):
+        script = r'''
+$ErrorActionPreference = 'Stop'
+$type = [Reflection.Assembly]::LoadFile($env:RECOMP_LAUNCHER_TEST_EXE).GetType('Game')
+$profileDir = [Environment]::GetFolderPath('UserProfile')
+$line = "$profileDir\doa2u " + $profileDir.ToUpper().Replace('\', '/') + " D:\$([Environment]::UserName)\x"
+$type.GetMethod('RedactPrivate').Invoke($null, @($line))
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            build_launchers(Path(folder))
+            env = dict(os.environ, RECOMP_LAUNCHER_TEST_EXE=str(Path(folder) / "Launcher.exe"))
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                     "-ExecutionPolicy", "Bypass", "-Command", script],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), r"~\doa2u ~ D:\~\x")
+
+    def test_keyboard_json_becomes_the_runner_keymap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "private").mkdir()
+            with patch("run_game.ROOT", root):
+                self.assertEqual(keyboard_map(), "")
+                (root / "private/keyboard.json").write_text('{"a": "space", "start": "F5", "up": "W"}')
+                self.assertEqual(keyboard_map(), "a=20,start=74,up=57")
+                for bad in ('{"jump": "Z"}', '{"a": "Home"}', '{"a": "F10"}', '{"a": "F11"}', '[1]', '{"a":'):
+                    (root / "private/keyboard.json").write_text(bad)
+                    with self.assertRaises(ValueError):
+                        keyboard_map()
+
+    def test_logs_show_the_home_folder_and_user_as_tilde(self):
+        windows = private_pattern("E:\\Profiles\\Ann", "ann.b")
+        for line, expected in ((r"open E:\Profiles\Ann\doa2u\.recomp-storage", r"open ~\doa2u\.recomp-storage"),
+                               ("open e:/profiles/ann/doa2u", "open ~/doa2u"),
+                               (r"D:\ANN.B\games and E:/x/Ann/y", r"D:\~\games and E:/x/~/y"),
+                               (r"E:\Profiles\Anna\x and Annex", r"E:\Profiles\Anna\x and Annex")):
+            self.assertEqual(redact_private(line, windows), expected)
+        posix = private_pattern("/srv/ann/", "ann")
+        self.assertEqual(redact_private("/srv/ann/x /run/media/ann/USB", posix), "~/x /run/media/~/USB")
+        self.assertIsNone(private_pattern("/", ""))
+
     def test_play_keeps_player_saves_and_has_no_deadline_or_script(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -88,7 +144,7 @@ $keyDown.Invoke($form, @($down))
             selected.parent.mkdir()
             selected.write_bytes(b"synthetic input")
             receipt = dict(recipe=dict(xbe_sha256="hash"), manifest_sha256="hash",
-                           ebp_count=0, runner_sha256="hash")
+                           ebp_count=0, runner_sha256="hash", vulkan_runner_sha256="hash")
             (root / "private/program/receipt.json").write_text(json.dumps(receipt))
             disc = root / "private/play-disc"
             save = disc / ".recomp-storage/profile"
@@ -97,8 +153,8 @@ $keyDown.Invoke($form, @($down))
             with patch("run_game.ROOT", root), patch("run_game.selected_xbe", return_value=selected), \
                     patch("run_game.program_manifest", return_value=("hash", 0)), \
                     patch("run_game.sha256", return_value="hash"), \
-                    patch("run_game.subprocess.run") as execute:
-                execute.return_value.returncode = 0
+                    patch("run_game.subprocess.Popen") as execute:
+                execute.return_value = runner(0, [f"open {Path.home() / 'doa2u'}\n"])
                 for height in (480, 720, 1080, 1440, 2160):
                     self.assertEqual(run(None, widescreen=True, msaa=32, smaa=True,
                                          resolution=height), 0)
@@ -106,7 +162,7 @@ $keyDown.Invoke($form, @($down))
                     self.assertEqual([env[name] for name in (
                         "RECOMP_D3D_WIDESCREEN", "RECOMP_D3D_MSAA", "RECOMP_D3D_SMAA")], ["1", "32", "1"])
                     self.assertEqual(float(env["RECOMP_D3D_SCALE"]), height / 480)
-                self.assertIsNone(execute.call_args.kwargs["timeout"])
+                self.assertIsNone(execute.return_value.wait.call_args.kwargs["timeout"])
                 self.assertEqual(execute.call_args.args[0], [
                     str(runner_path(root)),
                     "--xbe", str(disc / selected.name), "--disc-root", str(disc)])
@@ -114,17 +170,27 @@ $keyDown.Invoke($form, @($down))
                 self.assertEqual(execute.call_args.args[0][-1], "--skip-intro")
                 self.assertEqual(run(None, unlock_all=False), 0)
                 self.assertEqual(execute.call_args.args[0][-1], "--no-unlock-all")
-                self.assertEqual(run(None, surround=True), 0)
+                self.assertEqual(run(None, surround=True, free_camera=True, random_cpu_costumes=True), 0)
                 self.assertEqual(execute.call_args.kwargs["env"]["RECOMP_AUDIO_SURROUND"], "1")
+                self.assertEqual(execute.call_args.kwargs["env"]["RECOMP_FREE_CAMERA"], "1")
+                self.assertEqual(execute.call_args.kwargs["env"]["RECOMP_RANDOM_CPU_COSTUMES"], "1")
+                self.assertEqual(run(None, vrr=True), 0)
+                self.assertEqual(execute.call_args.kwargs["env"]["RECOMP_D3D_VRR"], "1")
+                self.assertEqual(execute.call_args.kwargs["env"]["RECOMP_LAUNCHER_SETTINGS"],
+                                 str(root / "private/launcher.json"))
+                self.assertEqual(run(None, vulkan=True), 0)
+                self.assertEqual(execute.call_args.args[0][0], str(runner_path(root, vulkan=True)))
                 # A soft-reset relaunch starts one more runner in the same session log.
                 execute.reset_mock()
-                execute.side_effect = [Mock(returncode=4), Mock(returncode=0)]
+                execute.side_effect = [runner(4), runner(0)]
                 self.assertEqual(run(None), 0)
                 self.assertEqual(execute.call_count, 2)
             self.assertEqual(save.read_text(), "user save")
             logs = list((root / "private/play-logs").glob("*.log"))
-            self.assertEqual(len(logs), 9)
+            self.assertEqual(len(logs), 11)
             self.assertIn("runner_sha256=hash", logs[0].read_text())
+            # glob's order is the file system's; the relaunch runs print nothing.
+            self.assertTrue(any(f"open ~{os.sep}doa2u" in log.read_text() for log in logs))
 
     def test_isolated_probe_uses_separate_saves_and_scripted_input(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -142,8 +208,8 @@ $keyDown.Invoke($form, @($down))
             with patch("run_game.ROOT", root), patch("run_game.selected_xbe", return_value=selected), \
                     patch("run_game.program_manifest", return_value=("hash", 0)), \
                     patch("run_game.sha256", return_value="hash"), \
-                    patch("run_game.subprocess.run") as execute:
-                execute.return_value.returncode = 0
+                    patch("run_game.subprocess.Popen") as execute:
+                execute.return_value = runner(0)
                 self.assertEqual(run(1, [30, 100], [200], isolated=True,
                                      buttons_polls=[(3800, 8), (4000, 1)],
                                      analog_polls=[(4500, 3), (4600, 1)],
@@ -170,13 +236,19 @@ $keyDown.Invoke($form, @($down))
             with patch("run_game.ROOT", root):
                 self.assertEqual(saved_settings(), {})
                 settings.write_text(json.dumps({"height": 1080, "msaa": 4, "smaa": False,
-                    "widescreen": True, "skipIntro": True, "surround": True, "unlockAll": False}),
+                    "widescreen": True, "vrr": True, "skipIntro": True, "surround": True, "unlockAll": False,
+                    "freeCamera": True, "randomCpuCostumes": True}),
                     encoding="utf-8")
                 self.assertEqual(saved_settings(), {"resolution": 1080, "msaa": 4, "smaa": False,
-                    "widescreen": True, "skip_intro": True, "surround": True, "unlock_all": False})
+                    "widescreen": True, "vrr": True, "skip_intro": True, "surround": True, "unlock_all": False,
+                    "free_camera": True, "random_cpu_costumes": True})
                 settings.write_text(json.dumps({"height": 900, "msaa": 3, "widescreen": "yes"}),
                     encoding="utf-8")
                 self.assertEqual(saved_settings(), {})
+                for screen, expected in (("16:10", "16:10"), ("32:9", "32:9"), ("3440:1440", "3440:1440"), ("4:3", False),
+                                         ("16:9", "16:9"), ("5:1", True), ("wide", True)):
+                    settings.write_text(json.dumps({"widescreen": True, "screen": screen}), encoding="utf-8")
+                    self.assertEqual(saved_settings(), {"widescreen": expected}, screen)
                 settings.write_text("{", encoding="utf-8")
                 self.assertEqual(saved_settings(), {})
 
@@ -185,6 +257,9 @@ $keyDown.Invoke($form, @($down))
         expected = ("build/recomp-program-mingw/recomp_program_runner.exe" if os.name == "nt"
             else "build/recomp-program/recomp_program_runner")
         self.assertEqual(runner_path(root), root / expected)
+        vulkan = ("build/recomp-program-mingw/recomp_program_runner_vulkan.exe" if os.name == "nt"
+            else "build/recomp-program/recomp_program_runner")
+        self.assertEqual(runner_path(root, vulkan=True), root / vulkan)
 
     def test_rejects_invalid_start_polls_before_reading_inputs(self):
         for polls in ([0], [-1], [2**64], [1, 2, 3, 4, 5]):
@@ -256,9 +331,10 @@ $keyDown.Invoke($form, @($down))
     def test_seeds_hdd_cache_with_copies_and_replaces_partial_archives(self):
         with tempfile.TemporaryDirectory() as folder:
             disc = Path(folder)
-            (disc / "doa2").mkdir()
+            # Real extracted discs use an uppercase folder; Linux must still find it.
+            (disc / "DOA2").mkdir()
             for name in ("voice.afs", "datahdd.afs", "datahdd2.afs"):
-                (disc / "doa2" / name).write_bytes(name.encode() * 3)
+                (disc / "DOA2" / name).write_bytes(name.encode() * 3)
             cache = disc / ".recomp-storage/partition5"
             cache.mkdir(parents=True)
             (cache / "datahdd.afs").write_bytes(b"partial")
@@ -268,7 +344,7 @@ $keyDown.Invoke($form, @($down))
             self.assertEqual((cache / "datahdd2.afs").read_bytes(), b"datahdd2.afs" * 3)
             # A complete-size archive is the game's own install; it is kept.
             self.assertEqual((cache / "voice.afs").read_bytes(), b"x" * 27)
-            self.assertFalse((cache / "datahdd2.afs").samefile(disc / "doa2/datahdd2.afs"))
+            self.assertFalse((cache / "datahdd2.afs").samefile(disc / "DOA2/datahdd2.afs"))
             self.assertEqual(list(cache.glob("*.tmp")), [])
 
     def test_rejects_a_stale_runner_before_preparing_disc(self):
@@ -290,6 +366,14 @@ $keyDown.Invoke($form, @($down))
                     patch("run_game.prepare_disc") as prepare:
                 with self.assertRaisesRegex(ValueError, "Runner differs"):
                     run(1)
+                del receipt["runner_sha256"]
+                (root / "private/program/receipt.json").write_text(json.dumps(receipt))
+                with self.assertRaisesRegex(ValueError, "has no runner"):
+                    run(1)
+                if os.name == "nt":
+                    # A build from before the Vulkan renderer asks for a rebuild.
+                    with self.assertRaisesRegex(ValueError, "no Vulkan renderer"):
+                        run(1, vulkan=True)
                 prepare.assert_not_called()
 
 

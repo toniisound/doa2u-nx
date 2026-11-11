@@ -3,13 +3,18 @@
 #include "d3d_draw_shader.h"
 #include "d3d_vblank.h"
 #include "input_keyboard_win32.h"
+#include "overlay_d3d11.h"
+#include "screenshot.h"
+#include "widescreen.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
 #include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 
 #include <cmath>
@@ -243,7 +248,10 @@ struct RecompD3dPresenter {
     bool owns_window_class = false;
     HWND window = nullptr;
     bool close_requested = false;
+    bool fullscreen = false;           // borderless over the monitor; F11 and Alt+Enter toggle it
+    WINDOWPLACEMENT windowed_placement{}; // where leaving fullscreen returns; length 0 = unset
     bool widescreen = false;
+    uint32_t aspect_w = 16u, aspect_h = 9u; // widescreen shape, from RECOMP_D3D_WIDESCREEN
     float scale = 1.0f;         // RECOMP_D3D_SCALE: main target height multiplier
     uint32_t msaa = 1u;         // RECOMP_D3D_MSAA: main target sample count
     float target_scale_x = 1.0f, target_scale_y = 1.0f; // bound target / guest size
@@ -283,6 +291,11 @@ struct RecompD3dPresenter {
     ID3D11Buffer *draw_vertex_buffer = nullptr;
     ID3D11Buffer *draw_index_buffer = nullptr;
     ID3D11Buffer *draw_constant_buffer = nullptr;
+    /* D3D11.1 ring of per-draw constants, bound by offset; null falls back to
+       draw_constant_buffer, which renames on every draw. */
+    ID3D11DeviceContext1 *context1 = nullptr;
+    ID3D11Buffer *constant_ring = nullptr;
+    UINT constant_ring_used = 0u;
     RasterStateEntry raster_states[kRasterStateSlots]{};
     uint32_t raster_state_count = 0u, next_raster_state_slot = 0u;
     UINT draw_vertex_capacity = 0u;
@@ -356,13 +369,13 @@ RecompD3dPresenter *active_presenter;
 
 static bool immediate_present;
 
-/* kernel_config.c reports the Xbox widescreen video flag only when
-   RECOMP_D3D_WIDESCREEN=1, so the game renders 4:3 (or anamorphic 16:9) into
-   the guest backbuffer; the window presents that buffer at the same aspect. */
+/* The display aspect: RECOMP_D3D_WIDESCREEN's shape (16:9 for 1), else 4:3.
+   The game renders 4:3 or that shape anamorphic into its backbuffer; a
+   netplay session takes the host's 4:3 or 16:9, and submitPresent fits it in. */
 uint32_t presentClientWidth(const RecompD3dPresenter *presenter, uint64_t height)
 {
     return static_cast<uint32_t>(presenter->widescreen
-        ? (height * 16u + 8u) / 9u
+        ? (height * presenter->aspect_w + presenter->aspect_h - 1u) / presenter->aspect_h
         : (height * 4u + 1u) / 3u);
 }
 
@@ -388,25 +401,78 @@ uint32_t scaledSize(const RecompD3dPresenter *presenter, uint32_t guest)
         static_cast<uint32_t>(D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION));
 }
 
-/* Beyond the screen the swap chain downsamples into a screen-sized window. */
-uint32_t windowHeight(const RecompD3dPresenter *presenter)
+/* A scaled window covers the primary screen, whatever its shape; scale 1
+   keeps a 480-line window. (DOA3 port, issue #45 there.) */
+uint32_t windowWidth(const RecompD3dPresenter *presenter)
 {
-    return presenter->scale == 1.0f ? presenter->config.height : (std::min)(
-        mainHeight(presenter), static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN)));
+    return presenter->scale == 1.0f
+        ? presentClientWidth(presenter, presenter->config.height)
+        : static_cast<uint32_t>(GetSystemMetrics(SM_CXSCREEN));
 }
 
-/* VRR needs direct flip, which a DWM-scaled swap chain loses; with VRR the
-   swap chain matches the window and the presenter scales into it itself. */
+uint32_t windowHeight(const RecompD3dPresenter *presenter)
+{
+    return presenter->scale == 1.0f
+        ? presenter->config.height : static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN));
+}
+
+/* VRR needs direct flip. */
 bool immediatePresent(const RecompD3dPresenter *presenter)
 {
     return immediate_present && !presenter->vrr;
 }
 
-bool vrrScaled(const RecompD3dPresenter *presenter)
+/* The largest rectangle of the picture's aspect centered in a width x height
+   window; the rest of the screen stays black. */
+D3D11_VIEWPORT fitViewport(float aspect, UINT width, UINT height)
 {
-    return presenter->vrr &&
-        (mainWidth(presenter) != presentClientWidth(presenter, windowHeight(presenter)) ||
-         mainHeight(presenter) != windowHeight(presenter));
+    const float fitted = std::round(height * aspect);
+    const float w = (std::min)(fitted, static_cast<float>(width));
+    const float h = fitted <= width ? static_cast<float>(height) : std::round(width / aspect);
+    return {std::floor((width - w) / 2.0f), std::floor((height - h) / 2.0f), w, h, 0.0f, 1.0f};
+}
+
+/* Borderless fullscreen on the window's monitor. The swap chain follows the
+   client size on the next present. A window that started fullscreen (scale > 1)
+   leaves it for a centered 480-line window. */
+void toggleFullscreen(RecompD3dPresenter *presenter)
+{
+    HWND window = presenter->window;
+    if (!presenter->fullscreen) {
+        MONITORINFO monitor{sizeof monitor};
+        GetWindowPlacement(window, &presenter->windowed_placement);
+        GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
+        SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(window, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left, monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        WINDOWPLACEMENT &placement = presenter->windowed_placement;
+        if (placement.length == 0u) {
+            MONITORINFO monitor{sizeof monitor};
+            RECT origin{}; // Placement coordinates are relative to the primary monitor's work area.
+            if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor) ||
+                !SystemParametersInfoW(SPI_GETWORKAREA, 0, &origin, 0)) {
+                // Zeroed geometry would put the window off-screen; center on the primary screen instead.
+                monitor.rcWork = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+                origin = {};
+            }
+            RECT rect = {0, 0, static_cast<LONG>(presentClientWidth(presenter, presenter->config.height)),
+                static_cast<LONG>(presenter->config.height)};
+            AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0u);
+            const LONG width = rect.right - rect.left, height = rect.bottom - rect.top;
+            const LONG left = (monitor.rcWork.left + monitor.rcWork.right - width) / 2 - origin.left;
+            const LONG top = (monitor.rcWork.top + monitor.rcWork.bottom - height) / 2 - origin.top;
+            placement.length = sizeof placement;
+            placement.showCmd = SW_SHOWNORMAL;
+            placement.rcNormalPosition = {left, top, left + width, top + height};
+        }
+        SetWindowLongPtrW(window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(window, &placement);
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    presenter->fullscreen = !presenter->fullscreen;
 }
 
 LRESULT CALLBACK presenterWindowProc(
@@ -415,8 +481,17 @@ LRESULT CALLBACK presenterWindowProc(
     WPARAM wparam,
     LPARAM lparam)
 {
+    // F11 and Alt+Enter (a WM_SYSKEYDOWN) switch fullscreen and never reach the game.
+    const bool toggle = (message == WM_KEYDOWN && wparam == VK_F11) ||
+        (message == WM_SYSKEYDOWN && wparam == VK_RETURN);
+    if (toggle || (message == WM_KEYUP && wparam == VK_F11) || (message == WM_SYSCHAR && wparam == VK_RETURN)) {
+        if (toggle && (lparam & (1 << 30)) == 0) // not a key repeat
+            toggleFullscreen(reinterpret_cast<RecompD3dPresenter *>(GetWindowLongPtrW(window, GWLP_USERDATA)));
+        return 0;
+    }
     if (message == WM_KEYDOWN || message == WM_KEYUP)
         recomp_input_keyboard_event(static_cast<uint32_t>(wparam), message == WM_KEYDOWN);
+    if (message == WM_CHAR) recomp_input_keyboard_char(static_cast<uint32_t>(wparam));
     if (message == WM_KILLFOCUS || message == WM_DESTROY)
         recomp_input_keyboard_reset();
     if (message == WM_NCCREATE) {
@@ -465,6 +540,7 @@ void releaseGraphics(RecompD3dPresenter *presenter)
         presenter->context->ClearState();
         presenter->context->Flush();
     }
+    recomp_overlay_d3d11_shutdown();
     releaseCom(presenter->present_target_view);
     releaseCom(presenter->vrr_target_view);
     releaseCom(presenter->vrr_source);
@@ -478,6 +554,8 @@ void releaseGraphics(RecompD3dPresenter *presenter)
     for (auto &entry : presenter->raster_states) releaseCom(entry.state);
     presenter->raster_state_count = presenter->next_raster_state_slot = 0u;
     releaseCom(presenter->draw_constant_buffer);
+    releaseCom(presenter->constant_ring);
+    releaseCom(presenter->context1);
     releaseCom(presenter->draw_index_buffer);
     releaseCom(presenter->draw_vertex_buffer);
     for (uint32_t i = 0u; i < presenter->draw_pipeline_count; ++i) {
@@ -566,10 +644,65 @@ void releasePresenter(RecompD3dPresenter *presenter)
     }
 }
 
+/* Each draw's constants take one slot, a multiple of 16 constants as
+   VSSetConstantBuffers1 requires. */
+constexpr UINT kConstantSlotBytes = (kRecompD3dDrawConstantFloats * sizeof(float) + 255u) & ~255u;
+constexpr UINT kConstantRingBytes = 1u << 24;
+
+/* A discard per draw renames the whole constant buffer every time; AMD's D3D11
+   driver stalls on that at a thousand or more draws a frame (issue #69). */
+void createConstantRing(RecompD3dPresenter *presenter)
+{
+    D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+    if (FAILED(presenter->context->QueryInterface(IID_PPV_ARGS(&presenter->context1))) ||
+        FAILED(presenter->device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) ||
+        !options.ConstantBufferOffsetting || !options.MapNoOverwriteOnDynamicConstantBuffer) {
+        releaseCom(presenter->context1);
+        return;
+    }
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = kConstantRingBytes;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(presenter->device->CreateBuffer(&desc, nullptr, &presenter->constant_ring)))
+        releaseCom(presenter->context1);
+    presenter->constant_ring_used = kConstantRingBytes;
+}
+
+/* Writes a draw's constants and binds them to the vertex, geometry and pixel stages. */
+bool bindDrawConstants(RecompD3dPresenter *presenter, const float *constants)
+{
+    const UINT size = kRecompD3dDrawConstantFloats * sizeof(float);
+    ID3D11Buffer *buffer = presenter->constant_ring != nullptr
+        ? presenter->constant_ring : presenter->draw_constant_buffer;
+    const bool wrap = presenter->constant_ring == nullptr ||
+        presenter->constant_ring_used + kConstantSlotBytes > kConstantRingBytes;
+    if (wrap) presenter->constant_ring_used = 0u;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(presenter->context->Map(buffer, 0u,
+            wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0u, &mapped)))
+        return false;
+    std::memcpy(static_cast<uint8_t *>(mapped.pData) + presenter->constant_ring_used, constants, size);
+    presenter->context->Unmap(buffer, 0u);
+    if (presenter->constant_ring == nullptr) {
+        presenter->context->VSSetConstantBuffers(0u, 1u, &buffer);
+        presenter->context->GSSetConstantBuffers(0u, 1u, &buffer);
+        presenter->context->PSSetConstantBuffers(0u, 1u, &buffer);
+        return true;
+    }
+    const UINT first = presenter->constant_ring_used / 16u, count = kConstantSlotBytes / 16u;
+    presenter->context1->VSSetConstantBuffers1(0u, 1u, &buffer, &first, &count);
+    presenter->context1->GSSetConstantBuffers1(0u, 1u, &buffer, &first, &count);
+    presenter->context1->PSSetConstantBuffers1(0u, 1u, &buffer, &first, &count);
+    presenter->constant_ring_used += kConstantSlotBytes;
+    return true;
+}
+
 bool createWindow(RecompD3dPresenter *presenter)
 {
     WNDCLASSEXW window_class{};
-    const uint32_t client_width = presentClientWidth(presenter, windowHeight(presenter));
+    const uint32_t client_width = windowWidth(presenter);
     RECT window_rect = {
         0,
         0,
@@ -578,6 +711,7 @@ bool createWindow(RecompD3dPresenter *presenter)
     };
     /* A scaled window fills the screen; decorations would not fit. */
     const DWORD style = presenter->scale > 1.0f ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+    presenter->fullscreen = style == WS_POPUP;
 
     presenter->instance = GetModuleHandleW(nullptr);
     window_class.cbSize = sizeof window_class;
@@ -630,7 +764,8 @@ bool createWindow(RecompD3dPresenter *presenter)
 
 HRESULT createDeviceWithDriver(
     RecompD3dPresenter *presenter,
-    D3D_DRIVER_TYPE driver_type)
+    D3D_DRIVER_TYPE driver_type,
+    IDXGIAdapter *adapter)
 {
     const bool immediate = immediatePresent(presenter);
     DXGI_SWAP_CHAIN_DESC swap_chain_desc{};
@@ -641,10 +776,8 @@ HRESULT createDeviceWithDriver(
     };
     D3D_FEATURE_LEVEL selected_feature_level{};
 
-    swap_chain_desc.BufferDesc.Width = vrrScaled(presenter)
-        ? presentClientWidth(presenter, windowHeight(presenter)) : mainWidth(presenter);
-    swap_chain_desc.BufferDesc.Height = vrrScaled(presenter)
-        ? windowHeight(presenter) : mainHeight(presenter);
+    swap_chain_desc.BufferDesc.Width = windowWidth(presenter);
+    swap_chain_desc.BufferDesc.Height = windowHeight(presenter);
     swap_chain_desc.BufferDesc.RefreshRate.Numerator = 0u;
     swap_chain_desc.BufferDesc.RefreshRate.Denominator = 1u;
     swap_chain_desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -660,8 +793,8 @@ HRESULT createDeviceWithDriver(
     if (presenter->vrr) swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     HRESULT result = D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        driver_type,
+        adapter,
+        adapter != nullptr ? D3D_DRIVER_TYPE_UNKNOWN : driver_type,
         nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         feature_levels,
@@ -673,6 +806,13 @@ HRESULT createDeviceWithDriver(
         &selected_feature_level,
         &presenter->context);
     // Flip chains use the per-chain limit; immediate presents retain the default.
+    // The window handles Alt+Enter itself; DXGI's own switch would take exclusive fullscreen.
+    if (SUCCEEDED(result)) {
+        IDXGIFactory *factory = nullptr;
+        if (SUCCEEDED(presenter->swap_chain->GetParent(IID_PPV_ARGS(&factory))))
+            factory->MakeWindowAssociation(presenter->window, DXGI_MWA_NO_ALT_ENTER);
+        releaseCom(factory);
+    }
     if (SUCCEEDED(result) && !immediate) {
         IDXGISwapChain2 *chain = nullptr;
         result = presenter->swap_chain->QueryInterface(IID_PPV_ARGS(&chain));
@@ -682,10 +822,38 @@ HRESULT createDeviceWithDriver(
     return result;
 }
 
+/* Hybrid laptops list the integrated GPU first, and the runner is a child of
+   DOA2U.exe, so a per-app GPU setting on the launcher never reaches it. Ask
+   DXGI for the fastest GPU (needs Windows 10 1803); null falls back to the default. */
+IDXGIAdapter1 *highPerformanceAdapter()
+{
+    IDXGIFactory6 *factory = nullptr;
+    IDXGIAdapter1 *adapter = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        factory->EnumAdapterByGpuPreference(
+            0u, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+        releaseCom(factory);
+    }
+    if (adapter != nullptr) {
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) releaseCom(adapter);
+        else std::fprintf(stderr, "recomp d3d presenter: gpu %ls\n", desc.Description);
+    }
+    return adapter;
+}
+
 HRESULT createGraphics(RecompD3dPresenter *presenter)
 {
+    IDXGIAdapter1 *adapter = highPerformanceAdapter();
     HRESULT hardware_result = createDeviceWithDriver(
-        presenter, D3D_DRIVER_TYPE_HARDWARE);
+        presenter, D3D_DRIVER_TYPE_HARDWARE, adapter);
+    releaseCom(adapter);
+    if (FAILED(hardware_result)) {
+        releaseGraphics(presenter);
+        hardware_result = createDeviceWithDriver(
+            presenter, D3D_DRIVER_TYPE_HARDWARE, nullptr);
+    }
 
     if (SUCCEEDED(hardware_result)) {
         presenter->driver_name = "hardware";
@@ -698,7 +866,7 @@ HRESULT createGraphics(RecompD3dPresenter *presenter)
             static_cast<unsigned long>(hardware_result));
         releaseGraphics(presenter);
         const HRESULT warp_result = createDeviceWithDriver(
-            presenter, D3D_DRIVER_TYPE_WARP);
+            presenter, D3D_DRIVER_TYPE_WARP, nullptr);
         if (FAILED(warp_result)) {
             std::fprintf(
                 stderr,
@@ -754,7 +922,8 @@ HRESULT createGraphics(RecompD3dPresenter *presenter)
         }
         releaseCom(guest_buffer);
     }
-    if (SUCCEEDED(result) && vrrScaled(presenter)) {
+    // Also the source of a picture whose aspect differs from the window's.
+    if (SUCCEEDED(result)) {
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = mainWidth(presenter);
         desc.Height = mainHeight(presenter);
@@ -1180,6 +1349,7 @@ RecompD3dPresenterError submitClear(
 /* Compiled draw shaders, keyed by a hash of target, entry point and source. Shared
    by the boot precompile thread and the render worker; blobs live until exit. */
 std::mutex compiled_shaders_lock;
+thread_local bool precompiling; // the boot precompile thread, whose compiles hold up no frame
 std::unordered_map<uint64_t, ID3DBlob *> compiled_shaders;
 
 /* RECOMP_SHADER_CACHE keeps compiled draw shaders as <hash>.dxbc, so a later launch
@@ -1301,6 +1471,7 @@ bool compileDrawShader(
     }
 
     ID3DBlob *errors = nullptr;
+    const auto compile_start = std::chrono::steady_clock::now();
     const HRESULT result = D3DCompile(
         source,
         std::strlen(source),
@@ -1313,7 +1484,12 @@ bool compileDrawShader(
         0u,
         blob,
         &errors);
-
+    // A compile on the render worker holds up the frame that needed it; the hash names its cache file.
+    if (!precompiling) {
+        std::fprintf(stderr, "recomp d3d presenter: %s draw shader %s %016llx in %.1f ms\n",
+            FAILED(result) ? "failed to compile" : "compiled", target, static_cast<unsigned long long>(hash),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
+    }
     if (FAILED(result)) {
         std::fprintf(
             stderr,
@@ -1337,6 +1513,7 @@ bool compileDrawShader(
 void precompileDrawShaders(const std::atomic<bool> *stop)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    precompiling = true;
     const ULONGLONG start = GetTickCount64();
     uint32_t compiled = 0u;
     unsigned loaded = 0u;
@@ -1508,7 +1685,7 @@ bool ensureSharedDrawState(RecompD3dPresenter *presenter)
        stage-1 texture matrix (16), bump matrices, bump fog and fog color (16),
        the extra reflection world-view/normal transforms (96), and the stage-2
        texture matrix and flags (20), then scaled receiver depth bias (4), then the
-       projected stage 1-3 matrices, count and slots (56). */
+       projected stage 1-3 matrices, count and slots (56), then table fog (8). */
     constant_desc.ByteWidth = kRecompD3dDrawConstantFloats * sizeof(float);
     constant_desc.Usage = D3D11_USAGE_DYNAMIC;
     constant_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -1518,6 +1695,7 @@ bool ensureSharedDrawState(RecompD3dPresenter *presenter)
     if (FAILED(result)) {
         return false;
     }
+    createConstantRing(presenter);
 
     /* Zero-initialized draw commands keep the original linear/wrap sampler. */
     D3D11_SAMPLER_DESC sampler_desc{};
@@ -1629,23 +1807,6 @@ bool ensureDynamicBuffer(
         return false;
     }
     capacity = size;
-    return true;
-}
-
-bool uploadBuffer(
-    RecompD3dPresenter *presenter,
-    ID3D11Buffer *buffer,
-    const void *source,
-    size_t size)
-{
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-
-    if (FAILED(presenter->context->Map(
-            buffer, 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped))) {
-        return false;
-    }
-    std::memcpy(mapped.pData, source, size);
-    presenter->context->Unmap(buffer, 0u);
     return true;
 }
 
@@ -2596,8 +2757,9 @@ RecompD3dPresenterError submitDraw(
     }
     if (draw.stage1_alpha_mask) {
         if (draw.has_alpha_mask || draw.has_reflection || draw.program_count || draw.distortion ||
-            draw.four_tap_filter || (draw.stage1_kill_only ? layout.texcoord_count == 0u
-                : layout.texcoord_count != 2u)) return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+            draw.four_tap_filter || (draw.stage1_kill_only || draw.stage1_mask_transform
+                ? layout.texcoord_count == 0u : layout.texcoord_count != 2u))
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
         RecompD3dPresenterDrawCommand mask{};
         mask.texture = draw.reflection_texture;
         mask.texture_bytes = draw.reflection_bytes;
@@ -2710,11 +2872,7 @@ RecompD3dPresenterError submitDraw(
     if (!uploadRing(presenter, &presenter->draw_index_buffer,
             presenter->draw_index_capacity, presenter->draw_index_used,
             upload_indices, index_size, D3D11_BIND_INDEX_BUFFER, index_offset) ||
-        !uploadBuffer(
-            presenter,
-            presenter->draw_constant_buffer,
-            draw_constants,
-            sizeof draw_constants)) {
+        !bindDrawConstants(presenter, draw_constants)) {
         return RECOMP_D3D_PRESENTER_HOST_FAILURE;
     }
 
@@ -2726,13 +2884,8 @@ RecompD3dPresenterError submitDraw(
         presenter->draw_index_buffer, DXGI_FORMAT_R16_UINT, index_offset);
     presenter->context->IASetPrimitiveTopology(topology);
     presenter->context->VSSetShader(pipeline->vertex_shader, nullptr, 0u);
-    presenter->context->VSSetConstantBuffers(
-        0u, 1u, &presenter->draw_constant_buffer);
     presenter->context->GSSetShader(geometry_line ? pipeline->geometry_shader : nullptr, nullptr, 0u);
-    presenter->context->GSSetConstantBuffers(0u, 1u, &presenter->draw_constant_buffer);
     presenter->context->PSSetShader(pipeline->pixel_shader, nullptr, 0u);
-    presenter->context->PSSetConstantBuffers(
-        0u, 1u, &presenter->draw_constant_buffer);
     const bool volume = draw.texture.volume_depth != 0u;
     ID3D11ShaderResourceView *views[] = {volume ? nullptr : texture_view, mask_view, bump_view,
         volume ? texture_view : nullptr};
@@ -2939,17 +3092,13 @@ RecompD3dPresenterError submitDraw(
     return RECOMP_D3D_PRESENTER_OK;
 }
 
-bool pumpMessages()
+/* The presenter thread pumps between packets. Dispatching here could start
+   a window drag's modal loop in the middle of a frame, which nothing can
+   draw through. */
+bool quitPending()
 {
     MSG message{};
-    while (PeekMessageW(&message, nullptr, 0u, 0u, PM_REMOVE)) {
-        if (message.message == WM_QUIT) {
-            return false;
-        }
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
-    return true;
+    return PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE) != 0;
 }
 
 bool frameDumpDue(ULONGLONG now, unsigned interval_ms, ULONGLONG &next)
@@ -2969,7 +3118,8 @@ void writeBackBufferBmp(
 /* RECOMP_D3D_FRAME_DUMP names the BMP path; AT and COUNT select presents.
    INTERVAL_MS optionally spaces captures in host time. Capture stays inside
    the renderer, without cross-process window painting or missed-frame bursts. */
-void dumpBackBufferOnce(RecompD3dPresenter *presenter, uint32_t present_count)
+void dumpBackBufferOnce(RecompD3dPresenter *presenter, uint32_t present_count,
+    ID3D11Texture2D *source)
 {
     const char *path = std::getenv("RECOMP_D3D_FRAME_DUMP");
     if (path == nullptr) {
@@ -3013,7 +3163,7 @@ void dumpBackBufferOnce(RecompD3dPresenter *presenter, uint32_t present_count)
         path = burst_path;
     }
 
-    writeBackBufferBmp(presenter, path, present_count);
+    writeBackBufferBmp(presenter, path, present_count, source);
     presenter->next_frame_dump_ms = GetTickCount64() + interval_ms;
 }
 
@@ -3404,6 +3554,45 @@ void recordFrameStatistics(RecompD3dPresenter *presenter,
     presenter->last_stat_refresh = stats.PresentRefreshCount;
 }
 
+// Saves the game's frame before the overlay (source, or the window's back
+// buffer), through a CPU-readable copy. Only a requested screenshot pays for the wait.
+void saveScreenshot(RecompD3dPresenter *presenter, ID3D11Texture2D *source)
+{
+    ID3D11Texture2D *back_buffer = nullptr;
+    if (source != nullptr) {
+        back_buffer = source;
+        back_buffer->AddRef();
+    } else {
+        presenter->swap_chain->GetBuffer(0u, IID_PPV_ARGS(&back_buffer));
+    }
+    bool saved = false;
+    if (back_buffer == nullptr) {
+        std::fprintf(stderr, "recomp screenshot: could not read the back buffer\n");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    back_buffer->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0u;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0u;
+    ID3D11Texture2D *staging = nullptr;
+    if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && desc.SampleDesc.Count == 1u &&
+        SUCCEEDED(presenter->device->CreateTexture2D(&desc, nullptr, &staging))) {
+        presenter->context->CopyResource(staging, back_buffer);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(presenter->context->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
+            recomp_screenshot_save(static_cast<const uint8_t *>(mapped.pData),
+                desc.Width, desc.Height, mapped.RowPitch);
+            saved = true;
+            presenter->context->Unmap(staging, 0u);
+        }
+    }
+    if (!saved) std::fprintf(stderr, "recomp screenshot: could not read the back buffer\n");
+    releaseCom(staging);
+    releaseCom(back_buffer);
+}
+
 RecompD3dPresenterError submitPresent(
     RecompD3dPresenter *presenter,
     const RecompD3dPresenterPresentCommand &present)
@@ -3414,7 +3603,7 @@ RecompD3dPresenterError submitPresent(
     /* Three distinct conditions used to collapse into one HOST_FAILURE code,
        so a stop here named the symptom and not the cause. Name each one. */
     {
-        const bool pumped = pumpMessages();
+        const bool pumped = !quitPending();
         if (pumped && presenter->close_requested) {
             return RECOMP_D3D_PRESENTER_CLOSED;
         }
@@ -3437,11 +3626,38 @@ RecompD3dPresenterError submitPresent(
        unconditionally meant the throttled path was never actually throttled:
        every frame was retired immediately and only the blocking behaviour
        changed. Pace to one refresh unless immediate presenting is asked for. */
-    if (!renderOutput(presenter, presenter->vrr_target_view != nullptr
-            ? presenter->vrr_target_view : presenter->present_target_view)) {
+    /* The swap chain follows the window, also a maximized or resized 480 one,
+       so DWM never stretches it out of shape. */
+    DXGI_SWAP_CHAIN_DESC chain{};
+    RECT client{};
+    presenter->swap_chain->GetDesc(&chain);
+    if (GetClientRect(presenter->window, &client) && client.right > 0 && client.bottom > 0 &&
+        (static_cast<UINT>(client.right) != chain.BufferDesc.Width ||
+            static_cast<UINT>(client.bottom) != chain.BufferDesc.Height)) {
+        presenter->context->ClearState();
+        releaseCom(presenter->present_target_view);
+        presenter->context->Flush();
+        chain.BufferDesc.Width = static_cast<UINT>(client.right);
+        chain.BufferDesc.Height = static_cast<UINT>(client.bottom);
+        ID3D11Texture2D *back_buffer = nullptr;
+        const bool resized = SUCCEEDED(presenter->swap_chain->ResizeBuffers(0u,
+                chain.BufferDesc.Width, chain.BufferDesc.Height, DXGI_FORMAT_UNKNOWN, chain.Flags)) &&
+            SUCCEEDED(presenter->swap_chain->GetBuffer(0u, IID_PPV_ARGS(&back_buffer))) &&
+            SUCCEEDED(presenter->device->CreateRenderTargetView(
+                back_buffer, nullptr, &presenter->present_target_view));
+        releaseCom(back_buffer);
+        if (!resized) return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    // A picture of another size or aspect than the window is drawn into it, with black bars.
+    const float window_aspect = presenter->widescreen
+        ? static_cast<float>(presenter->aspect_w) / presenter->aspect_h : 4.0f / 3.0f;
+    const float shown = present.aspect > 0.0f ? present.aspect : window_aspect;
+    const bool drawn = chain.BufferDesc.Width != mainWidth(presenter) ||
+        chain.BufferDesc.Height != mainHeight(presenter) || std::fabs(shown - window_aspect) > 0.001f;
+    if (!renderOutput(presenter, drawn ? presenter->vrr_target_view : presenter->present_target_view)) {
         return RECOMP_D3D_PRESENTER_HOST_FAILURE;
     }
-    if (presenter->vrr_target_view != nullptr) {
+    if (drawn) {
         auto *context = presenter->context;
         D3D11_TEXTURE2D_DESC window{};
         ID3D11Texture2D *back_buffer = nullptr;
@@ -3449,9 +3665,10 @@ RecompD3dPresenterError submitPresent(
         if (back_buffer == nullptr) return RECOMP_D3D_PRESENTER_HOST_FAILURE;
         back_buffer->GetDesc(&window);
         releaseCom(back_buffer);
-        const D3D11_VIEWPORT viewport = {0.0f, 0.0f,
-            static_cast<float>(window.Width), static_cast<float>(window.Height), 0.0f, 1.0f};
+        const D3D11_VIEWPORT viewport = fitViewport(shown, window.Width, window.Height);
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         context->ClearState();
+        context->ClearRenderTargetView(presenter->present_target_view, black);
         context->RSSetViewports(1u, &viewport);
         context->OMSetRenderTargets(1u, &presenter->present_target_view, nullptr);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3462,13 +3679,21 @@ RecompD3dPresenterError submitPresent(
         context->Draw(3u, 0u);
         context->ClearState();
     }
-    // Capture the rendered buffer before flip presentation releases it.
-    dumpBackBufferOnce(presenter, presenter->present_count + 1u);
+    // Capture the rendered buffer before flip presentation releases it, at the
+    // main target's size: a frame drawn into the window is dumped before fitting.
+    ID3D11Texture2D *frame = nullptr;
+    if (drawn) {
+        ID3D11Resource *output = nullptr;
+        presenter->vrr_source->GetResource(&output);
+        output->QueryInterface(IID_PPV_ARGS(&frame));
+        releaseCom(output);
+    }
+    dumpBackBufferOnce(presenter, presenter->present_count + 1u, frame);
     if (presenter->draw_log_active) {
         char path[1024];
         std::snprintf(path, sizeof path, "%s-%u.bmp",
             presenter->draw_log_trigger, presenter->present_count + 1u);
-        writeBackBufferBmp(presenter, path, presenter->present_count + 1u);
+        writeBackBufferBmp(presenter, path, presenter->present_count + 1u, frame);
         // Offscreen targets too (reflections, glow), as their single-sample views hold them.
         for (RenderTargetEntry &entry : presenter->render_targets) {
             ID3D11Resource *resource = nullptr;
@@ -3497,6 +3722,19 @@ RecompD3dPresenterError submitPresent(
         presenter->context->PSSetShaderResources(0u, 1u, &none);
         copyGuestBuffer(presenter, presenter->previous_frame);
         if (presenter->scale != 1.0f) presenter->context->GenerateMips(presenter->previous_frame_sample);
+    }
+
+    // The runtime's overlay text goes on the window, not the game's back
+    // buffer, which the game reads back as its front buffer.
+    {
+        if (recomp_screenshot_take_request()) saveScreenshot(presenter, frame);
+        releaseCom(frame);
+        DXGI_SWAP_CHAIN_DESC window{};
+        presenter->swap_chain->GetDesc(&window);
+        RecompOverlayText overlay;
+        recomp_overlay_take(&overlay);
+        recomp_overlay_d3d11_draw(presenter->device, presenter->context, presenter->present_target_view,
+            window.BufferDesc.Width, window.BufferDesc.Height, &overlay);
     }
 
     const auto clock_ms = [] {
@@ -3608,7 +3846,7 @@ RecompD3dPresenterError submitPresent(
     if (!presenter->first_present_reported) {
         ShowWindow(presenter->window, SW_SHOW);
         UpdateWindow(presenter->window);
-        if (!pumpMessages()) {
+        if (quitPending()) {
             return RECOMP_D3D_PRESENTER_HOST_FAILURE;
         }
         if (presenter->close_requested) {
@@ -3694,8 +3932,10 @@ RecompD3dPresenterError d3d_backend_create(
         return RECOMP_D3D_PRESENTER_OUT_OF_MEMORY;
     }
     created->config = *config;
-    const char *widescreen = std::getenv("RECOMP_D3D_WIDESCREEN");
-    created->widescreen = widescreen != nullptr && std::strcmp(widescreen, "0") != 0;
+    unsigned aspect_w = 16u, aspect_h = 9u;
+    created->widescreen = recomp_widescreen(&aspect_w, &aspect_h);
+    created->aspect_w = aspect_w;
+    created->aspect_h = aspect_h;
     const char *performance = std::getenv("RECOMP_PERF_COUNTER");
     created->performance_counter = performance != nullptr && std::strcmp(performance, "1") == 0;
     created->draw_log_trigger = std::getenv("RECOMP_D3D_DRAW_LOG");
@@ -4044,6 +4284,17 @@ RecompD3dPresenterError d3d_backend_destroy(
 void d3d_backend_set_immediate_present(bool enabled)
 {
     immediate_present = enabled;
+}
+
+/* The swap chain, its VRR output and the targets are sized at creation, so
+   PC Settings' quality rows apply at the next start here. */
+void d3d_backend_set_quality(float, uint32_t, bool)
+{
+}
+
+bool d3d_backend_quality_live()
+{
+    return false;
 }
 
 D3dBackendVisibilityPoll d3d_backend_poll_visibility(

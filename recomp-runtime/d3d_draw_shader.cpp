@@ -72,6 +72,8 @@ constexpr char kDrawShaderPrologue[] =
     "    row_major float4x4 projected_transform[3];\n"
     "    float4 projected_stages;\n"
     "    float4 projected_slots;\n"
+    "    float4 table_fog;\n"
+    "    float4 table_fog_color;\n"
     "}\n"
     "Texture2D guest_texture : register(t0);\n"
     "Texture3D guest_volume : register(t3);\n"
@@ -149,6 +151,7 @@ int buildDrawShaderSource(
         "    float projected_q : TEXCOORD7;\n"
         "    float2 reflection_coord2 : TEXCOORD10;\n"
         "    float3 projected_eye : TEXCOORD12;\n"
+        "    float table_fog : TEXCOORD13;\n"
         "%s"
         "};\n"
         "VSOut vs_main(VSIn input) {\n"
@@ -160,6 +163,8 @@ int buildDrawShaderSource(
         "    output.reflection_coord = float2(0, 0);\n"
         "%s"
         "%s"
+        /* Planar eye depth for table fog, from clip w. */
+        "    output.table_fog = output.position.w * table_fog.w + table_fog_color.w;\n"
         "    return output;\n"
         "}\n"
         "float4 ps_main(VSOut input) : SV_TARGET {\n"
@@ -229,11 +234,19 @@ int buildDrawShaderSource(
         "#endif\n"
         /* Fixed function adds specular after the texture stages, textured or not. */
         "    if (directional_flags.w > 0.5f) shaded.rgb += input.lit_specular;\n"
-        /* A stage-1 mask; z > 1.5 adds its ALPHAKILL, and z > 2.5 only kills. */
+        /* A stage-1 mask; z 2 adds its ALPHAKILL, z 3 only kills, and z 4
+           multiplies at transformed UV0. */
         "    if (reflection_flags.z > 0.5f) {\n"
         "        float mask = alpha_mask.SampleBias(mask_sampler, input.reflection_coord, reflection_flags.w).a;\n"
-        "        if (reflection_flags.z > 1.5f && mask == 0.0f) discard;\n"
-        "        if (reflection_flags.z < 2.5f) shaded.a *= mask;\n"
+        "        if (reflection_flags.z > 1.5f && reflection_flags.z < 3.5f && mask == 0.0f) discard;\n"
+        "        if (reflection_flags.z < 2.5f || reflection_flags.z > 3.5f) shaded.a *= mask;\n"
+        "    }\n"
+        /* Table fog per pixel: x 1 linear, 2 exp, 3 exp2; y end or density, z 1/(end - start). */
+        "    if (table_fog.x > 0.5f) {\n"
+        "        float d = max(input.table_fog, 0.0f);\n"
+        "        float f = table_fog.x < 1.5f ? (table_fog.y - d) * table_fog.z\n"
+        "            : table_fog.x < 2.5f ? exp(-d * table_fog.y) : exp(-d * d * table_fog.y * table_fog.y);\n"
+        "        shaded.rgb = lerp(table_fog_color.rgb, shaded.rgb, saturate(f));\n"
         "    }\n"
         /* NV2A compares rounded 8-bit alpha. Function values follow
            RecompD3dCompareFunc, from NEVER (0) to ALWAYS (7). */
@@ -277,10 +290,13 @@ int buildDrawShaderSource(
               "    output.texcoord2 = input.texcoord2;\n"
               "    output.texcoord3 = input.texcoord3;\n"
             : layout.texcoord_count == 2u ? "    output.texcoord1 = input.texcoord1;\n" : "",
-        /* z > 2.5: a kill-only stage-1 mask reads UV0. */
+        /* z 3: a kill-only stage-1 mask reads UV0; z 4 reads UV0 through TEXTURE1 (COUNT2). */
         layout.texcoord_count == 2u
-            ? "    if (reflection_flags.z > 0.5f) output.reflection_coord = reflection_flags.z > 2.5f ? input.texcoord : input.texcoord1;\n"
-            : has_texcoord ? "    if (reflection_flags.z > 2.5f) output.reflection_coord = input.texcoord;\n" : "",
+            ? "    if (reflection_flags.z > 0.5f) output.reflection_coord = reflection_flags.z > 3.5f\n"
+              "        ? mul(float4(input.texcoord, 1, 0), reflection_transform1).xy\n"
+              "        : reflection_flags.z > 2.5f ? input.texcoord : input.texcoord1;\n"
+            : has_texcoord ? "    if (reflection_flags.z > 2.5f) output.reflection_coord = reflection_flags.z > 3.5f\n"
+                             "        ? mul(float4(input.texcoord, 1, 0), reflection_transform1).xy : input.texcoord;\n" : "",
         has_texcoord && !layout.pretransformed
             ? (has_normal
                 /* Mesh-UV reflections (x == 2) may pair with stage-0 texgen. */
@@ -539,6 +555,7 @@ bool recomp_d3d_draw_shader_source(
             "        if (da<0 || db<0) {\n"
             "            float t=da/(da-db); VSOut c=(VSOut)0;\n"
             "            c.position=lerp(a.position,b.position,t); c.color=lerp(a.color,b.color,t);\n"
+            "            c.table_fog=lerp(a.table_fog,b.table_fog,t);\n"
             "            if (da<0) a=c; else b=c;\n"
             "        }\n"
             "    }\n"
@@ -628,6 +645,12 @@ bool recomp_d3d_draw_constants(
             constants_out[13] = 1.0f + (0.5f - viewport.TopLeftY) * constants_out[5];
             constants_out[14] = -viewport.MinDepth * constants_out[10];
             constants_out[15] = 1.0f;
+            // The 2D layer's fit to the screen shape scales clip X and Y about the viewport center.
+            for (unsigned axis = 0; axis < 2; ++axis) {
+                const float scale = draw.layer_scale[axis];
+                if (!layout.pretransformed || scale <= 0.0f) continue;
+                for (unsigned row = 0; row < 16; row += 4) constants_out[row + axis] *= scale;
+            }
         }
         if (screen_offset) {
             const float width = sub_viewport ? draw.viewport[2] : viewport.Width;
@@ -777,8 +800,22 @@ bool recomp_d3d_draw_constants(
         projected[48] = static_cast<float>(draw.projected_stage_count);
         for (unsigned i = 0u; i < 3u; ++i) projected[52 + i] = static_cast<float>(draw.projected_slots[i]);
     }
+    if (draw.fog_mode != 0u && !draw.program_count) {
+        float *fog = constants_out + 140 + 192 * 4 + 512 + 4 + 56;
+        fog[0] = static_cast<float>(draw.fog_mode);
+        fog[1] = draw.fog_mode == 1u ? draw.fog_end : draw.fog_density;
+        fog[2] = draw.fog_mode == 1u ? 1.0f / (draw.fog_end - draw.fog_start) : 0.0f;
+        fog[3] = draw.fog_depth[0];
+        fog[4] = ((draw.fog_color >> 16u) & 0xffu) / 255.0f;
+        fog[5] = ((draw.fog_color >> 8u) & 0xffu) / 255.0f;
+        fog[6] = (draw.fog_color & 0xffu) / 255.0f;
+        fog[7] = draw.fog_depth[1];
+    }
     if (draw.stage1_alpha_mask)
-        constants_out[138] = draw.stage1_kill_only ? 3.0f : draw.stage1_alpha_kill ? 2.0f : 1.0f;
+        constants_out[138] = draw.stage1_mask_transform ? 4.0f
+            : draw.stage1_kill_only ? 3.0f : draw.stage1_alpha_kill ? 2.0f : 1.0f;
+    if (draw.stage1_mask_transform)
+        std::memcpy(constants_out + 140 + 192 * 4 + 364, draw.reflection_stage1_transform, 64u);
     if (draw.bump_env) {
         float *bump = constants_out + 140 + 192 * 4 + 380;
         std::memcpy(bump, draw.bump_matrices, sizeof draw.bump_matrices);

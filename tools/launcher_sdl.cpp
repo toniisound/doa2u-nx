@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Linux launcher: pick resolution, anti-aliasing, widescreen, 5.1 surround and
+// Linux launcher: pick resolution, anti-aliasing, widescreen, 5.1 surround, the free camera and
 // the intro skip, remember them in private/launcher.json, then exit 0 so
 // run_game.py starts the game. Mirrors tools/launcher.cs without the build page
 // (./build_game.sh builds) and with MSAA up to SDL_GPU's 8x: the backdrop
@@ -28,16 +28,32 @@ constexpr float kInfoY = 262, kLabelY = 296, kValueY = 310, kValueH = 16, kTabY 
 
 const int kHeights[] = {480, 720, 1080, 1440, 2160};
 const int kSamples[] = {1, 2, 4, 8};
+const char *const kScreens[] = {"4:3", "16:9", "16:10", "ULTRAWIDE", "32:9"};
 
-enum Item { RESOLUTION, MSAA, SMAA, WIDESCREEN, SURROUND, SKIP_INTRO, UNLOCKS, UPDATE, CHECK_UPDATES, ITEM_COUNT };
-const char *kLabels[] = {"RESOLUTION", "MSAA", "SMAA", "SCREEN", "OUTPUT", "INTRO MOVIES", "UNLOCKS", "UPDATE", "CHECK AT START"};
+enum Item { RESOLUTION, MSAA, SMAA, WIDESCREEN, SURROUND, SKIP_INTRO, UNLOCKS, CPU_COSTUMES, FREE_CAMERA, UPDATE, CHECK_UPDATES, ITEM_COUNT };
+// One row per Item, in Item order: its label and how many values it cycles through.
+struct Row { const char *label; int count; };
+const Row kRows[] = {
+    {"RESOLUTION", static_cast<int>(std::size(kHeights))},
+    {"MSAA", static_cast<int>(std::size(kSamples))},
+    {"SMAA", 2},
+    {"SCREEN", static_cast<int>(std::size(kScreens))},
+    {"OUTPUT", 2},
+    {"INTRO MOVIES", 2},
+    {"UNLOCKS", 2},
+    {"CPU COSTUMES", 2},
+    {"FREE CAMERA", 2},
+    {"UPDATE", 2},
+    {"CHECK AT START", 2},
+};
+static_assert(std::size(kRows) == ITEM_COUNT, "kRows needs one row per Item");
 
 struct Page { const char *name, *info; std::vector<int> rows; };
 const Page kPages[] = {
     {"VIDEO SETTINGS", "Sets resolution, anti-aliasing and screen shape", {RESOLUTION, MSAA, SMAA, WIDESCREEN}},
     {"AUDIO SETTINGS", "Chooses stereo or the game's own 5.1 surround mix", {SURROUND}},
     {"MOVIES", "Plays or skips the logo and opening movies at boot", {SKIP_INTRO}},
-    {"GAMEPLAY", "Offers every character and costume, or leaves them to earn through play", {UNLOCKS}},
+    {"GAMEPLAY", "Chooses the unlocks, CPU costumes and whether the free camera is allowed", {UNLOCKS, CPU_COSTUMES, FREE_CAMERA}},
     {"START GAME", "Saves these settings and starts the game", {}},
     {"UPDATE", "Checks GitHub for a newer release and installs it", {UPDATE, CHECK_UPDATES}},
     {"EXIT", "Closes the launcher", {}},
@@ -49,11 +65,13 @@ struct Settings {
     int height = 0;
     int msaa = 8;
     bool smaa = true;
-    bool widescreen = true;
+    std::string screen = "16:9"; // "4:3", "16:9", "16:10", "32:9" or an ultrawide "W:H"
     bool surround = false;
     bool skip_intro = false;
     bool check_updates = true;
     bool unlock_all = true;
+    bool random_cpu_costumes = false;
+    bool free_camera = false;
 };
 
 struct Color { Uint8 r, g, b; };
@@ -83,11 +101,15 @@ Settings loadSettings(const std::string &path)
     if (jsonValue(text, "height", value)) settings.height = std::atoi(value.c_str());
     if (jsonValue(text, "msaa", value)) settings.msaa = std::atoi(value.c_str());
     if (jsonValue(text, "smaa", value)) settings.smaa = value == "true";
-    if (jsonValue(text, "widescreen", value)) settings.widescreen = value == "true";
+    // Settings saved before 16:10 hold only a widescreen flag.
+    if (jsonValue(text, "widescreen", value)) settings.screen = value == "true" ? "16:9" : "4:3";
+    if (jsonValue(text, "screen", value) && value.size() > 2) settings.screen = value.substr(1, value.size() - 2);
     if (jsonValue(text, "surround", value)) settings.surround = value == "true";
     if (jsonValue(text, "skipIntro", value)) settings.skip_intro = value == "true";
     if (jsonValue(text, "checkUpdates", value)) settings.check_updates = value == "true";
     if (jsonValue(text, "unlockAll", value)) settings.unlock_all = value == "true";
+    if (jsonValue(text, "freeCamera", value)) settings.free_camera = value == "true";
+    if (jsonValue(text, "randomCpuCostumes", value)) settings.random_cpu_costumes = value == "true";
     return settings;
 }
 
@@ -96,11 +118,14 @@ bool saveSettings(const std::string &path, const Settings &settings)
     std::ofstream file(path, std::ios::trunc);
     file << "{\n  \"height\": " << settings.height << ",\n  \"msaa\": " << settings.msaa
          << ",\n  \"smaa\": " << (settings.smaa ? "true" : "false")
-         << ",\n  \"widescreen\": " << (settings.widescreen ? "true" : "false")
+         << ",\n  \"widescreen\": " << (settings.screen != "4:3" ? "true" : "false")
+         << ",\n  \"screen\": \"" << settings.screen << '"'
          << ",\n  \"skipIntro\": " << (settings.skip_intro ? "true" : "false")
          << ",\n  \"checkUpdates\": " << (settings.check_updates ? "true" : "false")
          << ",\n  \"unlockAll\": " << (settings.unlock_all ? "true" : "false")
-         << ",\n  \"surround\": " << (settings.surround ? "true" : "false") << "\n}\n";
+         << ",\n  \"surround\": " << (settings.surround ? "true" : "false")
+         << ",\n  \"freeCamera\": " << (settings.free_camera ? "true" : "false")
+         << ",\n  \"randomCpuCostumes\": " << (settings.random_cpu_costumes ? "true" : "false") << "\n}\n";
     return static_cast<bool>(file);
 }
 
@@ -148,19 +173,20 @@ struct Launcher {
         switch (item) {
         case RESOLUTION: return std::to_string(kHeights[choice[item]]) + "P";
         case MSAA: return kSamples[choice[item]] == 1 ? "OFF" : std::to_string(kSamples[choice[item]]) + "X";
-        case WIDESCREEN: return choice[item] ? "16:9" : "4:3";
+        case WIDESCREEN: return kScreens[choice[item]];
         case SURROUND: return choice[item] ? "5.1" : "STEREO";
         case SKIP_INTRO: return choice[item] ? "SKIP" : "PLAY";
         case UPDATE: return update != nullptr ? "WORKING" : pending.empty() ? "CHECK" : "INSTALL";
         case UNLOCKS: return choice[item] ? "EARN" : "EVERYTHING";
+        case CPU_COSTUMES: return choice[item] ? "RANDOM" : "DEFAULT";
         default: return choice[item] ? "ON" : "OFF";
         }
     }
 
     void change(int item, int step)
     {
-        static const int counts[] = {static_cast<int>(std::size(kHeights)), static_cast<int>(std::size(kSamples)), 2, 2, 2, 2, 2, 2, 2};
-        choice[item] = (choice[item] + counts[item] + step) % counts[item];
+        const int count = kRows[item].count;
+        choice[item] = (choice[item] + count + step) % count;
     }
 
     // Checks for a newer release, or installs the one found. A quiet check says nothing unless it finds one.
@@ -310,12 +336,13 @@ struct Launcher {
             const bool selected = in_page && static_cast<int>(i) == row;
             if (selected) fill({left, kLabelY - 6, column, kValueY + kValueH + 10 - kLabelY}, kGold, 45);
             if (i > 0) fill({left, kLabelY - 2, 1, kValueY + kValueH + 2 - kLabelY}, kWhite, 36);
-            text(left + 8, kLabelY, kLabels[item], selected ? kWhite : Color{198, 182, 166});
+            text(left + 8, kLabelY, kRows[item].label, selected ? kWhite : Color{198, 182, 166});
             const std::string value = valueText(item);
             const Color arrow = selected ? kSand : Color{180, 150, 112};
             text(left + 8, kValueY + 4, "<", arrow);
-            text(left + 20, kValueY, value, selected ? kWhite : Color{232, 222, 212}, 2);
-            text(left + 24 + value.size() * 16, kValueY + 4, ">", arrow);
+            const float scale = 32 + value.size() * 16 <= column ? 2 : 1; // ULTRAWIDE fits only small
+            text(left + 20, kValueY + (scale == 2 ? 0 : 4), value, selected ? kWhite : Color{232, 222, 212}, scale);
+            text(left + 24 + value.size() * 8 * scale, kValueY + 4, ">", arrow);
         }
 
         // Page tabs along the bottom, the current one underlined in sunset gold.
@@ -397,12 +424,20 @@ int main(int argc, char **argv)
     launcher.choice[MSAA] = static_cast<int>(std::upper_bound(std::begin(kSamples), std::end(kSamples),
         std::max(settings.msaa, 1)) - std::begin(kSamples)) - 1;
     launcher.choice[SMAA] = settings.smaa ? 1 : 0;
-    launcher.choice[WIDESCREEN] = settings.widescreen ? 1 : 0;
+    launcher.choice[WIDESCREEN] = 3; // a saved ultrawide "W:H"
+    for (int i = 0; i < static_cast<int>(std::size(kScreens)); ++i) {
+        if (settings.screen == kScreens[i]) launcher.choice[WIDESCREEN] = i;
+    }
     launcher.choice[SURROUND] = settings.surround ? 1 : 0;
     launcher.choice[SKIP_INTRO] = settings.skip_intro ? 1 : 0;
     launcher.choice[CHECK_UPDATES] = settings.check_updates ? 1 : 0;
     if (settings.check_updates) launcher.startUpdate(true);
     launcher.choice[UNLOCKS] = settings.unlock_all ? 0 : 1;
+    launcher.choice[CPU_COSTUMES] = settings.random_cpu_costumes ? 1 : 0;
+    launcher.choice[FREE_CAMERA] = settings.free_camera ? 1 : 0;
+    // A plain exit keeps an untouched 16x/32x MSAA or ultrawide shape; play saves what the rows show.
+    const Settings loaded = settings;
+    const int shown_msaa = launcher.choice[MSAA], shown_screen = launcher.choice[WIDESCREEN];
 
     int result = -1;
     int held_dx = 0, held_dy = 0;
@@ -500,23 +535,32 @@ int main(int argc, char **argv)
         if (result < 0) launcher.draw();
     }
 
-    if (result == 0) {
+    // Settings hold after a plain exit too, so the game plays with them later.
+    {
         settings.height = kHeights[launcher.choice[RESOLUTION]];
         settings.msaa = kSamples[launcher.choice[MSAA]];
         settings.smaa = launcher.choice[SMAA] != 0;
-        settings.widescreen = launcher.choice[WIDESCREEN] != 0;
+        settings.screen = kScreens[launcher.choice[WIDESCREEN]];
+        if (launcher.choice[WIDESCREEN] == 3) {
+            // The primary screen's own shape when it is wider than 16:9, else 21:9 (2560x1080).
+            const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
+            settings.screen = mode != nullptr && mode->w * 9 > mode->h * 16
+                ? std::to_string(mode->w) + ":" + std::to_string(mode->h) : "64:27";
+        }
         settings.surround = launcher.choice[SURROUND] != 0;
         settings.skip_intro = launcher.choice[SKIP_INTRO] != 0;
         settings.check_updates = launcher.choice[CHECK_UPDATES] != 0;
         settings.unlock_all = launcher.choice[UNLOCKS] == 0;
+        settings.random_cpu_costumes = launcher.choice[CPU_COSTUMES] != 0;
+        settings.free_camera = launcher.choice[FREE_CAMERA] != 0;
+        if (result != 0) {
+            if (launcher.choice[MSAA] == shown_msaa) settings.msaa = loaded.msaa;
+            if (launcher.choice[WIDESCREEN] == shown_screen) settings.screen = loaded.screen;
+        }
         if (!saveSettings(settings_path, settings)) {
             std::fprintf(stderr, "launcher: cannot write %s\n", settings_path.c_str());
-            result = 1;
+            if (result == 0) result = 1;
         }
-    } else if ((launcher.choice[CHECK_UPDATES] != 0) != settings.check_updates) {
-        // Other settings save on play; Check At Start must also hold after a plain exit.
-        settings.check_updates = launcher.choice[CHECK_UPDATES] != 0;
-        saveSettings(settings_path, settings);
     }
     SDL_DestroyTexture(launcher.background);
     // Only a check can still be running here; stop it rather than leave it behind.

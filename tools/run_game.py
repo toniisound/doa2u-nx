@@ -5,17 +5,45 @@ import json
 import os
 from pathlib import Path
 import shutil
+import string
 import subprocess
 import sys
+import threading
 import uuid
 
 from build_game import ROOT, program_manifest, runner_path, selected_xbe
 import dedication_card
-from extract_iso import sha256
+from extract_iso import redact_private, sha256
 
 RELAUNCH = 4  # runner exit code for XLaunchNewImage of the game's own XBE
 # The archives check_hdd_install (0xf6cc0) expects on Z:, copied there by hdd_install_thread.
 HDD_ARCHIVES = ("voice.afs", "datahdd.afs", "datahdd2.afs")
+# Pad buttons and keys that private/keyboard.json may bind; the codes are Windows virtual keys.
+# F10 is left out because Windows treats it as a system key, and F11 because the presenter
+# keeps it, with Alt+Enter, for fullscreen.
+KEY_ACTIONS = ("up", "down", "left", "right", "start", "back", "a", "b", "x", "y", "white", "black", "ltrig", "rtrig")
+KEY_CODES = {**{c: ord(c) for c in string.ascii_uppercase + string.digits},
+             **{f"F{n}": 0x6f + n for n in range(1, 13) if n not in (10, 11)},
+             "BACKSPACE": 0x08, "TAB": 0x09, "ENTER": 0x0d, "SHIFT": 0x10, "CTRL": 0x11, "ESC": 0x1b,
+             "SPACE": 0x20, "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28}
+
+
+def keyboard_map():
+    """RECOMP_KEYMAP text for private/keyboard.json, e.g. {"a": "Space", "start": "Enter"}; "" if absent."""
+    try:
+        bindings = json.loads((ROOT / "private/keyboard.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as error:
+        raise ValueError(f"private/keyboard.json is not valid JSON: {error}")
+    if not isinstance(bindings, dict):
+        raise ValueError("private/keyboard.json must be an object such as {\"a\": \"Space\"}")
+    for action, key in bindings.items():
+        if action not in KEY_ACTIONS or not isinstance(key, str) or key.upper() not in KEY_CODES:
+            raise ValueError(f"private/keyboard.json: cannot bind {action!r} to {key!r}; buttons are "
+                             f"{', '.join(KEY_ACTIONS)}; keys are A-Z, 0-9, F1-F9, F12, Up, Down, Left, Right, "
+                             "Enter, Backspace, Space, Tab, Shift, Ctrl and Esc")
+    return ",".join(f"{action}={KEY_CODES[key.upper()]:x}" for action, key in bindings.items())
 
 
 def prepare_disc(source, disc):
@@ -59,14 +87,29 @@ def seed_hdd_cache(disc):
     Copies, not hardlinks: the installer reopens a stale file with CREATE_ALWAYS.
     """
     cache = disc / ".recomp-storage/partition5"
+    # Extracted discs name the folder DOA2; match any case so Linux finds it.
+    folder = next((entry for entry in disc.iterdir() if entry.name.lower() == "doa2" and entry.is_dir()), None)
+    if folder is None:
+        return
     for name in HDD_ARCHIVES:
-        source, target = disc / "doa2" / name, cache / name
+        source, target = folder / name, cache / name
         if not source.is_file() or (target.is_file() and target.stat().st_size == source.stat().st_size):
             continue
         cache.mkdir(parents=True, exist_ok=True)
         partial = target.with_name(name + ".tmp")
         shutil.copyfile(source, partial)
         partial.replace(target)
+
+
+def screen_shape(text):
+    """A "W:H" screen choice as the widescreen value: False for 4:3, else the
+    shape, which the runner accepts from 4:3 to 4:1 (recomp-runtime/widescreen.h)."""
+    width, colon, height = str(text).partition(":")
+    if not (colon and width.isdigit() and height.isdigit() and int(height) > 0
+            and 3 * int(width) >= 4 * int(height) and int(width) <= 4 * int(height)
+            and int(width) <= 16384 and int(height) <= 16384):
+        raise ValueError(f"Screen shape {text!r} must be W:H from 4:3 to 4:1")
+    return False if 3 * int(width) == 4 * int(height) else f"{int(width)}:{int(height)}"
 
 
 def saved_settings():
@@ -80,10 +123,17 @@ def saved_settings():
         options["resolution"] = saved["height"]
     if saved.get("msaa") in (1, 2, 4, 8, 16, 32):
         options["msaa"] = saved["msaa"]
-    for key, option in (("smaa", "smaa"), ("widescreen", "widescreen"), ("skipIntro", "skip_intro"),
-                        ("surround", "surround"), ("unlockAll", "unlock_all")):
+    for key, option in (("smaa", "smaa"), ("widescreen", "widescreen"), ("vrr", "vrr"), ("skipIntro", "skip_intro"),
+                        ("surround", "surround"), ("unlockAll", "unlock_all"), ("vulkan", "vulkan"),
+                        ("freeCamera", "free_camera"), ("randomCpuCostumes", "random_cpu_costumes")):
         if isinstance(saved.get(key), bool):
             options[option] = saved[key]
+    # Launchers since 16:10 save a "screen" shape instead of the widescreen flag.
+    if isinstance(saved.get("screen"), str):
+        try:
+            options["widescreen"] = screen_shape(saved["screen"])
+        except ValueError:
+            pass
     return options
 
 
@@ -98,7 +148,8 @@ def open_launcher():
 
 def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), analog_polls=(),
         widescreen=None, msaa=None, smaa=None, resolution=None, story_finale=False,
-        skip_intro=False, unlock_all=True, surround=None):
+        skip_intro=False, unlock_all=True, surround=None, vrr=None, vulkan=False, free_camera=None,
+        random_cpu_costumes=None):
     if seconds is not None and seconds <= 0:
         raise ValueError("Probe duration must be positive")
     if msaa is not None and msaa not in (1, 2, 4, 8, 16, 32):
@@ -108,11 +159,17 @@ def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), a
     env = os.environ.copy()
     for name, value in (("RECOMP_D3D_WIDESCREEN", widescreen),
                         ("RECOMP_D3D_MSAA", msaa), ("RECOMP_D3D_SMAA", smaa),
-                        ("RECOMP_AUDIO_SURROUND", surround)):
+                        ("RECOMP_AUDIO_SURROUND", surround), ("RECOMP_D3D_VRR", vrr),
+                        ("RECOMP_FREE_CAMERA", free_camera), ("RECOMP_RANDOM_CPU_COSTUMES", random_cpu_costumes)):
         if value is not None:
-            env[name] = str(int(value))
+            env[name] = value if isinstance(value, str) else str(int(value))
     if resolution is not None:
         env["RECOMP_D3D_SCALE"] = str(resolution / 480)
+    keymap = keyboard_map()
+    if keymap:
+        env.setdefault("RECOMP_KEYMAP", keymap)
+    # The game's PC SETTINGS page saves the launchers' choices here.
+    env["RECOMP_LAUNCHER_SETTINGS"] = str(ROOT / "private/launcher.json")
     # Both presenters keep compiled draw shaders here and load them at the next start.
     shader_cache = ROOT / "private/shader-cache"
     shader_cache.mkdir(parents=True, exist_ok=True)
@@ -137,8 +194,13 @@ def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), a
     if receipt["recipe"]["xbe_sha256"] != sha256(selected) or program_manifest(generated) != (
             receipt["manifest_sha256"], receipt["ebp_count"]):
         raise ValueError("Game or generated sources differ from the build receipt")
-    runner = runner_path(ROOT)
-    if sha256(runner) != receipt["runner_sha256"]:
+    runner = runner_path(ROOT, vulkan)
+    use_vulkan = vulkan and sys.platform == "win32"
+    expected = receipt.get("vulkan_runner_sha256" if use_vulkan else "runner_sha256")
+    if expected is None:
+        raise ValueError("This build has no Vulkan renderer; build the game again" if use_vulkan
+                         else "This build has no runner; build the game again")
+    if sha256(runner) != expected:
         raise ValueError("Runner differs from its successful build receipt")
     # A finale run clears Story, so it keeps its unlocks out of the player's saves.
     disc = ROOT / ("private/probe-disc" if isolated or story_finale else "private/play-disc")
@@ -161,7 +223,7 @@ def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), a
     log_path = logs / (uuid.uuid4().hex[:8] + ".log")
     if seconds is None:
         print(f"Play session log={log_path}", flush=True)
-    with log_path.open("x", encoding="utf-8") as log:
+    with log_path.open("x", buffering=1, encoding="utf-8", errors="surrogateescape") as log:
         log.write(f"runner_sha256={sha256(runner)}\nprogram_manifest={receipt['manifest_sha256']}\n")
         log.flush()
         try:
@@ -185,10 +247,15 @@ def run(seconds, start_polls=(), a_polls=(), isolated=False, buttons_polls=(), a
             code = RELAUNCH
             # The game's soft reset relaunches its own XBE; a fresh runner is that cold boot.
             while code == RELAUNCH:
-                result = subprocess.run(command,
-                                        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=seconds,
-                                        env=env)
-                code = result.returncode
+                with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      env=env, encoding="utf-8", errors="surrogateescape") as child:
+                    copy = threading.Thread(target=lambda: log.writelines(map(redact_private, child.stdout)))
+                    copy.start()
+                    try:
+                        code = child.wait(timeout=seconds)
+                    finally:
+                        child.kill()  # no-op once it has exited
+                        copy.join()
                 if seconds is not None:
                     break
         except subprocess.TimeoutExpired:
@@ -206,6 +273,8 @@ if __name__ == "__main__":
                           help="Play without a time limit; close the game window to exit")
     parser.add_argument("--widescreen", action=argparse.BooleanOptionalAction, default=None,
                         help="Use the game's native 16:9 camera and menus")
+    parser.add_argument("--screen", type=screen_shape, metavar="W:H",
+                        help="Widescreen in this shape, such as 16:10, 21:9 or 32:9 (4:3 to 4:1); 4:3 turns it off")
     parser.add_argument("--resolution", type=int, choices=(480, 720, 1080, 1440, 2160),
                         help="Render height: 480p, 720p, 1080p, 1440p or 4K; width follows aspect ratio")
     parser.add_argument("--msaa", type=int, choices=(1, 2, 4, 8, 16, 32),
@@ -214,6 +283,14 @@ if __name__ == "__main__":
                         help="Apply SMAA Ultra after MSAA resolve")
     parser.add_argument("--surround", action=argparse.BooleanOptionalAction, default=None,
                         help="Output 5.1 through the game's own surround mix")
+    parser.add_argument("--vrr", action=argparse.BooleanOptionalAction, default=None,
+                        help="Present for a G-SYNC or FreeSync display (Direct3D 11)")
+    parser.add_argument("--random-cpu-costumes", action=argparse.BooleanOptionalAction, default=None,
+                        help="Dress CPU opponents in random unlocked costumes (offline)")
+    parser.add_argument("--vulkan", action=argparse.BooleanOptionalAction, default=None,
+                        help="Windows: render through Vulkan (SDL_GPU) instead of Direct3D 11")
+    parser.add_argument("--free-camera", action=argparse.BooleanOptionalAction, default=None,
+                        help="Allow the free camera: F1, ` or a right-stick click takes it (docs/free-camera.md)")
     parser.add_argument("--input-start-pulse-at", type=int, action="append", default=[])
     parser.add_argument("--input-a-pulse-at", type=int, action="append", default=[])
     parser.add_argument("--input-buttons-pulse-at", type=int, nargs=2, action="append", default=[],
@@ -241,12 +318,15 @@ if __name__ == "__main__":
             return value if value is not None else saved.get(name)
         raise SystemExit(run(None if args.play else args.seconds, args.input_start_pulse_at,
                              args.input_a_pulse_at, args.isolated, args.input_buttons_pulse_at,
-                             args.input_analog_pulse_at, pick("widescreen", args.widescreen),
+                             args.input_analog_pulse_at,
+                             args.screen if args.screen is not None else pick("widescreen", args.widescreen),
                              pick("msaa", args.msaa), pick("smaa", args.smaa),
                              pick("resolution", args.resolution), args.story_finale,
                              args.skip_intro or saved.get("skip_intro", False),
                              args.unlock_all and saved.get("unlock_all", True),
-                             pick("surround", args.surround)))
+                             pick("surround", args.surround), pick("vrr", args.vrr),
+                             bool(pick("vulkan", args.vulkan)), pick("free_camera", args.free_camera),
+                             pick("random_cpu_costumes", args.random_cpu_costumes)))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(f"Cannot run game: {error}", file=sys.stderr)
         raise SystemExit(1)

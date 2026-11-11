@@ -14,7 +14,10 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define AcquireSRWLockExclusive pthread_mutex_lock
 #define ReleaseSRWLockExclusive pthread_mutex_unlock
 #endif
-static uint8_t held[RECOMP_INPUT_KEY_COUNT], pending[RECOMP_INPUT_KEY_COUNT];
+static uint8_t held[RECOMP_INPUT_KEY_COUNT], pending[RECOMP_INPUT_KEY_COUNT], sampled[RECOMP_INPUT_KEY_COUNT];
+static char text[64];
+static size_t text_size;
+static bool text_wanted;
 
 void recomp_input_keyboard_event(uint32_t key, bool down)
 {
@@ -30,6 +33,7 @@ void recomp_input_keyboard_reset(void)
     AcquireSRWLockExclusive(&lock);
     memset(held, 0, sizeof held);
     memset(pending, 0, sizeof pending);
+    text_size = 0u;
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -37,8 +41,50 @@ void recomp_input_keyboard_sample(uint8_t keys[RECOMP_INPUT_KEY_COUNT])
 {
     AcquireSRWLockExclusive(&lock);
     for (uint32_t i = 0; i < RECOMP_INPUT_KEY_COUNT; ++i) {
-        keys[i] = held[i] | pending[i];
+        keys[i] = sampled[i] = held[i] | pending[i];
         pending[i] = 0u;
     }
     ReleaseSRWLockExclusive(&lock);
+}
+
+bool recomp_input_keyboard_sampled(uint32_t key)
+{
+    if (key >= RECOMP_INPUT_KEY_COUNT) return false;
+    AcquireSRWLockExclusive(&lock);
+    const bool down = sampled[key] != 0u;
+    ReleaseSRWLockExclusive(&lock);
+    return down;
+}
+
+void recomp_input_keyboard_char(uint32_t character)
+{
+    if (character >= 0x80u) return;
+    AcquireSRWLockExclusive(&lock);
+    if (text_size < sizeof text) text[text_size++] = (char)character;
+    ReleaseSRWLockExclusive(&lock);
+}
+
+size_t recomp_input_keyboard_take_text(char *out, size_t capacity)
+{
+    AcquireSRWLockExclusive(&lock);
+    const size_t size = text_size < capacity ? text_size : capacity;
+    memcpy(out, text, size);
+    text_size = 0u;
+    ReleaseSRWLockExclusive(&lock);
+    return size;
+}
+
+void recomp_input_keyboard_want_text(bool wanted)
+{
+    AcquireSRWLockExclusive(&lock);
+    text_wanted = wanted;
+    ReleaseSRWLockExclusive(&lock);
+}
+
+bool recomp_input_keyboard_text_wanted(void)
+{
+    AcquireSRWLockExclusive(&lock);
+    const bool wanted = text_wanted;
+    ReleaseSRWLockExclusive(&lock);
+    return wanted;
 }

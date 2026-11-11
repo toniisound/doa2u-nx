@@ -30,8 +30,36 @@ static SDL_Joystick *attach(uintptr_t index, SDL_JoystickID *id)
     return *id != 0 ? SDL_OpenJoystick(*id) : NULL;
 }
 
-int main(void)
+/* CMake runs this with RECOMP_KEYMAP=a=20,bogus,start=74,x=53 and RECOMP_TEST_FOCUSED=1:
+   Space is A, F5 is Start and S is X. The keys those had press nothing, and Y, which had S,
+   has no key. "bogus" has no key and is skipped without losing the entries after it. */
+static int keymap(void)
 {
+    RecompInputGamepad pad, keys;
+    recomp_input_keyboard_reset();
+    recomp_input_keyboard_event('Z', true);
+    recomp_input_keyboard_event(0x0du, true);
+    recomp_input_keyboard_event('S', true);
+    CHECK(recomp_input_host_sample(0u, &pad));
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_A] == 0u && (pad.buttons & 0x0010u) == 0u);
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_X] == 0xffu && pad.analog_buttons[RECOMP_INPUT_ANALOG_Y] == 0u);
+    recomp_input_keyboard_event(0x20u, true);
+    recomp_input_keyboard_event(0x74u, true);
+    CHECK(recomp_input_host_sample(0u, &pad));
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_A] == 0xffu && (pad.buttons & 0x0010u) != 0u);
+    /* What the free camera leaves out while it flies. */
+    recomp_input_host_keyboard_buttons(&keys);
+    CHECK(keys.buttons == 0x0010u && keys.analog_buttons[RECOMP_INPUT_ANALOG_A] == 0xffu);
+    CHECK(keys.analog_buttons[RECOMP_INPUT_ANALOG_X] == 0xffu && keys.analog_buttons[RECOMP_INPUT_ANALOG_Y] == 0u);
+    CHECK(keys.analog_buttons[RECOMP_INPUT_ANALOG_B] == 0u);
+    puts("input host keymap: ok");
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    (void)argv;
+    if (argc > 1) return keymap();
     uint8_t keys[RECOMP_INPUT_KEY_COUNT];
     recomp_input_keyboard_reset();
     recomp_input_keyboard_event('Z', true);
@@ -72,6 +100,7 @@ int main(void)
     /* SDL discards the first jump of an axis that starts at an extreme (triggers). */
     CHECK(recomp_input_host_sample(0u, &pad));
     CHECK(!recomp_input_host_sample(1u, &pad));
+    CHECK(recomp_input_host_pad_connected(0u) && !recomp_input_host_pad_connected(1u));
     SDL_SetJoystickVirtualButton(first, SDL_GAMEPAD_BUTTON_SOUTH, true);
     SDL_SetJoystickVirtualButton(first, SDL_GAMEPAD_BUTTON_NORTH, true);
     SDL_SetJoystickVirtualButton(first, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
@@ -87,8 +116,8 @@ int main(void)
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_Y] == 0xffu);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_B] == 0u);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_X] == 0u);
-    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_BLACK] == 0xffu);
-    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_WHITE] == 0u);
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_WHITE] == 0xffu);
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_BLACK] == 0u);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_RTRIG] == 0xffu);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_LTRIG] == 0u);
     CHECK(pad.thumb_ly == 32767); /* stick up is positive, as in XInput */
@@ -111,8 +140,8 @@ int main(void)
     CHECK(pad.buttons == 0x0060u); /* BACK | LEFT_THUMB */
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_X] == 0xffu);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_A] == 0u);
-    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_WHITE] == 0xffu);
-    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_BLACK] == 0u);
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_BLACK] == 0xffu);
+    CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_WHITE] == 0u);
     CHECK(pad.analog_buttons[RECOMP_INPUT_ANALOG_LTRIG] == 0xffu);
     CHECK(pad.thumb_lx == -1000 && pad.thumb_ry == -2000);
     SDL_SetJoystickVirtualButton(second, SDL_GAMEPAD_BUTTON_WEST, false);
@@ -128,11 +157,14 @@ int main(void)
     recomp_input_host_stop_vibration();
     CHECK(rumbled[1] == 0u);
 
-    /* Removing port 0's pad leaves port 1 in place. */
+    /* Removing port 0's pad leaves port 1 in place. Port 0 still answers, neutral,
+       so the keyboard keeps working and a netplay session keeps sending a pad. */
     SDL_CloseJoystick(first);
     CHECK(SDL_DetachVirtualJoystick(first_id));
     CHECK(recomp_input_host_sample(0u, &pad));
     CHECK(pad.buttons == 0u && pad.analog_buttons[RECOMP_INPUT_ANALOG_A] == 0u);
+    CHECK(pad.thumb_ly == 0 && pad.analog_buttons[RECOMP_INPUT_ANALOG_RTRIG] == 0u);
+    CHECK(!recomp_input_host_pad_connected(0u) && recomp_input_host_pad_connected(1u));
     CHECK(recomp_input_host_sample(1u, &pad) && pad.buttons == 0x00a0u);
 
     SDL_CloseJoystick(second);

@@ -17,10 +17,43 @@ The Windows presenter builds SMAA by Jorge Jimenez and coauthors from
 iryoku/smaa, revision 71c806a838bdd7d517df19192a20f0c61b3ca29d, under its MIT
 license. Its original notices and LICENSE.txt remain in the fetched source.
 
+The Windows Vulkan renderer loads shaderc.dll from LWJGL 3.4.3
+(org.lwjgl:lwjgl-shaderc, natives-windows), which records source revision
+2c8cae7. The build fetches it. shaderc and the SPIRV-Tools code it contains
+are under the Apache License 2.0; its glslang code is under glslang's BSD,
+MIT and Apache 2.0 licenses. Each keeps its own notices. LWJGL's build is
+under the BSD 3-Clause license.
+
+The runner links miniupnpc 2.3.3 (miniupnp/miniupnp, tag miniupnpc_2_3_3),
+Copyright (c) 2005-2025 Thomas Bernard, under the BSD 3-Clause license. The
+build fetches it; its LICENSE remains in the fetched source.
+
+The runner decodes movie video with pl_mpeg by Dominic Szablewski
+(phoboslab/pl_mpeg, revision c871f2be022ece7ef4f64230b4fb8e1fb9eb6023), under
+the MIT license. The build fetches pl_mpeg.h, which carries its notice, and
+patches it with recomp-runtime/pl_mpeg_patch.cmake.
+
+recomp-runtime/musl_math/ is altered from musl libc (sin, cos, tan, atan,
+atan2, log1p, expm1 and their helpers from musl 1.2.5; log2 from musl
+1.1.19), Copyright (c) 2005-2020 Rich Felker, et al., under the MIT license,
+whose full text is in recomp-runtime/musl_math/COPYRIGHT. The files keep
+their fdlibm notices from Sun Microsystems.
+
 The macOS and Linux host layer (win32_compat, the POSIX fiber switch, the
 SDL3 audio output, the launchers and the SDL_GPU presenter's resource
 handling) adapts committed source from NoRain211/doa3-re (commit 48d05e9) and
 NoRain211/doaxbv-re, under GPL-3.0-or-later.
+
+The Vulkan renderer redraws the game's 2D art larger with xBRZ by Zenju
+(HqMAME project), under the GNU General Public License version 3 with its
+author's MAME linking exception. The build fetches PPSSPP's copy
+(hrydgard/ppsspp, ext/xbrz, revision 9f286ee4ca1093ba7ad3541d9c66b68fbeda0f23),
+whose files carry their notices, and patches out PPSSPP's own configuration
+header with recomp-runtime/xbrz_patch.cmake.
+
+The free camera's overlay draws with Dear ImGui by Omar Cornut, release
+1.91.9 (ocornut/imgui), fetched at configuration under its MIT license, whose
+notices remain in the fetched source.
 
 recomp-runtime/audio_reverb.cpp is altered from FAudio's
 src/FAudioFX_reverb.c (FNA-XNA/FAudio 26.10), Copyright (c) 2011-2024 Ethan

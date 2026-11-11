@@ -81,6 +81,7 @@ typedef struct HostRead {
 } HostRead;
 
 static HostRead *reads_queued;
+static unsigned reads_running; /* taken off the queue, not yet done */
 static int read_worker_state; /* 0 not started, 1 running, -1 failed */
 #ifdef _WIN32
 static SRWLOCK read_lock = SRWLOCK_INIT;
@@ -128,6 +129,7 @@ static void *read_worker(void *unused)
         while (reads_queued == NULL) wait_reads(read_queued);
         HostRead *read = reads_queued;
         reads_queued = read->next;
+        ++reads_running;
         unlock_reads();
         DWORD bytes_read = 0u;
         BOOL ok = read_at(read->handle, read->offset, read->buffer, read->length, &bytes_read);
@@ -135,6 +137,7 @@ static void *read_worker(void *unused)
         read->bytes_read = bytes_read;
         read->ok = ok;
         read->done = 1;
+        --reads_running;
         wake_reads(read_finished);
     }
 }
@@ -186,6 +189,117 @@ static bool reads_finished(void *context)
 }
 
 static uint32_t next_guest_handle = 1u;
+static bool synchronous_reads;
+
+void recomp_kernel_file_set_synchronous_reads(bool enabled)
+{
+    synchronous_reads = enabled;
+}
+
+/* The position is guest-visible through NtQueryInformationFile and cursor
+   reads, so a rewind puts it back; otherwise a replayed frame reads from
+   where the abandoned timeline stopped. */
+typedef struct FilePosition {
+    uint32_t guest_handle;
+    uint32_t active;
+    uint64_t cursor;
+    uint32_t directory_cursor;
+    uint32_t directory_queried;
+    char directory_pattern[RECOMP_DIRECTORY_NAME_SIZE];
+} FilePosition;
+
+typedef struct FilePositionState {
+    uint32_t next_guest_handle;
+    FilePosition entries[MAX_FILE_HANDLES];
+} FilePositionState;
+
+size_t recomp_kernel_file_state_size(void)
+{
+    return sizeof(FilePositionState);
+}
+
+void recomp_kernel_file_state_save(void *state)
+{
+    FilePositionState *out = state;
+    memset(out, 0, sizeof *out);
+    out->next_guest_handle = next_guest_handle;
+    for (size_t i = 0; i < MAX_FILE_HANDLES; ++i) {
+        if (!file_handles[i].active) continue;
+        out->entries[i].active = 1u;
+        out->entries[i].guest_handle = file_handles[i].guest_handle;
+        out->entries[i].cursor = file_handles[i].cursor;
+        out->entries[i].directory_cursor = (uint32_t)file_handles[i].directory.cursor;
+        out->entries[i].directory_queried = (uint32_t)file_handles[i].directory_queried;
+        memcpy(out->entries[i].directory_pattern, file_handles[i].directory_pattern,
+            sizeof out->entries[i].directory_pattern);
+    }
+}
+
+static bool file_restore_lost;
+
+bool recomp_kernel_file_state_lost(void)
+{
+    const bool lost = file_restore_lost;
+    file_restore_lost = false;
+    return lost;
+}
+
+void recomp_kernel_file_state_restore(const void *state)
+{
+    const FilePositionState *in = state;
+    file_restore_lost = false;
+    /* Close what the abandoned timeline opened: an unreleased native handle
+       also shifts every later guest handle number. */
+    for (size_t i = 0; i < MAX_FILE_HANDLES; ++i) {
+        FileHandleEntry *entry = &file_handles[i];
+        size_t slot;
+        if (!entry->active) continue;
+        for (slot = 0; slot < MAX_FILE_HANDLES; ++slot) {
+            if (in->entries[slot].active &&
+                in->entries[slot].guest_handle == entry->guest_handle) {
+                break;
+            }
+        }
+        if (slot != MAX_FILE_HANDLES) continue;
+        if (entry->host_handle != INVALID_HANDLE_VALUE) CloseHandle(entry->host_handle);
+        memset(entry, 0, sizeof *entry);
+        entry->host_handle = INVALID_HANDLE_VALUE;
+    }
+    for (size_t i = 0; i < MAX_FILE_HANDLES; ++i) {
+        size_t slot;
+        if (!in->entries[i].active) continue;
+        for (slot = 0; slot < MAX_FILE_HANDLES; ++slot) {
+            if (file_handles[slot].active &&
+                file_handles[slot].guest_handle == in->entries[i].guest_handle) {
+                break;
+            }
+        }
+        /* The game closed this handle after the save; guest RAM still holds it. */
+        if (slot == MAX_FILE_HANDLES) {
+            file_restore_lost = true;
+            continue;
+        }
+        file_handles[slot].cursor = in->entries[i].cursor;
+        file_handles[slot].directory.cursor = in->entries[i].directory_cursor;
+        file_handles[slot].directory_queried = (int)in->entries[i].directory_queried;
+        memcpy(file_handles[slot].directory_pattern, in->entries[i].directory_pattern,
+            sizeof file_handles[slot].directory_pattern);
+    }
+    next_guest_handle = in->next_guest_handle;
+}
+
+static FileHandleEntry *find_file_handle(uint32_t guest_handle);
+
+bool recomp_kernel_file_state_restorable(const void *state)
+{
+    const FilePositionState *in = state;
+    for (size_t i = 0; i < MAX_FILE_HANDLES; ++i) {
+        if (in->entries[i].active && find_file_handle(in->entries[i].guest_handle) == NULL)
+            return false;
+    }
+    return true;
+}
+
 static RecompSymbolicLinkModel symbolic_links;
 static int symbolic_links_initialized;
 static bool is_profile_path(const char *path);
@@ -206,6 +320,39 @@ void (*recomp_kernel_read_hook)(const char *host_path, uint64_t offset);
 /* Private proving runs use these fail-loud checkpoints to interrupt real
    save writes. They are inactive unless explicitly selected in the environment. */
 static unsigned save_write_number;
+/* Opens, writes and metadata changes that may change save storage on disk.
+   The disk is not part of a SyncTest snapshot, so a frame that makes one
+   cannot be replayed. Attempts count, even rejected ones. */
+static uint32_t profile_mutation_count;
+void (*recomp_kernel_profile_mutation_hook)(void);
+
+void recomp_kernel_file_reset(void)
+{
+    /* A queued read writes guest RAM, and its request lives on a parked stack. */
+    lock_reads();
+    while (reads_queued != NULL || reads_running != 0u) wait_reads(read_finished);
+    unlock_reads();
+    for (size_t i = 0; i < MAX_FILE_HANDLES; ++i) {
+        HANDLE host = file_handles[i].host_handle;
+        if (file_handles[i].active && host != NULL && host != INVALID_HANDLE_VALUE) CloseHandle(host);
+    }
+    memset(file_handles, 0, sizeof file_handles);
+    next_guest_handle = 1u;
+    symbolic_links_initialized = 0;
+    save_write_number = 0u;
+    profile_mutation_count = 0u;
+}
+
+uint32_t recomp_kernel_profile_mutations(void)
+{
+    return profile_mutation_count;
+}
+
+static void note_profile_mutation(void)
+{
+    ++profile_mutation_count;
+    if (recomp_kernel_profile_mutation_hook != NULL) recomp_kernel_profile_mutation_hook();
+}
 
 static unsigned save_fault_write(const char *name)
 {
@@ -306,6 +453,18 @@ static bool save_write_allowed(const FileHandleEntry *entry, uint32_t owner)
     return true;
 }
 
+/* A host file's attributes as the game sees them. In a session that is only
+   the directory and read-only bits, or normal: Windows adds archive, and index
+   or cloud bits by folder, that POSIX hosts never report, and both sides must
+   see the same. Read-only is the game's own, kept in a POSIX file's mode, and
+   it refuses a delete, so the game sees it. */
+static uint32_t session_attributes(uint32_t host)
+{
+    if (recomp_save_session == NULL) return host;
+    const uint32_t kept = host & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY);
+    return kept != 0u ? kept : FILE_ATTRIBUTE_NORMAL;
+}
+
 static uint32_t register_file_handle(
     HANDLE host_handle,
     FileHandleKind kind,
@@ -381,21 +540,23 @@ static uint32_t register_file_handle(
                             continue;
                         }
                         strcpy(entry.name, data.cFileName);
-                        entry.creation_time =
-                            (uint64_t)data.ftCreationTime.dwLowDateTime |
-                            (uint64_t)data.ftCreationTime.dwHighDateTime << 32u;
-                        entry.last_access_time =
-                            (uint64_t)data.ftLastAccessTime.dwLowDateTime |
-                            (uint64_t)data.ftLastAccessTime.dwHighDateTime << 32u;
-                        entry.last_write_time =
-                            (uint64_t)data.ftLastWriteTime.dwLowDateTime |
-                            (uint64_t)data.ftLastWriteTime.dwHighDateTime << 32u;
-                        entry.change_time = entry.last_write_time;
+                        if (recomp_save_session == NULL) {
+                            entry.creation_time =
+                                (uint64_t)data.ftCreationTime.dwLowDateTime |
+                                (uint64_t)data.ftCreationTime.dwHighDateTime << 32u;
+                            entry.last_access_time =
+                                (uint64_t)data.ftLastAccessTime.dwLowDateTime |
+                                (uint64_t)data.ftLastAccessTime.dwHighDateTime << 32u;
+                            entry.last_write_time =
+                                (uint64_t)data.ftLastWriteTime.dwLowDateTime |
+                                (uint64_t)data.ftLastWriteTime.dwHighDateTime << 32u;
+                            entry.change_time = entry.last_write_time;
+                        }
                         size = (uint64_t)data.nFileSizeLow |
                             (uint64_t)data.nFileSizeHigh << 32u;
                         entry.size = size;
                         entry.allocation_size = (size + 4095u) & ~4095ull;
-                        entry.attributes = data.dwFileAttributes;
+                        entry.attributes = session_attributes(data.dwFileAttributes);
                         if (!recomp_directory_add(
                                 &file_handles[i].directory, &entry)) {
                             fprintf(stderr, "recomp kernel: directory '%s' lists only its first %u entries\n",
@@ -579,6 +740,32 @@ static int build_host_path(const char *relative, char *host_path, size_t host_pa
     return append_relative_path(relative, host_path, host_path_size);
 }
 
+bool recomp_kernel_disc_host_path(const char *guest_path, char *host_path, size_t host_path_size)
+{
+    char normalized[MAX_PATH_LEN];
+    if (guest_path == NULL || host_path == NULL || host_path_size == 0u ||
+        recomp_disc_root_path == NULL ||
+        !normalize_guest_path(guest_path, normalized, sizeof normalized) ||
+        !build_host_path(normalized + 2, host_path, host_path_size)) {
+        return false;
+    }
+#ifndef _WIN32
+    /* The guest path is lowercased; the caller opens it without CreateFileA. */
+    recomp_win32_resolve_case(host_path, host_path_size);
+#endif
+    return true;
+}
+
+/* Appends a storage partition's host folder; a save session moves partition 1. */
+static bool append_partition(char *path, size_t size, const char *partition)
+{
+    if (!append_segment(path, size, ".recomp-storage")) return false;
+    if (recomp_save_session != NULL && strcmp(partition, "partition1") == 0 &&
+        !append_segment(path, size, recomp_save_session))
+        return false;
+    return append_segment(path, size, partition);
+}
+
 static bool is_profile_path(const char *path)
 {
     char root[MAX_PATH_LEN];
@@ -586,8 +773,7 @@ static bool is_profile_path(const char *path)
         return false;
     }
     copy_root(root, sizeof root);
-    if (!append_segment(root, sizeof root, ".recomp-storage") ||
-        !append_segment(root, sizeof root, "partition1")) {
+    if (!append_partition(root, sizeof root, "partition1")) {
         return false;
     }
     size_t length = strlen(root);
@@ -630,8 +816,7 @@ static int build_storage_path(
     partition[sizeof partition - 2u] = guest_path[prefix_len - 1u];
 
     copy_root(host_path, host_path_size);
-    if (!append_segment(host_path, host_path_size, ".recomp-storage") ||
-        !append_segment(host_path, host_path_size, partition)) {
+    if (!append_partition(host_path, host_path_size, partition)) {
         return -1;
     }
 
@@ -1290,6 +1475,7 @@ static void bridge_nt_open_file(void)
     bool profile_path = is_profile_path(host_path);
     bool required_save_io = requested_write ||
         (profile_path && (desired_access & (DELETE | FILE_WRITE_ATTRIBUTES)) != 0u);
+    if (required_save_io && profile_path) note_profile_mutation();
     if (required_save_io && recomp_save_pending() &&
         ((profile_path && !recomp_save_active(save_owner)) ||
          (recomp_save_active(save_owner) && !profile_path))) {
@@ -1385,6 +1571,7 @@ static void bridge_nt_create_file(void)
     bool mutation = (desired_access & GENERIC_WRITE_ACCESS) != 0u ||
         (profile_path && (desired_access & (DELETE | FILE_WRITE_ATTRIBUTES)) != 0u) ||
         create_disposition != FILE_OPEN_DISPOSITION;
+    if (mutation && profile_path) note_profile_mutation();
     if (mutation && recomp_save_pending() &&
         ((profile_path && !recomp_save_active(save_owner)) ||
          (recomp_save_active(save_owner) && !profile_path))) {
@@ -1608,8 +1795,8 @@ static void bridge_nt_query_information_file(void)
         file_size = (uint64_t)size.QuadPart;
         policy = profile_metadata ? "host-profile-file-information" : "host-file-information";
         const uint32_t attributes = profile_metadata
-            ? host.FileAttributes : FILE_ATTRIBUTE_NORMAL;
-        if (profile_metadata && file_information != 0u &&
+            ? session_attributes(host.FileAttributes) : FILE_ATTRIBUTE_NORMAL;
+        if (profile_metadata && recomp_save_session == NULL && file_information != 0u &&
             ((file_information_class == FILE_BASIC_INFORMATION && length >= 0x28u) ||
              (file_information_class == FILE_NETWORK_OPEN_INFORMATION && length >= 0x38u))) {
             const LARGE_INTEGER times[4] = {host.CreationTime, host.LastAccessTime,
@@ -1702,6 +1889,7 @@ static bool handle_profile_mutation_information(
 
     const bool profile_path = is_profile_path(entry->host_path);
     *required_save_io = entry->save_write || profile_path;
+    if (profile_path) ++profile_mutation_count;
     if (profile_path && recomp_save_pending() &&
         (!recomp_save_active(current_save_owner()) ||
          (entry->save_owned && entry->save_owner != current_save_owner()))) {
@@ -2051,6 +2239,7 @@ static void bridge_nt_write_file(void)
         }
 
         tracked_handle_seen = 1;
+        if (is_profile_path(file_handles[i].host_path)) ++profile_mutation_count;
         if (!save_write_allowed(&file_handles[i], current_save_owner())) {
             status = RECOMP_STATUS_UNSUCCESSFUL;
             policy = "save-write-owner-rejected";
@@ -2214,7 +2403,7 @@ static void bridge_nt_read_file(void)
             .length = length,
         };
         if ((file_handles[i].sharing_access & FILE_SHARE_WRITE) != 0u ||
-            length == 0u) {
+            length == 0u || synchronous_reads) {
             read.ok = read_at(read.handle, read.offset, read.buffer, read.length,
                 &read.bytes_read);
         } else {

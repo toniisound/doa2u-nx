@@ -72,6 +72,8 @@ uint32_t recomp_kernel_allocate_pool(uint32_t size)
 }
 void recomp_kernel_free_pool(uint32_t address) { freed = address; }
 uint32_t recomp_d3d8_require_device(void) { return DEVICE; }
+static bool overlay_hidden;
+bool recomp_scene_freeze_overlay_hidden(void) { return overlay_hidden; }
 const RecompD3dRenderStateModel *recomp_d3d8_state_model(void) { return &state; }
 bool recomp_d3d8_state_set_simple(uint32_t method, uint32_t value)
 {
@@ -89,6 +91,8 @@ bool recomp_d3d8_resource_inline_texture(uint32_t stage, RecompD3dTextureDesc *o
     *out = texture;
     return true;
 }
+void recomp_d3d8_fit_2d_layer(RecompD3dPresenterDrawCommand *draw) { (void)draw; }
+void recomp_d3d8_fit_3d_viewport(RecompD3dPresenterDrawCommand *draw) { (void)draw; }
 bool recomp_d3d8_draw_has_coverage(const RecompD3dPresenterDrawCommand *draw)
 {
     ++coverage_queries;
@@ -352,6 +356,12 @@ static int draw_tests(void)
     *recomp_memory_u32(DEVICE + 0xf88u) = 0u;
     invoke(0x348240u, 2u, 2u, VERTICES, 20u);
     CHECK(submits == quads + 4u && submitted.data.draw.fvf == 0x44u && !submitted.data.draw.has_texture);
+    /* The clean view leaves out a pretransformed fixed-function draw but still counts it. */
+    const uint32_t counted = recomp_d3d8_draw_submitted();
+    overlay_hidden = true;
+    invoke(0x348240u, 2u, 2u, VERTICES, 20u);
+    overlay_hidden = false;
+    CHECK(submits == quads + 4u && recomp_d3d8_draw_submitted() == counted + 1u);
     /* Width 2 widens an x-major line by one pixel above and below. */
     const float line[10] = {10.0f, 20.0f, 0.0f, 1.0f, 0.0f, 50.0f, 24.0f, 0.0f, 1.0f, 0.0f};
     const float wide = 2.0f;
@@ -502,7 +512,8 @@ static int point_tests(void)
     CHECK(*recomp_memory_u32(DEVICE + 0xf94u) == 0x7000u);
     inline_texture_active = false;
     texture.data = saved_data;
-    /* 0x1f5030 leaves LIGHTING on for texture-RGB/material-alpha point sprites. */
+    /* 0x1f5030 and the snow at 0x1ed3a0 and 0x1a54a0 leave LIGHTING on for texture-RGB
+       point sprites. With COLORVERTEX and a COLOR1 source, lit alpha is vertex alpha. */
     *recomp_memory_u32(0x3553f8u) = *recomp_memory_u32(0x355404u) = 1u;
     *recomp_memory_u32(0x355408u) = *recomp_memory_u32(0x355418u) = 2u;
     *recomp_memory_u32(0x35540cu) = *recomp_memory_u32(0x35541cu) = 1u;
@@ -510,6 +521,28 @@ static int point_tests(void)
     recomp_guest_store(DEVICE + 0xf0cu, &material_alpha, sizeof material_alpha);
     /* Unused lighting RGB data must not affect this material or trigger guards. */
     *recomp_memory_u32(DEVICE + 0xf00u) = 0x7fc00000u;
+    invoke(0x348240u, 1u, 1u, VERTICES, 16u);
+    memcpy(&diffuse, &captured_vertices[3], sizeof diffuse);
+    CHECK(!draw->directional.enabled && diffuse == 0x80ffffffu &&
+        draw->material_alpha_mode == RECOMP_D3D_MATERIAL_ALPHA_NONE);
+    /* Koku-An's linear table fog (FUN_00286000) reaches the draw on eye depth. */
+    const float fog_range[3] = {12.3f, 90.5f, 0.0f};
+    recomp_guest_store(0x3553d8u, fog_range, sizeof fog_range);
+    *recomp_memory_u32(0x3553d0u) = 1u;
+    *recomp_memory_u32(0x3553d4u) = 3u;
+    *recomp_memory_u32(0x355488u) = 0xff37414eu;
+    invoke(0x348240u, 1u, 1u, VERTICES, 16u);
+    CHECK(draw->fog_mode == 1u && draw->fog_start == 12.3f && draw->fog_end == 90.5f &&
+        draw->fog_depth[0] == 1.0f && draw->fog_depth[1] == 0.0f && draw->fog_color == 0xff37414eu);
+    *recomp_memory_u32(0x3553e4u) = 1u;
+    invoke(0x348240u, 1u, 1u, VERTICES, 16u);
+    CHECK(draw->fog_mode == 0u);
+    *recomp_memory_u32(0x3553e4u) = 0u;
+    *recomp_memory_u32(0x3553d0u) = 0u;
+    invoke(0x348240u, 1u, 1u, VERTICES, 16u);
+    CHECK(draw->fog_mode == 0u);
+    /* A MATERIAL diffuse source takes the material's diffuse alpha instead. */
+    *recomp_memory_u32(0x35541cu) = 0u;
     invoke(0x348240u, 1u, 1u, VERTICES, 16u);
     memcpy(&diffuse, &captured_vertices[3], sizeof diffuse);
     CHECK(!draw->directional.enabled && diffuse == 0xffffffffu &&
@@ -1594,6 +1627,42 @@ static int effect_tests(void)
     return 0;
 }
 
+/* Leon's Story ending (FUN_001aa820): stage 0 MODULATE(TEXTURE, DIFFUSE), stage 1
+   SELECTARG2(CURRENT) color and MODULATE(TEXTURE, CURRENT) alpha at UV0 through
+   TEXTURE1, COUNT2. */
+static int stage1_transform_tests(void)
+{
+    if (setjmp(stopped) != 0) { fprintf(stderr, "Unexpected stop: %s\n", stop_reason); return 1; }
+    initialize();
+    *recomp_memory_u32(0x3553f8u) = 0u;
+    *recomp_memory_u32(DEVICE + 0xf88u) = 0x7000u;
+    *recomp_memory_u32(DEVICE + 0xf8cu) = 0x7000u;
+    const float texture1[16] = {0.5f,0,0,0, 0,1,0,0, 0.25f,0,1,0, 0,0,0,1};
+    recomp_guest_store(DEVICE + 0xd20u, texture1, sizeof texture1);
+    set_stage(0u, 12u, 4u); set_stage(0u, 14u, 2u); set_stage(0u, 15u, 0u);
+    set_stage(0u, 16u, 4u); set_stage(0u, 18u, 2u); set_stage(0u, 19u, 0u);
+    set_stage(1u, 0u, 3u); set_stage(1u, 1u, 3u);
+    set_stage(1u, 12u, 3u); set_stage(1u, 14u, 2u); set_stage(1u, 15u, 1u);
+    set_stage(1u, 16u, 4u); set_stage(1u, 18u, 2u); set_stage(1u, 19u, 1u);
+    set_stage(1u, 21u, 2u);
+    *recomp_memory_u32(DEVICE + 0x798u) = 0x142u;
+    invoke(0x348240u, 5u, 3u, VERTICES, 24u);
+    const RecompD3dPresenterDrawCommand *draw = &submitted.data.draw;
+    CHECK(submits == 1u && draw->stage1_alpha_mask && draw->stage1_mask_transform &&
+        !draw->stage1_alpha_kill && !draw->stage1_kill_only && draw->reflection_address_u == 3u &&
+        draw->reflection_stage1_transform[0] == 0.5f && draw->reflection_stage1_transform[8] == 0.25f);
+    /* The transformed mask has no ALPHAKILL path, so a kill stops. */
+    set_stage(1u, 11u, 4u);
+    if (setjmp(stopped) == 0) { invoke(0x348240u, 5u, 3u, VERTICES, 24u); return 1; }
+    CHECK(submits == 1u && strncmp(stop_reason, "d3d8:stage1-mask:", 17) == 0);
+    set_stage(1u, 11u, 0u);
+    /* Without the transform, a UV0 mask that multiplies alpha is still unsupported. */
+    set_stage(1u, 21u, 0u);
+    if (setjmp(stopped) == 0) { invoke(0x348240u, 5u, 3u, VERTICES, 24u); return 1; }
+    CHECK(submits == 1u && strncmp(stop_reason, "d3d8:stage1-mask:", 17) == 0);
+    return 0;
+}
+
 /* The stage effect's bump pass (FUN_0027ffc0 definition, FUN_002807f0 state). */
 static int bump_tests(void)
 {
@@ -1936,7 +2005,8 @@ int main(void)
 {
     initialize();
     if (pixel_tests() || draw_tests() || line_tests() || quad_tests() || point_tests() || lighting_tests() || filter_tests() || bright_tests() ||
-        distortion_tests() || factor_tests() || position_texgen_tests() || effect_tests() || program_tests() || bump_tests() ||
+        distortion_tests() || factor_tests() || position_texgen_tests() || effect_tests() ||
+        stage1_transform_tests() || program_tests() || bump_tests() ||
         volume_tests() || reflection_inverse_tests() || reflection_coverage_tests() || frame_buffer_tests() || depth_bias_tests()) return 1;
     puts("PASS D3D8 pixel lifecycle/constants and semantic draw ABI/snapshots");
     return 0;

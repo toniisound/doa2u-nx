@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Extract a user-owned Xbox ISO locally with XboxDev extract-xiso."""
 import argparse
+import ctypes
 import hashlib
 import json
+import locale
+import os
 from pathlib import Path
 import re
 import shutil
@@ -23,7 +26,23 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def run_logged(args, log_path, cwd=None, on_line=None):
+def private_pattern(home, user):
+    """The player's home folder, or their user name as any folder, in either slash direction or case."""
+    home = str(home).rstrip("\\/")
+    names = [r"[\\/]".join(map(re.escape, re.split(r"[\\/]", home)))] if home and not home.endswith(":") else []
+    names += [r"(?<=[\\/])" + re.escape(name) for name in (re.split(r"[\\/]", home)[-1], user) if name]
+    return re.compile("(?:" + "|".join(names) + r")(?![\w.-])", re.IGNORECASE) if names else None
+
+
+PRIVATE = private_pattern(os.path.expanduser("~"), os.environ.get("USERNAME") or os.environ.get("USER"))
+
+
+def redact_private(text, pattern=PRIVATE):
+    """Players paste logs into public issues, so their home folder and user name become ~."""
+    return pattern.sub("~", text) if pattern else text
+
+
+def run_logged(args, log_path, cwd=None, on_line=None, redact=True):
     """Run a tool into its log; echo each line, or call on_line instead."""
     if on_line is None:
         print(f"{log_path.stem}... (log: {log_path})", flush=True)
@@ -31,6 +50,8 @@ def run_logged(args, log_path, cwd=None, on_line=None):
         with subprocess.Popen([str(arg) for arg in args], cwd=cwd,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
             for line in process.stdout:
+                if redact:
+                    line = redact_private(line.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
                 log.write(line)
                 log.flush()
                 if on_line is None:
@@ -40,6 +61,20 @@ def run_logged(args, log_path, cwd=None, on_line=None):
             code = process.wait()
         if code:
             raise subprocess.CalledProcessError(code, args)
+
+
+def narrow_encoding():
+    """The code page a narrow-character program reads names in; UTF-8 mode hides it from locale."""
+    return f"cp{ctypes.windll.kernel32.GetACP()}" if os.name == "nt" else sys.getfilesystemencoding()
+
+
+def read_listing(path):
+    """extract-xiso prints the image path in that code page, not UTF-8."""
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(narrow_encoding(), "replace")
 
 
 def listing_files(text):
@@ -81,6 +116,16 @@ def listing_files(text):
     return files
 
 
+def check_path(path):
+    """extract-xiso reads narrow paths, so Windows hands it the ANSI form of a name."""
+    try:
+        str(path).encode(narrow_encoding())
+    except UnicodeEncodeError:
+        raise ValueError(f"extract-xiso reads names in {narrow_encoding()}, which cannot store "
+                         "every character of the ISO or output path; move both to a path that "
+                         "code page can store")
+
+
 def extract(iso, output, tool):
     private = package_root() / "private"
     private.mkdir(exist_ok=True)
@@ -94,6 +139,8 @@ def extract(iso, output, tool):
     iso = iso.resolve(strict=True)
     if not iso.is_file():
         raise ValueError("Input must be an ISO file")
+    check_path(iso)
+    check_path(output)
     executable = shutil.which(str(tool))
     if not executable:
         raise ValueError("Install XboxDev extract-xiso or pass --extractor <executable>")
@@ -101,8 +148,9 @@ def extract(iso, output, tool):
     output.mkdir(parents=True, exist_ok=False)
     print("Checking ISO hash...", flush=True)
     original_hash = sha256(iso)
-    run_logged([executable, "-l", iso], output / "listing.log")
-    files = listing_files((output / "listing.log").read_text(encoding="utf-8", errors="strict"))
+    # Redaction could rewrite a disc folder named like the user, and listing_files parses this log.
+    run_logged([executable, "-l", iso], output / "listing.log", redact=False)
+    files = listing_files(read_listing(output / "listing.log"))
     if shutil.disk_usage(output).free < sum(files.values()):
         raise ValueError("Not enough disk space for the listed files")
     disc = output / "disc"

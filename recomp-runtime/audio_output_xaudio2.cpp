@@ -16,7 +16,7 @@
 
 namespace {
 
-constexpr uint32_t kVoiceCount = 256;
+constexpr uint32_t kVoiceCount = RECOMP_AUDIO_OUTPUT_SLOTS;
 /* The ring bounds memory; the time budget bounds latency, so voices that
    submit millisecond pieces are not dropped after a few milliseconds. */
 constexpr uint32_t kQueueSize = 128;
@@ -275,11 +275,12 @@ extern "C" void recomp_audio_output_initialize(void)
         return;
     }
     HRESULT error = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(error)) {
+    // The Vulkan renderer's SDL window already made this thread single-threaded; XAudio2 runs in either.
+    if (FAILED(error) && error != RPC_E_CHANGED_MODE) {
         disableOutput("CoInitializeEx", error);
         return;
     }
-    com_initialized = true;
+    com_initialized = SUCCEEDED(error);
     error = XAudio2Create(&engine, 0, XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(error)) {
         disableOutput("XAudio2Create", error);

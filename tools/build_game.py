@@ -22,14 +22,14 @@ CAPSTONE = "5.0.7"
 PILLOW = "12.2.0"  # minimum; run_game.py builds the optional dedication card with it
 # The generated program the runtime was validated against. Changing the lifter
 # pin or the function list in tools/doa2u/functions changes it; regenerate and update both.
-PROGRAM_SHA256 = "5f43bf496a7b2e22c66598ed75eda161220eb420b55e833e5f3e70ce84ad1760"
+PROGRAM_SHA256 = "ba127cee2e4b0aa222ef2ddaf9984c131be2a84def362b752d3811551ed68517"
 PROGRAM_EBP = 0
 # The disassembler's function list, minus call edges the lift does not need, so players skip disassembly.
 FUNCTIONS = ROOT / "tools/doa2u/functions"
 # Seconds and output lines each step took in the validated build; they pace the progress bar.
 # The build starts every generated file at once, so the compile advances by time alone.
-STEPS = {"xbe-parser": (5, 253), "disasm": (1440, 33), "lift": (315, 55),
-         "configure": (30, 20), "build": (245, 0)}
+STEPS = {"xbe-parser": (5, 253), "disasm": (1440, 33), "lift": (160, 55),
+         "configure": (30, 20), "build": (225, 0)}
 LABELS = {"xbe-parser": "Reading the executable", "disasm": "Disassembling",
           "lift": "Translating to C", "configure": "Configuring", "build": "Compiling"}
 
@@ -129,10 +129,11 @@ def use_windows_newlines(generated):
             path.write_bytes(data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 
 
-def runner_path(root=ROOT):
-    """The Windows runner builds with llvm-mingw in its own folder, so an old MSVC cache cannot clash."""
+def runner_path(root=ROOT, vulkan=False):
+    """The Windows runner builds with llvm-mingw in its own folder, so an old MSVC cache cannot clash.
+    Windows also builds a Vulkan runner; elsewhere the one runner already renders through SDL_GPU."""
     if sys.platform == "win32":
-        return root / "build/recomp-program-mingw/recomp_program_runner.exe"
+        return root / f"build/recomp-program-mingw/recomp_program_runner{'_vulkan' if vulkan else ''}.exe"
     return root / "build/recomp-program/recomp_program_runner"
 
 
@@ -185,10 +186,26 @@ def import_disc(iso, extractor=None):
     receipt = imported / "receipt.json"
     if receipt.is_file():
         print("Checking the ISO against the existing extraction...", flush=True)
-        if json.loads(receipt.read_text(encoding="utf-8"))["iso_sha256"] != sha256(iso):
-            raise ValueError(f"{imported} holds a different disc; move it away to use this ISO")
-        print(f"Using the disc already extracted to {imported / 'disc'}", flush=True)
-    else:
+        if json.loads(receipt.read_text(encoding="utf-8"))["iso_sha256"] == sha256(iso):
+            print(f"Using the disc already extracted to {imported / 'disc'}", flush=True)
+        else:
+            # Stage first, so picking the wrong ISO cannot destroy a usable import.
+            staging = imported.with_name(imported.name + ".staging")
+            if staging.exists():
+                print(f"Removing the old staged extraction in {staging}", flush=True)
+                shutil.rmtree(staging)
+            bundled = ROOT / "tools/artifacts/extract-xiso.exe"
+            try:
+                extract(iso, staging, extractor or (bundled if bundled.is_file() else extract_xiso(ROOT)))
+                if not any(sha256(xbe) == XBE_SHA256 for xbe in (staging / "disc").glob("*.xbe")):
+                    raise ValueError("This build supports only Dead or Alive Ultimate (Xbox, USA) Disc 2")
+                shutil.rmtree(imported)
+                staging.rename(imported)
+                print(f"Swapped in the staged disc at {imported / 'disc'}", flush=True)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+    if not receipt.is_file():
         if imported.exists():
             print(f"Removing the unfinished extraction in {imported}", flush=True)
             shutil.rmtree(imported)
@@ -206,6 +223,8 @@ def import_disc(iso, extractor=None):
 
 def build(build_only=False, lift_only=False, iso=None, disassemble=False, extractor=None):
     windows = sys.platform == "win32"
+    if windows and (ROOT / "tools/cmake/bin").is_dir():  # the Windows release ZIP carries CMake
+        os.environ["PATH"] = os.pathsep.join([str(ROOT / "tools/cmake/bin"), os.environ.get("PATH", "")])
     # SDL3's Wayland header step hands the build path to /bin/sh unquoted; spaces survive, these do not.
     if (sys.platform.startswith("linux") and not lift_only
             and set(str(ROOT)) & set("()&;|<>`$'\"\\*?[]!#~{}\n")):
@@ -299,11 +318,15 @@ def build(build_only=False, lift_only=False, iso=None, disassemble=False, extrac
                 f"-DRECOMP_PROGRAM_EBP_EXPECTED={receipt['ebp_count']}"], logs / "configure.log")
     # Linux builds the settings launcher beside the runner; SteamOS has no compiler.
     targets = ["recomp_program_runner"] + (["recomp_launcher"] if sys.platform.startswith("linux") else [])
+    if windows:
+        targets.append("recomp_program_runner_vulkan")
     # Generated chunks are large; outside Windows more jobs than this can exhaust memory.
     jobs = str(os.cpu_count() or 4) if windows else str(min(4, os.cpu_count() or 1))
     progress.run(["cmake", "--build", build_dir, "--parallel", jobs,
                 "--target", *targets], logs / "build.log")
     receipt["runner_sha256"] = sha256(runner_path())
+    if windows:
+        receipt["vulkan_runner_sha256"] = sha256(runner_path(vulkan=True))
     receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
 
 

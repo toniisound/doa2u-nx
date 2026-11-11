@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "fiber_adapter.h"
+#include "native_fiber.h"
 #include "xbox_memory_layout.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -17,6 +19,8 @@ enum {
 static uint8_t memory[RECOMP_XBOX_RAM_SIZE];
 static int passed = 1;
 static uint32_t entry_count;
+static uint32_t task_passes; /* a count the task keeps on its native stack */
+static void *task_native;
 
 static void check(const char *field, uint32_t actual, uint32_t expected)
 {
@@ -42,8 +46,11 @@ static void test_fiber_entry(void)
     const uint32_t esp = recomp_runtime.registers.esp;
     const uint32_t handle = recomp_fiber_adapter_model()->current_handle;
     check("entry parameter", *recomp_memory_u32(esp + 4u), 0x22222222u);
+    task_native = recomp_native_fiber_current();
+    volatile uint32_t passes = 0u;
     for (;;) {
         ++entry_count;
+        task_passes = ++passes;
         check("task TLS fiber", *recomp_memory_u32(TLS_BLOCK + 0xcu), handle);
         recomp_runtime.registers.ebx = 0x12345678u;
         *recomp_memory_u32(XBOX_PCR_BASE) = 0x87654321u;
@@ -100,6 +107,38 @@ int main(void)
         check("main TLS fiber", *recomp_memory_u32(TLS_BLOCK + 0xcu), main_fiber);
     }
     check("thread context", recomp_fiber_thread_context(), main_fiber);
+    /* A thread parked in the task resolves to its own fiber, so a reset frees each once. */
+    check("task maps to thread fiber", recomp_fiber_adapter_thread_fiber(task_native) == recomp_native_fiber_current(), 1u);
+    check("thread fiber maps to itself",
+        recomp_fiber_adapter_thread_fiber(recomp_native_fiber_current()) == recomp_native_fiber_current(), 1u);
+
+    /* A snapshot rewinds a delete; the parked context resumes in place. */
+    void *saved = malloc(recomp_fiber_adapter_state_size());
+    if (saved == NULL) return 1;
+    recomp_fiber_adapter_state_save(saved);
+    arguments[0] = second;
+    call(RECOMP_XAPI_DELETE_FIBER, 1u, arguments);
+    recomp_fiber_adapter_state_restore(saved);
+    free(saved);
+    arguments[0] = second;
+    call(RECOMP_XAPI_SWITCH_TO_FIBER, 1u, arguments);
+    check("task resumed after rewind", entry_count, 3u);
+    check("main after rewind", *recomp_memory_u32(TLS_BLOCK + 0xcu), main_fiber);
+
+    /* A snapshot also takes back what the task ran since: its native stack rewinds with it. */
+    saved = malloc(recomp_fiber_adapter_state_size());
+    if (saved == NULL) return 1;
+    recomp_fiber_adapter_state_save(saved);
+    check("state is restorable", recomp_fiber_adapter_state_restorable(saved), 1u);
+    arguments[0] = second;
+    call(RECOMP_XAPI_SWITCH_TO_FIBER, 1u, arguments);
+    check("task ran on", task_passes, 4u);
+    recomp_fiber_adapter_state_restore(saved);
+    free(saved);
+    arguments[0] = second;
+    call(RECOMP_XAPI_SWITCH_TO_FIBER, 1u, arguments);
+    check("task's stack rewound", task_passes, 4u);
+
     arguments[0] = second;
     call(RECOMP_XAPI_DELETE_FIBER, 1u, arguments);
     recomp_fiber_adapter_reset();

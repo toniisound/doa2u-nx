@@ -1,18 +1,37 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "host_diagnostics.h"
 #include "d3d8_adapter.h"
+#include "d3d_presenter.h"
 #include "dsound_api_adapter.h"
+#include "dsound_buffer_adapter.h"
+#include "guest_snapshot.h"
+#include "fiber_adapter.h"
+#include "free_camera_adapter.h"
+#include "cpu_costume.h"
+#include "unlock_profile.h"
+#include "pc_settings.h"
+#include "runner_assets.h"
+#include "menu_quit.h"
+#include "pc_settings_store.h"
 #include "input_adapter.h"
 #include "input_host_win32.h"
 #include "input_pulse_source.h"
+#include "netplay_menu.h"
+#include "netplay_session.h"
+#include "perf_overlay.h"
+#include "rollback.h"
 #include "runner_load.h"
 #include "save_transaction.h"
+#include "synctest.h"
 #include "d3d_vblank.h"
 #include "xapi_time_adapter.h"
 #include "xbox_memory_layout.h"
 extern "C" {
 #include "kernel_abi.h"
+#include "native_fiber.h"
+#include "overlay_text.h"
 #include "program_manual.h"
+#include "quit_prompt.h"
 #include "stop_report.h"
 RecompFunction recomp_program_lookup(std::uint32_t address);
 }
@@ -34,13 +53,61 @@ RecompFunction recomp_program_lookup(std::uint32_t address);
 #include <strings.h>
 #define _stricmp strcasecmp
 #endif
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <timeapi.h>
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+#endif
 
 static RecompInputPulseSource inputPulses;
 static bool scriptedInputOnly;
+// SyncTest's RAM snapshots read this; write tracking is fixed when guest RAM is allocated.
+static bool guestRamWriteWatch;
+static std::uint8_t *guestRam;
+
+static void quitPrompt(std::uint32_t port, RecompInputGamepad *gamepad)
+{
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    RecompOverlayText text;
+    recomp_overlay_clear(&text);
+    switch (recomp_quit_prompt_filter(port, gamepad, static_cast<std::uint64_t>(now))) {
+    case RECOMP_QUIT_OPENED:
+        recomp_overlay_set_title(&text, "Quit to the desktop?");
+        recomp_overlay_set_hint(&text, "A quit   B keep playing");
+        recomp_overlay_publish(RECOMP_OVERLAY_QUIT_PROMPT, &text);
+        break;
+    case RECOMP_QUIT_CANCELLED:
+        recomp_overlay_publish(RECOMP_OVERLAY_QUIT_PROMPT, &text);
+        break;
+    case RECOMP_QUIT_CHOSEN:
+        recomp_stop(0, "player-quit");
+        break;
+    case RECOMP_QUIT_NONE:
+        break;
+    }
+}
+
+// A host pad goes through the quit prompt, then the netplay menu. The open
+// prompt owns the pads, so the room cannot inject its A behind it.
+static void filterHostPad(std::uint32_t port, RecompInputGamepad *gamepad, bool sampled)
+{
+    quitPrompt(port, sampled ? gamepad : nullptr);
+    if (sampled && !recomp_quit_prompt_open()) recomp_netplay_menu_filter(port, gamepad);
+}
 
 static bool sampleInput(std::uint32_t port, RecompInputGamepad *gamepad)
 {
-    if (port != 0u) return !scriptedInputOnly && recomp_input_host_sample(port, gamepad);
+    bool present = false;
+    if (recomp_netplay_session_pad(port, gamepad, &present)) return present;
+    if (port != 0u) {
+        const bool sampled = !scriptedInputOnly && recomp_input_host_sample(port, gamepad);
+        filterHostPad(port, gamepad, sampled);
+        return sampled;
+    }
     const bool sampled = recomp_input_pulse_source_sample(&inputPulses, gamepad);
     static bool startHeld;
     const bool start = sampled && (gamepad->buttons & RECOMP_INPUT_BUTTON_START) != 0u;
@@ -49,25 +116,79 @@ static bool sampleInput(std::uint32_t port, RecompInputGamepad *gamepad)
             static_cast<unsigned long long>(inputPulses.sample_count));
         startHeld = start;
     }
-    return sampled;
+    filterHostPad(0u, gamepad, sampled);
+    return recomp_netplay_session_back_pad(gamepad) || sampled;
 }
 
-/* Offer every costume and character. 0x87cfa8 points at the live profile.
-   The game's own award loops (0xdc640, 0xdc100) set each costume byte at
-   +0x2ed8 to that character's costume count from 0x6e0f08 (the select screen
-   shows min(byte, count)), and the three character flags at +0x2ed2 to 1.
-   Repeating them each frame also covers profiles loaded later. */
+/* Offer every costume and character without saving them (unlock_profile.c):
+   the live profile is unlocked in memory each frame, while its saves and
+   awards keep to what was earned, so turning this off gives it back. */
 static bool unlockAll = true; // --no-unlock-all leaves unlocks to play
-static void unlockProfile(std::uint32_t)
+
+/* PC SETTINGS in the game's Options menu (pc_settings.c) edits the launchers'
+   private/launcher.json, which run_game.py names in RECOMP_LAUNCHER_SETTINGS.
+   Unlocks and CPU Costumes change at once (offline only); the other rows
+   apply at the next launch. */
+static std::string launcherSettings;
+static RecompPcSettingsStore pcStore;
+
+static void pcSettingChanged(unsigned setting, unsigned choice, void *)
 {
-    const std::uint32_t profile = *recomp_memory_u32(0x0087cfa8u);
-    if (profile == 0u) return;
-    for (std::uint32_t i = 0; i < 15u; ++i) {
-        const std::uint8_t character = *recomp_memory(0x006959dcu + i, 1u);
-        const std::uint8_t slot = *recomp_memory(0x006959c0u + character, 1u);
-        *recomp_memory(profile + 0x2ed8u + slot, 1u) = *recomp_memory(0x006e0f08u + character, 1u);
+    switch (setting) {
+    case RECOMP_PC_UNLOCKS: unlockAll = choice == 0u; break;
+    case RECOMP_PC_CPU_COSTUMES: recomp_cpu_costume_set_enabled(choice == 1u); break;
+    case RECOMP_PC_FREE_CAMERA: recomp_free_camera_set_enabled(choice == 1u); break;
+    case RECOMP_PC_RESOLUTION:
+    case RECOMP_PC_MSAA:
+    case RECOMP_PC_SMAA: {
+        const unsigned height = RECOMP_PC_HEIGHTS[recomp_pc_settings_choice(RECOMP_PC_RESOLUTION)];
+        const unsigned samples = RECOMP_PC_SAMPLES[recomp_pc_settings_choice(RECOMP_PC_MSAA)];
+        recomp_d3d_presenter_set_quality(static_cast<float>(height) / 480.0f, samples,
+            recomp_pc_settings_choice(RECOMP_PC_SMAA) == 1u);
+        break;
     }
-    std::memset(recomp_memory(profile + 0x2ed2u, 3u), 1, 3u);
+    default: break;
+    }
+}
+
+static void pcSettingsClosed(void *)
+{
+    if (launcherSettings.empty()) return;
+    std::uint8_t choices[RECOMP_PC_SETTING_COUNT];
+    for (unsigned i = 0u; i < RECOMP_PC_SETTING_COUNT; ++i) choices[i] = recomp_pc_settings_choice(i);
+    if (!recomp_pc_settings_write(launcherSettings, pcStore, choices))
+        std::fprintf(stderr, "recomp runner: PC settings not saved; launcher settings unreadable or unwritable\n");
+}
+
+static void installPcSettings(bool online)
+{
+    const char *path = std::getenv("RECOMP_LAUNCHER_SETTINGS");
+    launcherSettings = path != nullptr ? path : "";
+    pcStore = {};
+#ifdef _WIN32
+    // The launchers' defaults: the primary display's height, and its shape for Ultrawide.
+    const int width = GetSystemMetrics(SM_CXSCREEN), height = GetSystemMetrics(SM_CYSCREEN);
+    if (height > 0) pcStore.primaryHeight = height;
+    if (width * 9 > height * 16) pcStore.ultrawideShape = std::to_string(width) + ":" + std::to_string(height);
+#endif
+    std::uint8_t choices[RECOMP_PC_SETTING_COUNT];
+    recomp_pc_settings_read(launcherSettings, pcStore, choices);
+    // The rows that apply at once show what is running. Online turns the free camera
+    // and CPU costumes off for the session, so those rows keep the saved choice.
+    choices[RECOMP_PC_UNLOCKS] = unlockAll ? 0u : 1u;
+    if (!online) {
+        choices[RECOMP_PC_CPU_COSTUMES] = recomp_cpu_costume_enabled() ? 1u : 0u;
+        choices[RECOMP_PC_FREE_CAMERA] = recomp_free_camera_enabled() ? 1u : 0u;
+    }
+    const RecompPcSettingsHost host{pcSettingChanged, pcSettingsClosed, nullptr};
+    recomp_pc_settings_install(&host, choices);
+    // The Vulkan renderer rebuilds its targets live; Direct3D 11 takes them at the next start.
+    const bool quality = recomp_d3d_presenter_quality_live();
+    for (unsigned setting : {RECOMP_PC_RESOLUTION, RECOMP_PC_MSAA, RECOMP_PC_SMAA})
+        recomp_pc_settings_set_live(setting, quality);
+    // Online they show the page's next-start help; the choice applies at the next offline start.
+    for (unsigned setting : {RECOMP_PC_CPU_COSTUMES, RECOMP_PC_FREE_CAMERA})
+        recomp_pc_settings_set_live(setting, !online);
 }
 
 /* Dedication card shown each time the staff roll starts. The BMP is a private
@@ -167,19 +288,43 @@ static void applyStoryFinale()
     }
 }
 
-// Holds the guest at a Swap: 1.5 s fade in, hold, 1.5 s fade out over 10 s.
+// Any pad button or key held now, ignoring thumbsticks and light trigger pressure.
+static bool anyButtonHeld()
+{
+    if (scriptedInputOnly) return false;
+    for (std::uint32_t port = 0; port < RECOMP_INPUT_PORT_COUNT; ++port) {
+        RecompInputGamepad pad{};
+        if (!recomp_input_host_sample(port, &pad)) continue;
+        if (pad.buttons != 0u) return true;
+        for (const std::uint8_t analog : pad.analog_buttons)
+            if (analog >= 0x80u) return true;
+    }
+    return false;
+}
+
+/* Holds the guest at a Swap: 1.5 s fade in, hold, 1.5 s fade out over 10 s.
+   A new button press starts the fade out early; one held from the fight must
+   be released first. */
 static void showCard()
 {
     using namespace std::chrono;
     constexpr auto fade = milliseconds(1500), total = milliseconds(10000);
-    const char *wide = std::getenv("RECOMP_D3D_WIDESCREEN");
-    const float aspect = wide != nullptr && std::strcmp(wide, "0") != 0 ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float aspect = (recomp_kernel_video_flags() & 0x00010000u) != 0u
+        ? recomp_kernel_widescreen_aspect() : 4.0f / 3.0f;
     std::fprintf(stderr, "recomp runner: staff roll starts; dedication card shown\n");
+    // Guest time stops for the card, so the output pump must not play past it.
+    recomp_dsound_output_lock();
     const auto start = steady_clock::now();
+    steady_clock::duration end = total;
+    bool held = true;
     for (auto next = start;;) {
         const auto elapsed = steady_clock::now() - start;
-        if (elapsed >= total) break;
-        const auto edge = std::min<steady_clock::duration>(elapsed, total - elapsed);
+        const bool pressed = anyButtonHeld();
+        // Fade out from the current level: as long as the fade in took so far.
+        if (pressed && !held) end = std::min(end, elapsed + std::min<steady_clock::duration>(elapsed, fade));
+        held = pressed;
+        if (elapsed >= end) break;
+        const auto edge = std::min<steady_clock::duration>(elapsed, end - elapsed);
         const auto level = static_cast<std::uint8_t>(edge >= fade ? 255 : 255 * edge / fade);
         recomp_d3d8_present_card(cardPixels.data(), cardWidth, cardHeight, aspect, level);
         next += microseconds(16667);
@@ -187,15 +332,75 @@ static void showCard()
     }
     recomp_xapi_hold_time(static_cast<std::uint64_t>(
         duration_cast<nanoseconds>(steady_clock::now() - start).count()));
+    recomp_dsound_output_unlock();
 }
 
 static void onSwap(std::uint32_t frame)
 {
-    if (unlockAll) unlockProfile(frame);
+    recomp_unlock_profile_frame(recomp_netplay_session_unlock_all(unlockAll));
     if (storyFinale) applyStoryFinale();
+    recomp_netplay_session_on_swap(frame);
     if (!cardPending) return;
     cardPending = false;
     showCard();
+}
+
+static void saveInputPulses(void *state)
+{
+    std::memcpy(state, &inputPulses, sizeof inputPulses);
+}
+
+static void restoreInputPulses(const void *state)
+{
+    std::memcpy(&inputPulses, state, sizeof inputPulses);
+}
+
+static void onFrameBoundary(std::uint32_t frame)
+{
+    /* A snapshot from before the main fiber exists cannot be restored. */
+    if (recomp_fiber_adapter_model()->current_handle == 0u) return;
+    const RecompSyncTestResult result = recomp_synctest_frame(frame);
+    if (result == RECOMP_SYNCTEST_MISMATCH) recomp_stop(2, "synctest:mismatch");
+    if (result == RECOMP_SYNCTEST_SKIP) recomp_stop(3, "synctest:skip");
+    if (result == RECOMP_SYNCTEST_MATCH && !recomp_synctest_loop())
+        recomp_stop(0, "synctest:match");
+}
+
+static const doaxbv::XbeParseResult *xbe;
+
+static bool loadImage()
+{
+    std::vector<std::uint8_t> image(RECOMP_XBOX_RAM_SIZE, 0u);
+    std::string error;
+    if (!recomp_load_xbe(*xbe, image, error)) {
+        std::cerr << "recomp runner: " << error << '\n';
+        return false;
+    }
+    std::memcpy(guestRam, image.data(), image.size());
+    const auto imageEnd = static_cast<std::uint64_t>(xbe->metadata.header.baseAddress) + xbe->metadata.header.sizeImage;
+    if (!xbox_HeapSetImageEnd(static_cast<std::uint32_t>(imageEnd))) {
+        std::cerr << "recomp runner: invalid heap image boundary\n";
+        return false;
+    }
+    return true;
+}
+
+static void bootGuest();
+
+static VOID WINAPI rebootGuest(void *)
+{
+    recomp_reset_runtime_modules();
+    if (!loadImage()) recomp_stop(2, "runner:reboot-image");
+    bootGuest();
+}
+
+static void reboot()
+{
+    recomp_input_host_stop_vibration();
+    // The guest's stacks are never resumed; the new fiber frees them.
+    void *fiber = recomp_native_fiber_create(rebootGuest, nullptr);
+    if (fiber == nullptr) recomp_stop(2, "runner:reboot-fiber");
+    recomp_native_fiber_switch(fiber);
 }
 
 int main(int argc, char **argv)
@@ -203,6 +408,8 @@ int main(int argc, char **argv)
     recomp_install_host_diagnostics();
     recomp_d3d_frame_breakdown = recomp_kernel_thread_times;
     std::string xbePath, discRoot, expectStop, milestoneLog;
+    std::string replayPath;
+    RecompNetplayLaunch launch;
     recomp_input_pulse_source_init(&inputPulses, recomp_input_host_sample, 0u);
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -221,6 +428,28 @@ int main(int argc, char **argv)
         }
         if (argument == "--skip-intro") {
             recomp_skip_intro = true;
+            continue;
+        }
+        if ((argument == "--netplay-host" || argument == "--netplay-delay") && i + 1 < argc) {
+            const std::string value = argv[++i];
+            std::uint32_t number = 0u;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+            const bool host = argument == "--netplay-host";
+            if (parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() ||
+                (host ? number == 0u || number > 65535u : number > RECOMP_ROLLBACK_WINDOW)) {
+                std::cerr << "recomp runner: --netplay-host needs a UDP port and --netplay-delay at most "
+                          << RECOMP_ROLLBACK_WINDOW << " frames\n";
+                return 64;
+            }
+            (host ? launch.hostPort : launch.delay) = number;
+            continue;
+        }
+        if (argument == "--netplay-join" && i + 1 < argc) {
+            launch.join = argv[++i];
+            continue;
+        }
+        if (argument == "--replay" && i + 1 < argc) {
+            replayPath = argv[++i];
             continue;
         }
         if (argument == "--input-start-pulse-at" && i + 1 < argc) {
@@ -305,7 +534,8 @@ int main(int argc, char **argv)
                 " [--input-buttons-pulse-at <poll> <decimal-mask>]"
                 " [--input-analog-pulse-at <poll> <button-index>]"
                 " [--input-analog-pulse-every <first-poll> <period> <last-poll> <button-index>]"
-                " [--input-script-only] [--story-finale] [--skip-intro] [--no-unlock-all]\n";
+                " [--input-script-only] [--story-finale] [--skip-intro] [--no-unlock-all]"
+                " [--netplay-host <port> [--netplay-delay <frames>] | --netplay-join <host>:<port> | --replay <file>]\n";
             return 64;
         }
         const std::string value = argv[++i];
@@ -316,6 +546,10 @@ int main(int argc, char **argv)
     }
     if (xbePath.empty()) {
         std::cerr << "recomp runner: --xbe is required\n";
+        return 64;
+    }
+    if ((launch.hostPort != 0u) + !launch.join.empty() + !replayPath.empty() > 1) {
+        std::cerr << "recomp runner: --netplay-host, --netplay-join and --replay cannot be combined\n";
         return 64;
     }
     recomp_stop_configure(expectStop.empty() ? nullptr : expectStop.c_str(),
@@ -329,18 +563,14 @@ int main(int argc, char **argv)
         std::cerr << "recomp runner: XBE SHA-256 differs from the authenticated program target\n";
         return 1;
     }
-    std::vector<std::uint8_t> memory(RECOMP_XBOX_RAM_SIZE, 0u);
-    std::string error;
-    if (!recomp_load_xbe(parsed, memory, error)) {
-        std::cerr << "recomp runner: " << error << '\n';
+    xbe = &parsed;
+    std::uint8_t *memory = recomp_guest_ram_allocate(RECOMP_XBOX_RAM_SIZE, &guestRamWriteWatch);
+    guestRam = memory;
+    if (memory == nullptr) {
+        std::cerr << "recomp runner: guest RAM allocation failed\n";
         return 1;
     }
-    const auto imageEnd = static_cast<std::uint64_t>(parsed.metadata.header.baseAddress) +
-        parsed.metadata.header.sizeImage;
-    if (!xbox_HeapSetImageEnd(static_cast<std::uint32_t>(imageEnd))) {
-        std::cerr << "recomp runner: invalid heap image boundary\n";
-        return 1;
-    }
+    if (!loadImage()) return 1;
     if (discRoot.empty()) discRoot = std::filesystem::absolute(std::filesystem::u8path(xbePath)).parent_path().string();
     const auto discPath = std::filesystem::u8path(discRoot);
     std::error_code filesystemError;
@@ -349,31 +579,97 @@ int main(int argc, char **argv)
         return 1;
     }
     recomp_disc_root_path = discRoot.c_str();
+    recomp_netplay_session_init({discPath, RECOMP_NETPLAY_BUILD, &inputPulses, scriptedInputOnly, guestRam, unlockAll, reboot});
+    if ((launch.hostPort != 0u || !launch.join.empty()) && !recomp_netplay_session_connect(launch)) return 1;
+    if (!replayPath.empty() && !recomp_netplay_session_load_replay(replayPath)) return 1;
+    bootGuest();
+}
+
+static void bootGuest()
+{
+    static bool booted;
+    const bool first = !booted;
+    booted = true;
     if (!recomp_save_initialize(recomp_disc_root_path)) {
         std::cerr << "recomp runner: save recovery failed; guest not started\n";
-        return 2;
+        std::exit(2);
     }
-    const RecompMemoryRegion region = {0u, memory.size(), memory.data()};
+    static RecompMemoryRegion region;
+    region = {0u, RECOMP_XBOX_RAM_SIZE, guestRam};
     recomp_runtime_init(&region, 1u, nullptr, 0u, nullptr, 0u);
     recomp_runtime_set_lookup(recomp_program_lookup);
+    if (!recomp_netplay_session_read_env()) {
+        std::cerr << "recomp runner: RECOMP_ROLLBACK must be loopback or udp:<local port>:<peer host>:<peer port>, "
+                  << "with decimal frame counts, a lag or delay of at most " << RECOMP_ROLLBACK_WINDOW
+                  << " frames, and the UDP port must open\n";
+        std::exit(1);
+    }
+    const bool rollbackEnabled = recomp_netplay_session_enabled();
+    // Each boot sets every hook, so nothing from a session that ended carries over.
+    recomp_d3d_frame_boundary_hook = nullptr;
+    recomp_kernel_profile_mutation_hook = nullptr;
+    recomp_xapi_frame_clock_set_enabled(false);
+    recomp_kernel_file_set_synchronous_reads(false);
+    recomp_dsound_buffer_set_game_thread_pump(false);
+    if (recomp_synctest_enabled() || rollbackEnabled) {
+        const char *clock = std::getenv("RECOMP_FRAME_CLOCK");
+        if (clock == nullptr || std::strcmp(clock, "0") != 0)
+            recomp_xapi_frame_clock_set_enabled(true);
+        recomp_synctest_set_guest_ram(guestRam, RECOMP_XBOX_RAM_SIZE, guestRamWriteWatch);
+        recomp_kernel_file_set_synchronous_reads(true);
+        recomp_synctest_install_default_modules();
+        if (!rollbackEnabled) {
+            recomp_synctest_set_extra_state(sizeof inputPulses, saveInputPulses, restoreInputPulses);
+            recomp_d3d_frame_boundary_hook = onFrameBoundary;
+        }
+    }
     recomp_input_adapter_reset();
     recomp_input_adapter_set_source(sampleInput);
     recomp_d3d_present_hook = onSwap;
-    if (const char *card = std::getenv("RECOMP_DEDICATION_CARD"); card != nullptr && *card != '\0') {
+    recomp_d3d_overlay_hooks[RECOMP_D3D_OVERLAY_PERF] = recomp_perf_overlay;
+    recomp_netplay_session_install(recomp_synctest_enabled());
+    /* The free camera and the scene freeze run only with RECOMP_FREE_CAMERA=1,
+       and never online; off, input samples and task switches go unhooked.
+       Random CPU costumes are off online too, where both games must agree. */
+    const bool online = recomp_netplay_session_enabled() || recomp_synctest_enabled();
+    recomp_free_camera_install(online);
+    recomp_cpu_costume_install(online);
+    recomp_unlock_profile_reset();
+    recomp_runner_assets_reset();
+    installPcSettings(online);
+    recomp_menu_quit_install();
+    if (const char *card = std::getenv("RECOMP_DEDICATION_CARD"); first && card != nullptr && *card != '\0') {
         if (loadCard(card)) recomp_kernel_read_hook = noteRead;
         else std::fprintf(stderr, "recomp runner: dedication card is not a 24/32-bit BMP; skipped\n");
     }
-    if (!scriptedInputOnly) recomp_input_adapter_set_feedback_sink(recomp_input_host_set_vibration);
-    std::atexit(recomp_input_host_stop_vibration);
-    std::atexit(recomp_d3d8_shutdown);
-    std::atexit(recomp_dsound_api_shutdown);
+    if (!scriptedInputOnly) recomp_input_adapter_set_feedback_sink(recomp_netplay_session_set_vibration);
+    if (first) {
+#ifdef _WIN32
+        /* Guest frame waits that lost a 15.6 ms scheduler tick dropped frames on
+           a power-managed handheld (issue #69): ask for a 1 ms tick, keep Windows
+           from throttling the process, and run the game thread above normal. */
+        timeBeginPeriod(1u);
+        PROCESS_POWER_THROTTLING_STATE throttling{PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0u};
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling);
+        // Separate call: Windows 10 rejects the Windows 11 timer flag.
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+        std::atexit(recomp_netplay_session_exit);
+        std::atexit(recomp_input_host_stop_vibration);
+        std::atexit(recomp_d3d8_shutdown);
+        std::atexit(recomp_dsound_api_shutdown);
+        recomp_watchdog_start();
+    }
     recomp_runtime.registers.esp = XBOX_STARTUP_STACK_TOP;
     std::fprintf(stderr, "recomp runner: entry=0x%08x image_end=0x%08x native-d3d8-dsound\n",
-        parsed.metadata.selectedEntryPoint, static_cast<unsigned>(imageEnd));
-    recomp_watchdog_start();
+        xbe->metadata.selectedEntryPoint,
+        static_cast<unsigned>(xbe->metadata.header.baseAddress + xbe->metadata.header.sizeImage));
     recomp_runtime.registers.esp -= 4u;
     *recomp_memory_u32(recomp_runtime.registers.esp) = 0u;
-    recomp_dispatch_indirect_site(parsed.metadata.selectedEntryPoint,
+    recomp_dispatch_indirect_site(xbe->metadata.selectedEntryPoint,
         XBOX_STARTUP_STACK_TOP, __FILE__, __LINE__);
     recomp_kernel_run_threads();
     recomp_stop(0, "program-returned");

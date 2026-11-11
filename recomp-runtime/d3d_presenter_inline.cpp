@@ -124,6 +124,11 @@ RecompD3dPresenterError recomp_d3d_presenter_flush(RecompD3dPresenter *presenter
     return validate(presenter);
 }
 
+bool recomp_d3d_presenter_present_ready(RecompD3dPresenter *presenter)
+{
+    return validate(presenter) != RECOMP_D3D_PRESENTER_OK || d3d_backend_present_ready(active->backend);
+}
+
 RecompD3dPresenterError recomp_d3d_presenter_draw_coverage(
     RecompD3dPresenter *presenter, const RecompD3dPresenterDrawCommand *draw, bool *covered)
 {
@@ -163,6 +168,16 @@ RecompD3dPresenterError recomp_d3d_presenter_destroy(RecompD3dPresenter **presen
 void recomp_d3d_presenter_set_immediate_present(bool enabled)
 {
     d3d_backend_set_immediate_present(enabled);
+}
+
+void recomp_d3d_presenter_set_quality(float scale, uint32_t msaa, bool smaa)
+{
+    d3d_backend_set_quality(scale, msaa, smaa);
+}
+
+bool recomp_d3d_presenter_quality_live()
+{
+    return d3d_backend_quality_live();
 }
 
 void recomp_d3d_presenter_report_draw_textures()

@@ -3,12 +3,19 @@
 #include "d3d_card_model.h"
 #include "d3d_draw_model.h"
 
+/* Direct3D 11 runs on its own window thread; SDL_GPU (macOS, Linux and the
+   Windows Vulkan build) runs inline on the caller's. */
+#if defined(_WIN32) && !defined(RECOMP_PRESENTER_SDL_GPU)
+#define RECOMP_TEST_D3D11
+#else
+#include <SDL3/SDL.h>
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include "win32_compat.h"
-#include <SDL3/SDL.h>
 #include <stdlib.h>
 
 /* The SDL_GPU backend: _putenv_s with an empty value removes the variable. */
@@ -25,6 +32,7 @@ static ULONGLONG GetTickCount64()
 
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,7 +82,7 @@ static bool destroy(RecompD3dPresenter *&presenter)
     return passed && presenter == nullptr;
 }
 
-#ifdef _WIN32
+#ifdef RECOMP_TEST_D3D11
 static HWND presenterWindow()
 {
     HWND window = nullptr;
@@ -85,6 +93,59 @@ static HWND presenterWindow()
         if (process == GetCurrentProcessId()) return window;
     }
     return nullptr;
+}
+
+// F11 and Alt+Enter switch the window between a captioned window and a borderless one over its monitor.
+// A scaled presenter starts fullscreen and leaves it for a window centered in the monitor's work area.
+static bool testFullscreenKeys(bool start_fullscreen = false)
+{
+    struct ScaleEnv { // cleared on every return, so a failure here leaves later tests unscaled
+        explicit ScaleEnv(const char *value) { _putenv_s("RECOMP_D3D_SCALE", value); }
+        ~ScaleEnv() { _putenv_s("RECOMP_D3D_SCALE", ""); }
+    } scale_env(start_fullscreen ? "2" : "1");
+    RecompD3dPresenter *presenter = nullptr;
+    if (!expect("create fullscreen", recomp_d3d_presenter_create(&config, &presenter))) return false;
+    uint32_t swap = 1;
+    bool passed = expect("show window", tick(presenter, swap++));
+    const HWND window = presenterWindow();
+    if (window == nullptr) passed = false;
+    const auto fullscreen = [&] {
+        RECT rect{}, screen{};
+        GetWindowRect(window, &rect);
+        MONITORINFO monitor{sizeof monitor};
+        GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
+        screen = monitor.rcMonitor;
+        return (GetWindowLongW(window, GWL_STYLE) & WS_CAPTION) == 0 && EqualRect(&rect, &screen);
+    };
+    // The presenter thread dispatches posted keys between packets, so keep ticking until it has.
+    const auto press = [&](UINT message, WPARAM key, bool expected) {
+        PostMessageW(window, message, key, message == WM_SYSKEYDOWN ? (1 << 29) : 0);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (fullscreen() != expected && std::chrono::steady_clock::now() < until)
+            passed &= expect("tick", tick(presenter, swap++));
+        if (fullscreen() != expected) std::fprintf(stderr, "FAIL fullscreen key %u\n", message);
+        passed &= fullscreen() == expected;
+    };
+    if (passed) {
+        passed &= fullscreen() == start_fullscreen;
+        press(WM_KEYDOWN, VK_F11, !start_fullscreen);
+        if (start_fullscreen) {
+            RECT rect{};
+            GetWindowRect(window, &rect);
+            MONITORINFO monitor{sizeof monitor};
+            GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
+            const LONG dx = (rect.left + rect.right) - (monitor.rcWork.left + monitor.rcWork.right);
+            const LONG dy = (rect.top + rect.bottom) - (monitor.rcWork.top + monitor.rcWork.bottom);
+            if (std::abs(dx) > 1 || std::abs(dy) > 1) std::fprintf(stderr, "FAIL not centered dx=%ld dy=%ld\n", dx, dy);
+            passed &= std::abs(dx) <= 1 && std::abs(dy) <= 1;
+        }
+        press(WM_SYSKEYDOWN, VK_RETURN, start_fullscreen);
+        press(WM_SYSKEYDOWN, VK_RETURN, !start_fullscreen);
+        press(WM_KEYDOWN, VK_F11, start_fullscreen);
+    }
+    passed &= destroy(presenter);
+    if (passed) std::puts(start_fullscreen ? "PASS F11 leaves fullscreen centered" : "PASS F11 and Alt+Enter toggle fullscreen");
+    return passed;
 }
 #endif
 
@@ -113,6 +174,15 @@ static bool testTicks()
     passed &= expect("publish without present", recomp_d3d_presenter_flush(presenter, false));
     passed &= expect("wait idle", recomp_d3d_presenter_flush(presenter, true));
     passed &= expect("empty wait idle", recomp_d3d_presenter_flush(presenter, true));
+    // Once the host catches up, Swap's guest wait for the presenter ends.
+    const auto ready_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!recomp_d3d_presenter_present_ready(presenter) && std::chrono::steady_clock::now() < ready_by) {
+        std::this_thread::yield();
+    }
+    if (!recomp_d3d_presenter_present_ready(presenter)) {
+        std::fprintf(stderr, "FAIL present ready after idle\n");
+        passed = false;
+    }
     recomp_d3d_presenter_report_draw_textures();
     passed &= destroy(presenter);
     if (passed) std::puts("PASS five CLEAR/PRESENT ticks and partial shutdown");
@@ -1852,7 +1922,7 @@ static bool testClose(bool idle)
 {
     RecompD3dPresenter *presenter = nullptr;
     if (!expect("create close", recomp_d3d_presenter_create(&config, &presenter))) return false;
-#ifndef _WIN32
+#ifndef RECOMP_TEST_D3D11
     /* SDL delivers a close to the presenter's own thread at its next present. */
     SDL_Event quit{};
     quit.type = SDL_EVENT_QUIT;
@@ -1937,13 +2007,24 @@ static bool testVisibility()
     bool complete = true;
     uint32_t pixels[2]{};
     passed &= expect("queued result", recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels[0]));
-#ifdef _WIN32
+#ifdef RECOMP_TEST_D3D11
     // The render thread publishes nothing before the flush.
     passed &= !complete;
 #endif
     passed &= expect("unknown index", recomp_d3d_presenter_visibility_result(presenter, 9u, &complete, &pixels[0]),
         RECOMP_D3D_PRESENTER_INVALID_ARGUMENT);
     passed &= expect("publish visibility", recomp_d3d_presenter_flush(presenter, false));
+#ifdef RECOMP_TEST_D3D11
+    passed &= expect("wait for visibility", recomp_d3d_presenter_flush(presenter, true));
+    complete = false;
+    passed &= expect("index 7 resolves before the wait returns",
+        recomp_d3d_presenter_visibility_result(presenter, 7u, &complete, &pixels[0]));
+    passed &= complete;
+    complete = false;
+    passed &= expect("index 8 resolves before the wait returns",
+        recomp_d3d_presenter_visibility_result(presenter, 8u, &complete, &pixels[1]));
+    passed &= complete;
+#endif
     const ULONGLONG deadline = GetTickCount64() + 5000u;
     for (uint32_t i = 0; i < 2u && passed; ++i) {
         complete = false;
@@ -1954,7 +2035,7 @@ static bool testVisibility()
         passed &= complete;
     }
     passed &= pixels[0] == 160u * 240u && pixels[1] == 320u * 240u;
-#ifdef _WIN32
+#ifdef RECOMP_TEST_D3D11
     // An END the worker cannot match to a BEGIN fails the presenter.
     passed &= expect("unbegun end", recomp_d3d_presenter_submit(presenter, &end));
     passed &= expect("unbegun end fails", recomp_d3d_presenter_flush(presenter, true),
@@ -2265,7 +2346,7 @@ static bool testCard()
 
 static bool testScaledMsaaDepthBias()
 {
-#ifndef _WIN32
+#ifndef RECOMP_TEST_D3D11
     /* Lavapipe (Linux CI) evaluates the position at each sample when a shader
        runs per sample, so this exact-edge test moves; Metal and RADV pass it. */
     if (std::getenv("RECOMP_TEST_SOFTWARE_VULKAN") != nullptr) {
@@ -2735,11 +2816,11 @@ static bool testWidescreenAntialiasing(bool smaa, bool msaa, unsigned height = 4
         RecompD3dPresenterCommand present{RECOMP_D3D_PRESENTER_COMMAND_PRESENT};
         present.data.present = {5u,1u};
         passed &= expect("AA present", d3d_backend_submit(presenter, &present));
-#ifdef _WIN32
+#ifdef RECOMP_TEST_D3D11
         RECT rect{};
-        const unsigned client_height = (std::min)(height, static_cast<unsigned>(GetSystemMetrics(SM_CYSCREEN)));
+        // A scaled window covers the screen; the picture is fitted into it.
         passed &= GetClientRect(presenterWindow(), &rect) &&
-            rect.right == (client_height * 16u + 8u) / 9u && rect.bottom == client_height;
+            rect.right == GetSystemMetrics(SM_CXSCREEN) && rect.bottom == GetSystemMetrics(SM_CYSCREEN);
 #endif
         passed &= expect("AA target release", d3d_backend_release_memory(presenter, 0x10000u, 4096u, true));
     }
@@ -2881,12 +2962,26 @@ static bool testResampledMsaaTarget()
 
 int main()
 {
+#if defined(_WIN32) && !defined(RECOMP_TEST_D3D11)
+    // Hosted Windows CI has no Vulkan driver; ctest counts this as a skip.
+    SDL_GPUDevice *vulkan = SDL_InitSubSystem(SDL_INIT_VIDEO)
+        ? SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, nullptr) : nullptr;
+    if (vulkan == nullptr) {
+        std::printf("SKIP no Vulkan device: %s\n", SDL_GetError());
+        return 77;
+    }
+    SDL_DestroyGPUDevice(vulkan);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#endif
     recomp_d3d_presenter_set_immediate_present(false);
     if (!testResampledMsaaTarget() ||
         !testWidescreenAntialiasing(false, false) || !testWidescreenAntialiasing(true, false) ||
         !testWidescreenAntialiasing(false, true) || !testWidescreenAntialiasing(true, true) ||
         !testWidescreenAntialiasing(false, false, 1080u) || !testWidescreenAntialiasing(true, true, 1080u, 32u) ||
         !testDrawCoverage() || !testDrawCoverage(true) || !testQueuedDrawCoverage() ||
+#ifdef RECOMP_TEST_D3D11
+        !testFullscreenKeys() || !testFullscreenKeys(true) ||
+#endif
         !testTicks() || !testCapturedDraw() || !testMipSampler() || !testLines() || !testLighting() ||
         !testReflectionStage2() || !testReflectionStage2(true) || !testReflectionStage2(false, true) ||
         !testReflectionAddress(false) || !testReflectionAddress(true) || !testReflectionAddress(true, true) ||

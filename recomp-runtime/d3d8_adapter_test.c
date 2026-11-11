@@ -7,6 +7,7 @@
 #include "d3d_vblank.h"
 #include "stop_report.h"
 
+#include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,6 +54,8 @@ static uint32_t create_count, submit_count, destroy_count;
 static uint32_t vblank_reset_count, wait_present_count, wait_vblank_count;
 void recomp_d3d8_state_reset(void) {}
 void recomp_d3d8_state_write_defaults(bool auto_depth) { (void)auto_depth; }
+void recomp_d3d8_render_state_save(RecompD3dRenderStateModel *state) { (void)state; }
+void recomp_d3d8_render_state_restore(const RecompD3dRenderStateModel *state) { (void)state; }
 void recomp_d3d8_resource_reset(void) {}
 bool recomp_d3d8_resource_describe(uint32_t resource, RecompD3dTextureDesc *out)
 {
@@ -87,6 +90,9 @@ void recomp_d3d8_resource_set_render_targets(uint32_t color, uint32_t depth)
 void recomp_d3d_presenter_report_draw_textures(void) {}
 static unsigned flush_count;
 static bool flush_wait;
+static bool flush_resolves_visibility;
+static bool visibility_complete;
+static uint32_t visibility_pixels, visibility_queried;
 static bool coverage = true;
 static RecompD3dPresenterError coverage_error = RECOMP_D3D_PRESENTER_OK;
 RecompD3dPresenterError recomp_d3d_presenter_draw_coverage(
@@ -101,6 +107,7 @@ RecompD3dPresenterError recomp_d3d_presenter_flush(RecompD3dPresenter *presenter
     (void)presenter;
     ++flush_count;
     flush_wait = wait;
+    if (wait && flush_resolves_visibility) visibility_complete = true;
     return RECOMP_D3D_PRESENTER_OK;
 }
 RecompD3dPresenterError recomp_d3d_presenter_release_memory(
@@ -117,8 +124,20 @@ RecompD3dPresenterError recomp_d3d_presenter_invalidate_textures(
 }
 void recomp_d3d_wait_vblank(void) { ++wait_vblank_count; }
 void recomp_d3d_note_block(uint32_t return_address) { (void)return_address; }
-static bool visibility_complete;
-static uint32_t visibility_pixels, visibility_queried;
+static bool present_ready, host_wait_polled;
+bool recomp_d3d_presenter_present_ready(RecompD3dPresenter *presenter)
+{
+    return presenter == &mock_presenter && present_ready;
+}
+/* Swap must wait as a guest until the presenter can take its frame. */
+bool recomp_kernel_wait_host(bool (*done)(void *context), void *context)
+{
+    present_ready = false;
+    host_wait_polled = !done(context);
+    present_ready = true;
+    host_wait_polled &= done(context);
+    return true;
+}
 RecompD3dPresenterError recomp_d3d_presenter_visibility_result(
     RecompD3dPresenter *presenter, uint32_t index, bool *complete, uint32_t *pixels)
 {
@@ -129,6 +148,7 @@ RecompD3dPresenterError recomp_d3d_presenter_visibility_result(
     return RECOMP_D3D_PRESENTER_OK;
 }
 static uint32_t dispatched, dispatched_context, dispatched_return;
+static uint32_t queue_from_callback; /* the next callback queues one with this context, or 0 */
 void recomp_dispatch_indirect_site(uint32_t guest_address, uint32_t saved_esp,
     const char *member, int line)
 {
@@ -136,6 +156,15 @@ void recomp_dispatch_indirect_site(uint32_t guest_address, uint32_t saved_esp,
     dispatched = guest_address;
     dispatched_return = *recomp_memory_u32(recomp_runtime.registers.esp);
     dispatched_context = *recomp_memory_u32(recomp_runtime.registers.esp + 4u);
+    if (queue_from_callback != 0u) { /* InsertCallback(1, 0x276b50, queue_from_callback) */
+        const uint32_t esp = recomp_runtime.registers.esp;
+        recomp_runtime.registers.esp -= 16u;
+        uint32_t *frame = recomp_memory_u32(recomp_runtime.registers.esp);
+        frame[0] = 0u; frame[1] = 1u; frame[2] = 0x276b50u; frame[3] = queue_from_callback;
+        queue_from_callback = 0u;
+        recomp_d3d8_lookup_manual(0x349e10u)();
+        recomp_runtime.registers.esp = esp;
+    }
     recomp_runtime.registers.esp += 4u; /* cdecl: the callee pops only its return. */
 }
 static jmp_buf stop_environment;
@@ -214,6 +243,8 @@ RecompD3dPresenterError recomp_d3d_presenter_destroy(
 
 static uint32_t saved_display, freed_display;
 uint32_t recomp_kernel_av_get_saved_data_address(void) { return saved_display; }
+static float widescreen_aspect = 16.0f / 9.0f;
+float recomp_kernel_widescreen_aspect(void) { return widescreen_aspect; }
 void recomp_kernel_av_set_saved_data_address(uint32_t address) { saved_display = address; }
 uint32_t recomp_kernel_allocate_contiguous(
     uint32_t size, uint32_t highest_address, uint32_t alignment, uint32_t protect)
@@ -314,6 +345,71 @@ static int create(void)
 {
     const uint32_t arguments[] = {0u, 1u, 0u, 0x40u, PARAMETERS, OUTPUT};
     return call(0x34a470u, arguments, 6u, NULL);
+}
+
+/* Another screen shape fits the 16:9 HUD layer, scissor included; an indexed
+   draw's bounds come from the vertices it uses. */
+static int fit_tests(void)
+{
+    reset_fixture();
+    RecompD3dPresentationParameters wide;
+    memcpy(&wide, recomp_memory(PARAMETERS, sizeof wide), sizeof wide);
+    wide.flags |= 0x10u;
+    memcpy(recomp_memory(PARAMETERS, sizeof wide), &wide, sizeof wide);
+    int passed = create();
+    /* A 200-wide quad, plus two unused vertices spanning the target. */
+    const float vertices[6][4] = {{100.0f, 0.0f, 0.0f, 1.0f}, {300.0f, 0.0f, 0.0f, 1.0f},
+        {100.0f, 100.0f, 0.0f, 1.0f}, {300.0f, 100.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f},
+        {720.0f, 0.0f, 0.0f, 1.0f}};
+    const uint16_t indices[6] = {0u, 1u, 2u, 2u, 1u, 3u};
+    RecompD3dPresenterDrawCommand draw = {0};
+    draw.vertex_bytes = vertices;
+    draw.vertex_stride = sizeof vertices[0];
+    draw.vertex_count = 6u;
+    draw.index_bytes = indices;
+    draw.index_count = 6u;
+    draw.target.color.width = 720u;
+    draw.target.color.height = 480u;
+    draw.has_scissor = true;
+    const int32_t full[4] = {0, 0, 720, 480};
+    memcpy(draw.scissor, full, sizeof full);
+    widescreen_aspect = 32.0f / 9.0f;
+    recomp_d3d8_fit_2d_layer(&draw);
+    passed &= expect("ultrawide narrows the HUD layer and its scissor about the center",
+        draw.layer_scale[0] == 0.5f && draw.layer_scale[1] == 1.0f && draw.scissor[0] == 180 &&
+        draw.scissor[1] == 0 && draw.scissor[2] == 540 && draw.scissor[3] == 480);
+    memcpy(draw.scissor, full, sizeof full);
+    widescreen_aspect = 1.6f;
+    recomp_d3d8_fit_2d_layer(&draw);
+    passed &= expect("16:10 shortens the HUD layer and its scissor about the center",
+        draw.layer_scale[0] == 1.0f && fabsf(draw.layer_scale[1] - 0.9f) < 1e-5f && draw.scissor[0] == 0 &&
+        draw.scissor[1] >= 23 && draw.scissor[1] <= 24 && draw.scissor[2] == 720 &&
+        draw.scissor[3] >= 456 && draw.scissor[3] <= 457);
+    /* A 3D view in a menu panel moves with the panel and keeps its size. */
+    RecompD3dPresenterDrawCommand view = {0};
+    view.target.color.width = 720u;
+    view.target.color.height = 480u;
+    const float panel[6] = {100.0f, 0.0f, 200.0f, 100.0f, 0.0f, 1.0f};
+    memcpy(view.viewport, panel, sizeof panel);
+    view.has_scissor = true;
+    const int32_t panel_clip[4] = {100, 0, 300, 100};
+    memcpy(view.scissor, panel_clip, sizeof panel_clip);
+    view.program_count = 1u;
+    view.program_constants[58][0] = 100.0f;
+    view.program_constants[59][0] = 200.0f;
+    widescreen_aspect = 32.0f / 9.0f;
+    recomp_d3d8_fit_3d_viewport(&view);
+    passed &= expect("ultrawide moves a 3D panel view toward the center with its scissor",
+        view.viewport[0] == 180.0f && view.viewport[2] == 200.0f && view.viewport[1] == 0.0f &&
+        view.viewport[3] == 100.0f && view.scissor[0] == 230 &&
+        view.scissor[2] == 330 && view.program_constants[59][0] == 280.0f);
+    view.viewport[0] = 0.0f;
+    view.viewport[2] = 720.0f;
+    recomp_d3d8_fit_3d_viewport(&view);
+    passed &= expect("a full-width 3D view stays", view.viewport[0] == 0.0f && view.viewport[2] == 720.0f &&
+        view.viewport[1] == 0.0f && view.viewport[3] == 100.0f);
+    widescreen_aspect = 16.0f / 9.0f;
+    return passed;
 }
 
 static int coverage_tests(void)
@@ -643,7 +739,7 @@ int main(void)
     passed &= expect("swap ABI, counter, pacing and physical storage rotation",
         recomp_runtime.registers.eax == 1u &&
         recomp_runtime.registers.esp == ENTRY_ESP + 8u &&
-        *recomp_memory_u32(DEVICE + 0x2478u) == 1u && wait_present_count == 1u &&
+        *recomp_memory_u32(DEVICE + 0x2478u) == 1u && wait_present_count == 1u && host_wait_polled &&
         submitted.type == RECOMP_D3D_PRESENTER_COMMAND_PRESENT &&
         submitted.data.present.effective_flags == 5u &&
         submitted.data.present.swap_counter == 1u &&
@@ -795,11 +891,58 @@ int main(void)
         submitted.type == RECOMP_D3D_PRESENTER_COMMAND_VISIBILITY_END &&
         submitted.data.visibility_index == 0x11u &&
         recomp_runtime.registers.esp == ENTRY_ESP + 8u && recomp_runtime.registers.eax == 0u);
+    recomp_d3d8_set_gpu_work_suppressed(true);
+    prior_submits = submit_count;
+    passed &= call(0x3457c0u, arguments, 0u, NULL);
+    passed &= call(0x345860u, arguments, 1u, NULL);
+    recomp_d3d8_set_gpu_work_suppressed(false);
+    passed &= expect("a repeated run-ahead frame keeps its visibility test off the GPU",
+        submit_count == prior_submits && recomp_runtime.registers.eax == 0u);
     arguments[0] = 1u; arguments[1] = 0x276b50u; arguments[2] = 0x11u;
+    dispatched = 0u;
     passed &= call(0x349e10u, arguments, 3u, NULL);
-    passed &= expect("callback runs as cdecl with its context",
+    passed &= expect("callback waits with the stdcall ABI",
+        dispatched == 0u && recomp_runtime.registers.esp == ENTRY_ESP + 16u &&
+        recomp_runtime.registers.eax == EAX_SENTINEL);
+    arguments[0] = 0u;
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= expect("callback skips the next swap", dispatched == 0u);
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= expect("callback runs as cdecl with its context on the second swap",
         dispatched == 0x276b50u && dispatched_context == 0x11u && dispatched_return == 0u &&
-        recomp_runtime.registers.esp == ENTRY_ESP + 16u && recomp_runtime.registers.eax == EAX_SENTINEL);
+        recomp_runtime.registers.esp == ENTRY_ESP + 8u);
+    arguments[0] = 1u; arguments[1] = 0x276b50u; arguments[2] = 0x11u;
+    queue_from_callback = 0x22u;
+    passed &= call(0x349e10u, arguments, 3u, NULL);
+    arguments[0] = 0u;
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= expect("a callback can queue another",
+        dispatched_context == 0x11u && queue_from_callback == 0u);
+    dispatched = 0u;
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= expect("a callback queued by a callback still skips the next swap", dispatched == 0u);
+    passed &= call(0x34af80u, arguments, 1u, NULL);
+    passed &= expect("a callback queued by a callback runs on the second swap",
+        dispatched == 0x276b50u && dispatched_context == 0x22u);
+    void *callback_state = malloc(recomp_d3d8_state_size());
+    passed &= expect("callback snapshot allocated", callback_state != NULL);
+    if (callback_state != NULL) {
+        arguments[0] = 1u; arguments[1] = 0x276b50u; arguments[2] = 0x33u;
+        passed &= call(0x349e10u, arguments, 3u, NULL);
+        recomp_d3d8_state_save(callback_state);
+        arguments[0] = 0u;
+        passed &= call(0x34af80u, arguments, 1u, NULL);
+        passed &= call(0x34af80u, arguments, 1u, NULL);
+        recomp_d3d8_state_restore(callback_state);
+        dispatched = 0u;
+        passed &= call(0x34af80u, arguments, 1u, NULL);
+        passed &= expect("a restored callback still skips the next swap", dispatched == 0u);
+        passed &= call(0x34af80u, arguments, 1u, NULL);
+        passed &= expect("a restored callback runs on the second swap",
+            dispatched == 0x276b50u && dispatched_context == 0x33u);
+        free(callback_state);
+    }
     arguments[0] = 2u;
     passed &= call(0x349e10u, arguments, 3u, "d3d8:insert-callback:2");
     arguments[0] = 0x11u; arguments[1] = OUTPUT; arguments[2] = 0u;
@@ -816,6 +959,57 @@ int main(void)
     passed &= expect("complete result counts supersampled back-buffer samples",
         recomp_runtime.registers.eax == 0u && recomp_runtime.registers.esp == ENTRY_ESP + 16u &&
         *recomp_memory_u32(OUTPUT) == 600u);
+    visibility_queried = 0u;
+    *recomp_memory_u32(OUTPUT) = EAX_SENTINEL;
+    passed &= call(0x344450u, arguments, 3u, NULL);
+    passed &= expect("completed result stays available before the next end",
+        recomp_runtime.registers.eax == 0u && *recomp_memory_u32(OUTPUT) == 600u &&
+        visibility_queried == 0u);
+    {
+        const unsigned saved_flush_count = flush_count;
+        const bool saved_flush_wait = flush_wait;
+        unsigned char *visibility_state = malloc(recomp_d3d8_state_size());
+        passed &= expect("visibility snapshot allocated", visibility_state != NULL);
+        if (visibility_state != NULL) {
+            passed &= call(0x3457c0u, arguments, 0u, NULL);
+            passed &= call(0x345860u, arguments, 1u, NULL);
+            visibility_complete = false;
+            *recomp_memory_u32(OUTPUT) = EAX_SENTINEL;
+            passed &= call(0x344450u, arguments, 3u, NULL);
+            passed &= expect("new visibility result is pending",
+                recomp_runtime.registers.eax == 0x88760828u &&
+                *recomp_memory_u32(OUTPUT) == EAX_SENTINEL);
+            visibility_complete = false;
+            visibility_pixels = 303u;
+            flush_resolves_visibility = true;
+            recomp_d3d8_state_save(visibility_state);
+            passed &= expect("snapshot captures the pending visibility result",
+                flush_wait && visibility_complete);
+            flush_resolves_visibility = false;
+            visibility_queried = 0u;
+            *recomp_memory_u32(OUTPUT) = EAX_SENTINEL;
+            passed &= call(0x344450u, arguments, 3u, NULL);
+            passed &= expect("captured visibility result is returned",
+                recomp_runtime.registers.eax == 0u && *recomp_memory_u32(OUTPUT) == 606u &&
+                visibility_queried == 0u);
+            passed &= call(0x3457c0u, arguments, 0u, NULL);
+            passed &= call(0x345860u, arguments, 1u, NULL);
+            visibility_pixels = 304u;
+            passed &= call(0x344450u, arguments, 3u, NULL);
+            passed &= expect("live visibility value advances",
+                recomp_runtime.registers.eax == 0u && *recomp_memory_u32(OUTPUT) == 608u);
+            recomp_d3d8_state_restore(visibility_state);
+            visibility_queried = 0u;
+            *recomp_memory_u32(OUTPUT) = EAX_SENTINEL;
+            passed &= call(0x344450u, arguments, 3u, NULL);
+            passed &= expect("restored visibility result is cached",
+                recomp_runtime.registers.eax == 0u && *recomp_memory_u32(OUTPUT) == 606u &&
+                visibility_queried == 0u);
+            free(visibility_state);
+        }
+        flush_count = saved_flush_count;
+        flush_wait = saved_flush_wait;
+    }
     arguments[2] = OUTPUT + 4u;
     passed &= call(0x344450u, arguments, 3u, "d3d8:visibility-timestamp-unbound");
     arguments[0] = 0x12u; arguments[2] = 0u;
@@ -881,6 +1075,7 @@ int main(void)
     const uint32_t partial[5] = {COLOR_HEADER, RECT_SOURCE, 1u, SNAPSHOT, 0u};
     passed &= call(0x344aa0u, partial, 5u, "d3d8:copy-rects-unbound");
     passed &= coverage_tests();
+    passed &= fit_tests();
     recomp_d3d8_shutdown();
     passed &= expect("shutdown destroys presenter once", destroy_count == 1u);
     recomp_d3d8_shutdown();

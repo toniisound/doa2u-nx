@@ -2,9 +2,9 @@
 // Windows launcher, built twice by tools/package_test.py with the C# compiler
 // every Windows ships (.NET Framework 4):
 //   Launcher.exe builds the game from your Disc 2 ISO, picks resolution,
-//     anti-aliasing, SMAA, widescreen, the intro skip and 5.1 surround,
-//     remembers them in private\launcher.json, then plays. An ISO dropped on it
-//     opens the build page with that disc chosen.
+//     anti-aliasing, SMAA, widescreen, the renderer, VRR, the intro skip, 5.1 surround and
+//     the free camera, remembers them in private\launcher.json, then plays. An ISO
+//     dropped on it, or chosen on the build page, starts the build.
 //   DOA2U.exe (PLAY_ONLY) plays with the saved settings.
 // Adapted from committed DOA3 tools/launcher.cs at 6c782d5: its Horizon Bar menu
 // over the generated castle-bridge backdrop (tools/launcher-background.jpg); no retail art is used.
@@ -23,6 +23,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -33,8 +34,24 @@ static class Game
     public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
     public static readonly string Runner = Path.Combine(Root, @"build\recomp-program-mingw\recomp_program_runner.exe");
     public static string Private(string name) { return Path.Combine(Root, "private", name); }
+    // Players paste logs into public issues, so their home folder and user name become ~.
+    static readonly Regex PrivatePath = PrivatePattern(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), Environment.UserName);
+    static readonly string BundledPython = Path.Combine(Root, @"tools\python\python.exe");
     static string[] python;
     static bool pythonFound;
+
+    // Mirrors private_pattern in tools/extract_iso.py.
+    static Regex PrivatePattern(string home, string user)
+    {
+        home = (home ?? "").TrimEnd('\\', '/');
+        var names = new List<string>();
+        if (home.Length > 0 && !home.EndsWith(":")) names.Add(string.Join(@"[\\/]", home.Split('\\', '/').Select(Regex.Escape)));
+        foreach (string name in new[] { home.Split('\\', '/').Last(), user })
+            if (!string.IsNullOrEmpty(name)) names.Add(@"(?<=[\\/])" + Regex.Escape(name));
+        return names.Count == 0 ? null : new Regex("(?:" + string.Join("|", names) + @")(?![\w.-])", RegexOptions.IgnoreCase);
+    }
+
+    public static string RedactPrivate(string text) { return PrivatePath == null ? text : PrivatePath.Replace(text, "~"); }
 
     public static Dictionary<string, object> LoadSettings()
     {
@@ -72,18 +89,34 @@ static class Game
         return s.TryGetValue(key, out v) && v is string ? (string)v : fallback;
     }
 
-    public static bool IsIso(string path)
+    // "4:3", "16:9", "16:10", "32:9" or an ultrawide "W:H"; settings saved before
+    // 16:10 hold only a widescreen flag.
+    public static string ScreenShape(Dictionary<string, object> s)
     {
-        return !string.IsNullOrEmpty(path) && path.EndsWith(".iso", StringComparison.OrdinalIgnoreCase) && File.Exists(path);
+        return Str(s, "screen", Bool(s, "widescreen", true) ? "16:9" : "4:3");
     }
 
-    // Python 3.12 or newer, through the py launcher or PATH; null if there is none.
+    // The primary screen's own shape when it is wider than 16:9, else 21:9 (2560x1080).
+    public static string UltrawideShape()
+    {
+        var bounds = Screen.PrimaryScreen.Bounds;
+        return bounds.Width * 9 > bounds.Height * 16 ? bounds.Width + ":" + bounds.Height : "64:27";
+    }
+
+    public static bool IsIso(string path)
+    {
+        return !string.IsNullOrEmpty(path) && File.Exists(path)
+            && (path.EndsWith(".iso", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".xiso", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // The release ZIP's bundled Python, else Python 3.12 or newer through the py launcher or PATH; null if there is none.
     public static string[] Python
     {
         get
         {
             if (pythonFound) return python;
             pythonFound = true;
+            if (File.Exists(BundledPython)) return python = new[] { BundledPython };
             foreach (var candidate in new[] { new[] { "py", "-3" }, new[] { "python" } })
             {
                 string args = string.Join(" ", candidate.Skip(1)) + " -c \"import sys; sys.exit(sys.version_info < (3, 12))\"";
@@ -112,9 +145,16 @@ static class Game
             StandardErrorEncoding = Encoding.UTF8
         };
         start.EnvironmentVariables["PYTHONUTF8"] = "1";
+        if (Python[0] == BundledPython)
+        {
+            // An installed Python's settings or user packages must not redirect the bundled one.
+            start.EnvironmentVariables.Remove("PYTHONHOME");
+            start.EnvironmentVariables.Remove("PYTHONPATH");
+            start.EnvironmentVariables["PYTHONNOUSERSITE"] = "1";
+        }
         var process = new Process { StartInfo = start };
-        process.OutputDataReceived += delegate (object sender, DataReceivedEventArgs e) { if (e.Data != null) onLine(e.Data); };
-        process.ErrorDataReceived += delegate (object sender, DataReceivedEventArgs e) { if (e.Data != null) onLine(e.Data); };
+        process.OutputDataReceived += delegate (object sender, DataReceivedEventArgs e) { if (e.Data != null) onLine(RedactPrivate(e.Data)); };
+        process.ErrorDataReceived += delegate (object sender, DataReceivedEventArgs e) { if (e.Data != null) onLine(RedactPrivate(e.Data)); };
         process.Start();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
@@ -142,7 +182,7 @@ static class Game
         if (code == 0) return null;
         string[] lines = File.ReadAllLines(log);
         return "The game stopped with exit code " + code + ".\n\n" + string.Join("\n", lines.Skip(Math.Max(0, lines.Length - 20)))
-            + "\n\nFull log: " + log;
+            + "\n\nFull log: " + RedactPrivate(log);
     }
 }
 
@@ -211,12 +251,24 @@ class LauncherForm : Form
 {
     static readonly int[] Heights = { 480, 720, 1080, 1440, 2160 };
     static readonly int[] Samples = { 1, 2, 4, 8, 16, 32 };
+    static readonly string[] Screens = { "4:3", "16:9", "16:10", "Ultrawide", "32:9" };
     const int BuildPage = 4, PlayPage = 5, UpdatePage = 6;
+    const string DiscordUrl = "https://discord.gg/56TGGxZnE3";
+    // The Discord mark in a 24-unit box: one outline of cubic Bezier segments, the eyes cut out below.
+    static readonly float[] DiscordOutline = {
+        20.32f, 4.37f, 18.8f, 3.66f, 17.15f, 3.14f, 15.43f, 2.85f, 15.2f, 3.2f, 14.97f, 3.7f, 14.74f, 4.14f,
+        12.9f, 3.86f, 11.06f, 3.86f, 9.25f, 4.14f, 9.08f, 3.75f, 8.84f, 3.27f, 8.63f, 2.89f,
+        6.9f, 3.18f, 5.26f, 3.7f, 3.67f, 4.4f, 0.53f, 9.05f, -0.32f, 13.58f, 0.1f, 18.06f,
+        2.18f, 19.62f, 4.17f, 20.53f, 6.12f, 21.14f, 6.6f, 20.5f, 7.05f, 19.83f, 7.43f, 19.12f,
+        6.78f, 18.87f, 6.15f, 18.57f, 5.55f, 18.23f, 5.68f, 18.1f, 5.82f, 17.9f, 5.95f, 17.7f,
+        9.88f, 19.5f, 14.13f, 19.5f, 18.01f, 17.7f, 18.13f, 17.9f, 18.26f, 18.1f, 18.45f, 18.23f,
+        17.85f, 18.57f, 17.22f, 18.87f, 16.58f, 19.12f, 16.94f, 19.82f, 17.35f, 20.48f, 17.8f, 21.12f,
+        19.76f, 20.51f, 21.75f, 19.6f, 23.8f, 18.09f, 24.3f, 12.9f, 22.96f, 8.4f, 20.32f, 4.37f };
     // Horizon Bar layout on a 960x540 window: letterbox bars, the settings and page tabs in the bottom one.
     const int W = 960, H = 540, TopH = 44, Side = 30, FadeY = 334;
     const int InfoY = 380, LabelY = 414, ValueY = 434, ValueH = 30, TabY = 494, TabH = 26;
 
-    readonly Row resolution, msaa, smaa, screen, surround, intro, unlock, chooseGame, updateRow, checkAtStart;
+    readonly Row resolution, msaa, smaa, screen, renderer, vrr, surround, intro, unlock, cpuCostumes, freeCamera, chooseGame, updateRow, checkAtStart;
     readonly Page[] pages;
     // The menu cursor picks a page; inside a page the row cursor picks a setting.
     int menu, row;
@@ -224,6 +276,7 @@ class LauncherForm : Form
     // A notice (build progress, a refused action) replaces the information text until the next input.
     string notice;
     string gameSource;
+    readonly string savedShape; // a saved ultrawide "W:H", or null
     bool built = File.Exists(Game.Runner);
     Process build;
     // The newer version a check found, and whether a check or install is running on its thread.
@@ -242,6 +295,7 @@ class LauncherForm : Form
     bool downHeld;
     Point? drag;
     RectangleF[] tabs;
+    RectangleF discord;
 
     readonly Bitmap background = new Bitmap(W, H);
     readonly Font itemFont = new Font("Arial", 15, FontStyle.Bold | FontStyle.Italic, GraphicsUnit.Pixel);
@@ -253,6 +307,8 @@ class LauncherForm : Form
     readonly Font logoFont = new Font("Arial Black", 30, FontStyle.Italic, GraphicsUnit.Pixel);
     readonly Font bigFont = new Font("Arial Black", 54, FontStyle.Italic, GraphicsUnit.Pixel);
     readonly Font ultimateFont = new Font("Arial", 21, FontStyle.Bold | FontStyle.Italic, GraphicsUnit.Pixel);
+    readonly Font badgeFont = new Font("Verdana", 11, FontStyle.Bold, GraphicsUnit.Pixel);
+    readonly StringFormat typographic = new StringFormat(StringFormat.GenericTypographic) { FormatFlags = StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoClip };
     readonly StringFormat far = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
     readonly StringFormat near = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
     readonly StringFormat center = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
@@ -273,20 +329,27 @@ class LauncherForm : Form
         msaa = new Row { Label = "MSAA", Info = "Smooths polygon edges; a count the GPU lacks falls back to its highest",
             Names = new[] { "Off", "2x", "4x", "8x", "16x", "32x" }, Index = savedMsaa < 0 ? Samples.Length - 1 : savedMsaa, Default = Samples.Length - 1 };
         smaa = Choice("SMAA", "Smooths edges with SMAA Ultra after MSAA", new[] { "Off", "On" }, Game.Bool(settings, "smaa", true), 1);
-        screen = Choice("Screen", "16:9 uses the game's own widescreen camera and menus", new[] { "4:3", "16:9" }, Game.Bool(settings, "widescreen", true), 1);
+        int savedScreen = Array.IndexOf(Screens, Game.ScreenShape(settings)); // -1: an ultrawide "W:H"
+        screen = new Row { Label = "Screen", Info = "Widescreen widens the game's own camera; its 16:9 menus keep their shape",
+            Names = Screens, Index = savedScreen >= 0 ? savedScreen : 3, Default = 1 };
+        savedShape = savedScreen >= 0 ? null : Game.ScreenShape(settings);
+        renderer = Choice("Renderer", "Vulkan can run smoother on some GPUs, such as AMD handhelds", new[] { "D3D 11", "Vulkan" }, Game.Bool(settings, "vulkan", false), 0);
+        vrr = Choice("VRR", "For G-SYNC and FreeSync displays with Direct3D 11; a fixed-refresh display tears", new[] { "Off", "On" }, Game.Bool(settings, "vrr", false), 0);
         surround = Choice("Output", "5.1 plays the game's own surround mix", new[] { "Stereo", "5.1" }, Game.Bool(settings, "surround", false), 0);
         intro = Choice("Intro Movies", "Skip goes straight to the title screen at boot", new[] { "Play", "Skip" }, Game.Bool(settings, "skipIntro", false), 0);
-        unlock = Choice("Unlocks", "Earn offers only the default characters and costumes; a profile saved with Everything keeps them", new[] { "Everything", "Earn" }, !Game.Bool(settings, "unlockAll", true), 0);
+        unlock = Choice("Unlocks", "Earn offers only what the profile has earned; Everything is never saved to it", new[] { "Everything", "Earn" }, !Game.Bool(settings, "unlockAll", true), 0);
+        freeCamera = Choice("Free Camera", "In game, F1 or a right-stick click flies the camera", new[] { "Off", "On" }, Game.Bool(settings, "freeCamera", false), 0);
+        cpuCostumes = Choice("CPU Costumes", "Random dresses CPU opponents in any unlocked costume; offline only", new[] { "Default", "Random" }, Game.Bool(settings, "randomCpuCostumes", false), 0);
         gameSource = Game.Str(settings, "game_source", null);
         chooseGame = new Row { Label = "Disc 2 ISO", Info = SourceName(), Action = "game" };
         updateRow = new Row { Label = "Update", Info = UpdateStatus(), Action = "update" };
         checkAtStart = Choice("Check At Start", "Looks for a newer release when the launcher opens", new[] { "Off", "On" }, Game.Bool(settings, "checkUpdates", true), 1);
-        var buildRow = new Row { Label = "Build", Info = "Lifts and compiles the game from your ISO; takes about 15 minutes", Action = "build" };
+        var buildRow = new Row { Label = "Build", Info = "Lifts and compiles the game from your ISO; takes about 10 minutes", Action = "build" };
         pages = new[] {
-            new Page { Name = "VIDEO SETTINGS", Info = "Sets resolution, anti-aliasing and screen shape", Rows = PageRows(resolution, msaa, smaa, screen) },
+            new Page { Name = "VIDEO SETTINGS", Info = "Sets resolution, anti-aliasing, screen shape, renderer and VRR", Rows = PageRows(resolution, msaa, smaa, screen, renderer, vrr) },
             new Page { Name = "AUDIO SETTINGS", Info = "Chooses stereo or 5.1 surround", Rows = PageRows(surround) },
             new Page { Name = "MOVIES", Info = "Plays or skips the logo and opening movies at boot", Rows = PageRows(intro) },
-            new Page { Name = "GAMEPLAY", Info = "Offers every character and costume, or leaves them to earn through play", Rows = PageRows(unlock) },
+            new Page { Name = "GAMEPLAY", Info = "Chooses the unlocks, CPU costumes and whether the free camera is allowed", Rows = PageRows(unlock, cpuCostumes, freeCamera) },
             new Page { Name = "BUILD GAME", Info = BuildStatus(), Rows = new[] { chooseGame, buildRow, new Row { Label = "Exit", Info = "Returns to the menu", Action = "back" } } },
             new Page { Name = "START GAME", Info = "Saves these settings and starts the game", Rows = new Row[0], Action = "play" },
             new Page { Name = "UPDATE", Info = UpdateStatus(), Rows = PageRows(updateRow, checkAtStart) },
@@ -315,7 +378,7 @@ class LauncherForm : Form
     static Row[] PageRows(params Row[] rows)
     {
         return rows.Concat(new[] {
-            new Row { Label = "Default Setting", Info = "Restores the defaults on this page", Action = "default" },
+            new Row { Label = "Defaults", Info = "Restores the defaults on this page", Action = "default" },
             new Row { Label = "Exit", Info = "Returns to the menu", Action = "back" } }).ToArray();
     }
 
@@ -325,7 +388,7 @@ class LauncherForm : Form
     }
     string BuildStatus()
     {
-        return built ? "Built. Build again after an update" : "Not built yet: choose your Disc 2 ISO, then Build";
+        return built ? "Built. Build again after an update" : "Not built yet: choose or drop your Disc 2 ISO";
     }
 
     string UpdateStatus()
@@ -345,7 +408,8 @@ class LauncherForm : Form
     void Update(bool quiet)
     {
         if (updating) return;
-        if (build != null) { notice = "Wait for the build to finish"; return; }
+        // A quiet start-up check only reads, so it may run beside a build started from a dropped ISO.
+        if (build != null && !quiet) { notice = "Wait for the build to finish"; return; }
         if (!Updater.Available) { notice = UpdateStatus(); return; }
         bool install = pending != null;
         if (!quiet) notice = install ? "Downloading " + pending : "Checking for updates";
@@ -382,8 +446,9 @@ class LauncherForm : Form
     {
         return new Dictionary<string, object> {
             { "height", Heights[resolution.Index] }, { "msaa", Samples[msaa.Index] }, { "smaa", smaa.Index == 1 },
-            { "widescreen", screen.Index == 1 }, { "skipIntro", intro.Index == 1 }, { "surround", surround.Index == 1 }, { "unlockAll", unlock.Index == 0 },
-            { "checkUpdates", checkAtStart.Index == 1 }, { "game_source", gameSource } };
+            { "widescreen", screen.Index != 0 }, { "screen", screen.Index == 3 ? Game.UltrawideShape() : Screens[screen.Index] },
+            { "vulkan", renderer.Index == 1 }, { "vrr", vrr.Index == 1 }, { "skipIntro", intro.Index == 1 }, { "surround", surround.Index == 1 }, { "unlockAll", unlock.Index == 0 },
+            { "freeCamera", freeCamera.Index == 1 }, { "randomCpuCostumes", cpuCostumes.Index == 1 }, { "checkUpdates", checkAtStart.Index == 1 }, { "game_source", gameSource } };
     }
 
     static Color Rgb(int r, int g, int b, int a = 255) { return Color.FromArgb(a, r, g, b); }
@@ -443,6 +508,40 @@ class LauncherForm : Form
         return path;
     }
 
+    static GraphicsPath DiscordLogo(float x, float y, float size)
+    {
+        var points = new PointF[DiscordOutline.Length / 2];
+        for (int i = 0; i < points.Length; i++) points[i] = new PointF(DiscordOutline[2 * i], DiscordOutline[2 * i + 1]);
+        var path = new GraphicsPath(FillMode.Alternate);
+        path.AddBeziers(points);
+        path.CloseFigure();
+        path.AddEllipse(5.86f, 10.49f, 4.32f, 4.84f);
+        path.AddEllipse(13.83f, 10.49f, 4.32f, 4.84f);
+        path.Transform(new Matrix(size / 24, 0, 0, size / 24, x, y));
+        return path;
+    }
+
+    // The README's "Join the Discord" badge (shields.io for-the-badge style), right-aligned at right and centred on cy.
+    RectangleF DrawDiscordBadge(Graphics g, float right, float cy)
+    {
+        const string label = "JOIN THE DISCORD";
+        const float h = 28, pad = 10, logo = 16, gap = 7, spacing = 1.2f;
+        float[] advance = label.Select(c => g.MeasureString(c.ToString(), badgeFont, PointF.Empty, typographic).Width + spacing).ToArray();
+        var rect = new RectangleF(right - (pad + logo + gap + advance.Sum() - spacing + pad), cy - h / 2, 0, h);
+        rect.Width = right - rect.X;
+        g.FillRectangle(new SolidBrush(Rgb(88, 101, 242)), rect);
+        g.FillPath(Brushes.White, DiscordLogo(rect.X + pad, cy - logo / 2, logo));
+        float x = rect.X + pad + logo + gap, y = cy - badgeFont.GetHeight(g) / 2;
+        for (int i = 0; i < label.Length; i++) { g.DrawString(label[i].ToString(), badgeFont, Brushes.White, x, y, typographic); x += advance[i]; }
+        return rect;
+    }
+
+    void OpenDiscord()
+    {
+        try { Process.Start(DiscordUrl); }
+        catch (Win32Exception) { notice = "No browser opened; visit " + DiscordUrl; }
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         Graphics g = e.Graphics;
@@ -451,10 +550,11 @@ class LauncherForm : Form
         g.DrawImage(background, 0, 0);
         Color sand = Rgb(241, 197, 143), dark = Rgb(42, 29, 21), muted = Rgb(191, 178, 165);
 
-        // Top letterbox bar: title and build state on the left, button prompts on the right.
+        // Top letterbox bar: title and build state on the left, button prompts and the Discord badge on the right.
         g.DrawString("DEAD OR ALIVE 2 ULTIMATE  \u00B7  " + (built ? "READY TO PLAY" : "NOT BUILT YET") + (pending != null ? "  \u00B7  UPDATE AVAILABLE" : ""),
             smallFont, new SolidBrush(muted), new RectangleF(Side, 0, 500, TopH), near);
-        float x = W - Side;
+        discord = DrawDiscordBadge(g, W - Side, TopH / 2f);
+        float x = discord.X - 22;
         foreach (var hint in new[] { new[] { "", "CHANGE" }, new[] { "B", "BACK" }, new[] { "A", "SELECT" } })
         {
             float textW = g.MeasureString(hint[1], smallFont).Width;
@@ -493,11 +593,13 @@ class LauncherForm : Form
             var valueRect = new RectangleF(left + 26, ValueY, colW - 30, ValueH);
             if (r.Names == null) { g.DrawString(Verb(r.Action), itemFont, new SolidBrush(sand), new RectangleF(left + 12, ValueY, colW - 16, ValueH), near); continue; }
             string value = r.Names[r.Index].ToUpperInvariant();
+            // Eight columns leave little room; a value too wide for its column drops to the smaller font.
+            Font font = g.MeasureString(value, menuFont).Width > colW - 40 ? itemFont : menuFont;
             float cy = ValueY + ValueH / 2f;
             Color arrow = selected ? sand : Rgb(241, 197, 143, 130);
             Arrow(g, left + 19, cy, -1, 0, arrow);
-            Arrow(g, left + 30 + g.MeasureString(value, menuFont).Width, cy, 1, 0, arrow);
-            g.DrawString(value, menuFont, new SolidBrush(selected ? Color.White : Rgb(232, 222, 212)), valueRect, near);
+            Arrow(g, left + 30 + g.MeasureString(value, font).Width, cy, 1, 0, arrow);
+            g.DrawString(value, font, new SolidBrush(selected ? Color.White : Rgb(232, 222, 212)), valueRect, near);
         }
 
         // Page tabs along the bottom, the current one underlined in sunset gold.
@@ -551,7 +653,7 @@ class LauncherForm : Form
         pages[BuildPage].Info = BuildStatus();
         if (code == 0) { notice = "Build complete. Choose START GAME to play"; menu = PlayPage; inPage = false; return; }
         notice = @"Build failed; see private\build.log";
-        MessageBox.Show("The build failed:\n\n" + string.Join("\n", lines.Skip(Math.Max(0, lines.Length - 8))) + "\n\nFull output: " + buildLog, Game.Title);
+        MessageBox.Show("The build failed:\n\n" + string.Join("\n", lines.Skip(Math.Max(0, lines.Length - 8))) + "\n\nFull output: " + Game.RedactPrivate(buildLog), Game.Title);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -565,11 +667,11 @@ class LauncherForm : Form
             using (var kill = Process.Start(new ProcessStartInfo("taskkill", "/T /F /PID " + build.Id) { UseShellExecute = false, CreateNoWindow = true }))
                 kill.WaitForExit();
         }
-        // Other settings save with a build or play; Check At Start must also hold after a plain exit.
-        var saved = Game.LoadSettings();
-        if (Game.Bool(saved, "checkUpdates", true) == (checkAtStart.Index == 1)) return;
-        saved["checkUpdates"] = checkAtStart.Index == 1;
-        try { Game.SaveSettings(saved); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        // Settings hold after a plain exit too, so DOA2U.exe plays with them. An exit keeps
+        // the saved ultrawide shape; play sizes it to the current screen.
+        var kept = Settings();
+        if (screen.Index == 3 && savedShape != null) kept["screen"] = savedShape;
+        try { Game.SaveSettings(kept); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
 
     static int Clamp(int value, int max) { return Math.Min(Math.Max(value, 0), max); }
@@ -607,8 +709,8 @@ class LauncherForm : Form
             else if (r.Action == "game")
             {
                 if (build != null) { notice = "Wait for the build to finish"; return; }
-                using (var dialog = new OpenFileDialog { Title = "Dead or Alive Ultimate Disc 2 ISO", Filter = "Xbox ISO|*.iso|All files|*.*" })
-                    if (dialog.ShowDialog() == DialogResult.OK) { gameSource = dialog.FileName; r.Info = SourceName(); }
+                using (var dialog = new OpenFileDialog { Title = "Dead or Alive Ultimate Disc 2 ISO", Filter = "Xbox ISO|*.iso;*.xiso|All files|*.*" })
+                    if (dialog.ShowDialog() == DialogResult.OK) UseDisc(dialog.FileName);
             }
             else if (r.Action == "build") StartBuild();
             else if (r.Action == "update") Update(false);
@@ -648,14 +750,14 @@ class LauncherForm : Form
     protected override void OnKeyUp(KeyEventArgs e) { base.OnKeyUp(e); if (e.KeyCode == Keys.Down) downHeld = false; }
     protected override void OnDeactivate(EventArgs e) { base.OnDeactivate(e); downHeld = false; }
 
-    // A dropped ISO becomes the game disc and selects Build.
+    // A dropped or chosen ISO becomes the game disc and starts the build.
     void UseDisc(string path)
     {
         if (build != null) { notice = "Wait for the build to finish"; return; }
         gameSource = path;
         chooseGame.Info = SourceName();
         menu = BuildPage; inPage = true; row = 1;
-        notice = SourceName() + ". Press Build";
+        StartBuild();
     }
 
     static string Dropped(DragEventArgs e)
@@ -710,17 +812,19 @@ class LauncherForm : Form
     {
         // Borderless, so a drag on the top bar moves the window.
         if (drag.HasValue) { Location = new Point(Left + e.X - drag.Value.X, Top + e.Y - drag.Value.Y); return; }
+        Cursor = discord.Contains(e.Location) ? Cursors.Hand : Cursors.Default;
         int m = HitTab(e.X, e.Y), i = HitColumn(e.X, e.Y);
         if (!inPage && m >= 0 && m != menu) { menu = m; Invalidate(); }
         if (inPage && i >= 0 && i != row) { row = i; Invalidate(); }
     }
-    protected override void OnMouseDown(MouseEventArgs e) { if (e.Y < TopH) drag = e.Location; }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Y < TopH && !discord.Contains(e.Location)) drag = e.Location; }
     protected override void OnMouseUp(MouseEventArgs e) { drag = null; }
 
     protected override void OnMouseClick(MouseEventArgs e)
     {
         if (build == null) notice = null;
         int x = e.X, m = HitTab(x, e.Y), i = HitColumn(x, e.Y);
+        if (e.Button == MouseButtons.Left && discord.Contains(e.Location)) { OpenDiscord(); Invalidate(); return; }
         if (e.Button == MouseButtons.Right) { Back(); Invalidate(); return; }
         if (m >= 0) { menu = m; inPage = false; Accept(); return; }
         if (i < 0) return;

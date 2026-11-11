@@ -99,10 +99,9 @@ uint32_t recomp_dsound_buffer_consume(
     uint32_t position = recomp_dsound_buffer_cursor(model, model->last_ms);
     uint32_t remainder = model->frame_remainder;
     recomp_dsound_buffer_cursor(model, now_ms);
-    /* shortcut: discard stalls over RECOMP_DSOUND_STALL_MS (100 ms) instead of
-       replaying stale ring data; use a device-driven producer when continuous
-       output across stalls matters. The Switch build raises the limit while
-       its frames still take longer than 100 ms. */
+    /* A stall over RECOMP_DSOUND_STALL_MS (100 ms) discards its span instead
+       of replaying stale ring data; the output pump thread keeps ordinary
+       spans near 10 ms. Discards are counted for host diagnostics. */
     if (elapsed > RECOMP_DSOUND_STALL_MS) {
         ++recomp_dsound_stall_drops;
         return 0u;

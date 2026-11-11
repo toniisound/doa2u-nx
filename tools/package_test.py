@@ -11,22 +11,25 @@ import tempfile
 import time
 import zipfile
 
+from build_prerequisites import fetch_verified
+from extract_iso import sha256
+
 ROOT = Path(__file__).resolve().parents[1]
 SUBMODULE = "tools/xboxrecomp"
 # A release holds what building and playing need; developer and agent material stays in the repository.
 DEV_FILES = {"AGENTS.md", "CONTEXT.md", "README.md", ".gitattributes", ".gitignore", ".gitmodules",
              "private/README.md", "tools/package_test.py", "tools/public_export.py", "tools/xbe_info.py",
-             "tools/doa2u/function_status.json", SUBMODULE}
+             "tools/doa2u/function_status.json", "tools/matchmaker.py", "tools/matchmaker.service", SUBMODULE}
 DEV_PREFIXES = (".github/", "docs/", "tools/test_", "tools/doa2u/ghidra/")
 # Files one platform family alone builds or runs; recomp-runtime/CMakeLists.txt picks backends by WIN32.
 WINDOWS_ONLY = {"tools/launcher.cs", *(f"recomp-runtime/{name}" for name in (
     "audio_output_xaudio2.cpp", "audio_output_xaudio2_test.cpp", "audio_output_xaudio2_host_test.cpp",
     "audio_xtalk_xapo.cpp", "audio_xtalk_xapo.h", "audio_capture_xapo.cpp", "audio_capture_xapo.h",
     "audio_capture_xapo_test.cpp", "xaudio2_reverb.h", "xaudio2_reverb_test.cpp",
-    "d3d_presenter_d3d11.cpp", "d3d_presenter_thread.cpp"))}
+    "d3d_presenter_d3d11.cpp", "d3d_presenter_thread.cpp", "overlay_d3d11.cpp", "overlay_d3d11.h"))}
+# The SDL_GPU presenter ships everywhere: Windows builds it as its Vulkan renderer.
 POSIX_ONLY = {"build_game.sh", "launcher.sh", "run_game.sh", "docs/building.md", *(f"recomp-runtime/{name}" for name in (
     "audio_output_sdl.cpp", "audio_output_sdl_test.cpp", "audio_reverb.cpp", "audio_reverb.h",
-    "d3d_presenter_sdl_gpu.cpp", "d3d_presenter_inline.cpp", "d3d_shader_compiler.cpp", "d3d_shader_compiler.h",
     "win32_compat.c", "win32_compat_test.c", "fiber_switch_arm64.S", "fiber_switch_x86_64.S"))}
 PLATFORM_FILES = {"windows": WINDOWS_ONLY,
                   "macos": POSIX_ONLY | {"tools/launcher_macos.swift", "tools/launcher-background.jpg"},
@@ -38,6 +41,18 @@ LIFTER_FILES = {"LICENSE", "NOTICE", "tools/__init__.py", "templates/runtime/rec
 # extract-xiso.exe and its LICENSE.TXT, copied from the DOA3 test package, and
 # dedication-photo.jpg, which run_game.py turns into the staff-roll card.
 ARTIFACTS = ROOT / "private" / "release-assets"
+# The Windows ZIP carries Python with the build's packages, and CMake, so players install nothing (#89).
+# Each is (URL, SHA-256, the archive folder that ships); the wheels are installed by unpacking them.
+PYTHON = ("https://www.nuget.org/api/v2/package/python/3.12.10",
+          "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8", "tools/")
+WHEELS = [("https://files.pythonhosted.org/packages/70/39/2138d890a8e827636b9de9924fbc8527fe83e38b6d26605b30ac55e30ebe/"
+           "capstone-5.0.7-py3-none-win_amd64.whl",
+           "4ab8bcb7da8f221ff45926ca168ca33e76f7237d06fbf3c10780002faa2670e1", ""),
+          ("https://files.pythonhosted.org/packages/5d/7b/25a221d2c761c6a8ae21bfa3874988ff2583e19cf8a27bf2fee358df7942/"
+           "pillow-12.2.0-cp312-cp312-win_amd64.whl",
+           "7f84204dee22a783350679a0333981df803dac21a0190d706a50475e361c93f5", "")]
+CMAKE = ("https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-windows-x86_64.zip",
+         "326c826486d46a23cf9d5a1c9ee3a567d427bdd02c4a34071937a2a675cff004", "cmake-4.4.5-windows-x86_64/")
 # ZIP name suffix and README for each platform; macOS and Linux build extract-xiso themselves.
 PLATFORMS = {"windows": ("", "docs/test-release.md"),
              "macos": ("-macOS", "docs/test-release-macos.md"),
@@ -64,6 +79,22 @@ def build_launchers(out_dir):
 
 def git(*args, cwd=ROOT):
     return subprocess.check_output(["git", *args], cwd=cwd)
+
+
+def bundle(package, prefix, url, digest, top, skip=()):
+    """Copy a pinned upstream ZIP's folder top, minus paths starting with skip, into the package at prefix.
+
+    Downloads the ZIP once into ARTIFACTS."""
+    cached = ARTIFACTS / "downloads" / digest
+    if not cached.is_file() or sha256(cached) != digest:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.unlink(missing_ok=True)
+        fetch_verified(url, digest, cached, url.rsplit("/", 1)[1])
+    with zipfile.ZipFile(cached) as source:
+        for info in source.infolist():
+            path = info.filename[len(top):]
+            if info.filename.startswith(top) and not info.is_dir() and not path.startswith(skip):
+                package.writestr(prefix + path, source.read(info))
 
 
 def shipped(path, platform):
@@ -108,6 +139,9 @@ def main():
     if not args.version:
         parser.error("give a version, or --launchers DIR")
     suffix, readme = PLATFORMS[args.platform]
+    # v0.2.1 and v0.2.2 shipped icon-less exes from a tree without it, and updating stripped installed icons.
+    if args.platform == "windows" and not ICON.is_file():
+        raise SystemExit(f"Missing {ICON}: the release launchers would ship without their icon")
     if git("status", "--porcelain", "--untracked-files=no").strip():
         raise SystemExit("Commit first: the package is built from HEAD")
     pinned = git("ls-tree", "HEAD", SUBMODULE).split()[2].decode()
@@ -141,6 +175,11 @@ def main():
         if windows:
             for artifact in artifacts[:2]:
                 package.write(ARTIFACTS / artifact, f"{name}/tools/artifacts/{artifact}")
+            bundle(package, f"{name}/tools/python/", *PYTHON)
+            for wheel in WHEELS:
+                bundle(package, f"{name}/tools/python/Lib/site-packages/", *wheel)
+            # The build never runs the GUI or reads the manuals; leaving them out saves 11 MB.
+            bundle(package, f"{name}/tools/cmake/", *CMAKE, skip=("bin/cmake-gui.exe", "doc/cmake/html/", "man/"))
             with tempfile.TemporaryDirectory() as launchers:
                 build_launchers(Path(launchers))
                 for exe in LAUNCHERS:

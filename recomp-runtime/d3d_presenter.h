@@ -67,6 +67,9 @@ typedef struct RecompD3dPresenterClearCommand {
 typedef struct RecompD3dPresenterPresentCommand {
     uint32_t effective_flags;
     uint32_t swap_counter;
+    /* Width over height the game drew its frame for: 4:3 or the widescreen
+       shape; a netplay session may differ from the window. 0 is the window's. */
+    float aspect;
 } RecompD3dPresenterPresentCommand;
 
 /* Fixed-function vertex lighting: directional and point lights. DOA3 also
@@ -145,6 +148,9 @@ typedef struct RecompD3dPresenterDrawCommand {
     /* One allowed rectangle with exclusive right/bottom guest target pixel edges. */
     bool has_scissor;
     int32_t scissor[4];
+    /* A pretransformed draw's scale about the viewport center, fitting the 2D
+       layer to the screen shape (widescreen.h); 0 leaves it. */
+    float layer_scale[2];
     /* Additional world-view-projection matrices for 1..3 explicit weights. */
     float blend_transforms[3][16];
     uint32_t blend_weight_count;
@@ -215,7 +221,14 @@ typedef struct RecompD3dPresenterDrawCommand {
     bool bump_water;
     float bump_matrices[2][4];
     float bump_fog[3];
+    /* Also the table fog color. */
     uint32_t fog_color;
+    /* D3D8 table fog on a fixed-function draw (0x34f5f0): mode 0 off, 1 linear
+       (end - d) / (end - start), 2 exp e^(-d density), 3 exp2 e^(-(d density)^2),
+       where planar eye depth d = clip w * fog_depth[0] + fog_depth[1]. */
+    uint32_t fog_mode;
+    float fog_start, fog_end, fog_density;
+    float fog_depth[2];
     uint32_t bump_address_u, bump_address_v;
     /* Stage-0 MODULATE(TEXTURE, TFACTOR) color over white vertices. */
     bool texture_factor_modulate;
@@ -240,6 +253,8 @@ typedef struct RecompD3dPresenterDrawCommand {
     bool stage1_alpha_kill;
     /* The stage-1 texture only applies its ALPHAKILL, at UV0; alpha is not multiplied. */
     bool stage1_kill_only;
+    /* The stage-1 mask reads UV0 through reflection_stage1_transform (TEXTURE1, COUNT2). */
+    bool stage1_mask_transform;
     /* Storage aliases the current guest backbuffer, whose pixels are host-owned. */
     bool texture_is_backbuffer;
     /* GetBackBuffer(-1): the frame Present last showed, not the one in progress. */
@@ -347,6 +362,9 @@ RecompD3dPresenterError recomp_d3d_presenter_destroy(
 /* Publish queued work without swapping; optionally wait for its completion. */
 RecompD3dPresenterError recomp_d3d_presenter_flush(
     RecompD3dPresenter *presenter, bool wait);
+/* True when a PRESENT would not wait for the host to finish earlier frames.
+   Errors report true, so the PRESENT itself returns them. Never waits. */
+bool recomp_d3d_presenter_present_ready(RecompD3dPresenter *presenter);
 
 /* Synchronous, write-free raster coverage of fixed-function triangles. Ignores
    shading and depth/stencil rejection; zero means no fragment can consume them. */
@@ -377,6 +395,14 @@ RecompD3dPresenterError recomp_d3d_presenter_invalidate_textures(
    not force guest state. Intended for the full-program runner; the default
    (vsync) remains for windowed tests. */
 void recomp_d3d_presenter_set_immediate_present(bool enabled);
+
+/* PC Settings: asks for a new resolution scale (1-8, as RECOMP_D3D_SCALE),
+   MSAA sample count and SMAA while the game runs. The renderer applies them
+   after its next presented frame, keeping what targets show, when
+   recomp_d3d_presenter_quality_live says it can; otherwise at the next start. */
+void recomp_d3d_presenter_set_quality(float scale, uint32_t msaa, bool smaa);
+/* Whether this renderer applies recomp_d3d_presenter_set_quality live. */
+bool recomp_d3d_presenter_quality_live(void);
 
 /* Observation only: reports which guest texture formats draws actually
    sampled, and which ones a draw asked for but the presenter could not

@@ -8,6 +8,9 @@
 
 /* --skip-intro: omit the logo movie's playback wait and end the boot opening movie. */
 extern bool recomp_skip_intro;
+void recomp_program_manual_reset(void);
+/* Forgets resolved guest calls, for a reboot (program_adapters.c). */
+void recomp_program_lookup_reset(void);
 
 RecompFunction recomp_lookup_manual(uint32_t guest_address);
 

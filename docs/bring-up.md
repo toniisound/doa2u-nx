@@ -26,6 +26,12 @@ overwrite PCR. Heap and contiguous allocations grow toward each other and
 reject overlap. The loader checks sections, source digests, stack/TLS bounds
 and reserved ranges before running code.
 
+The loader fills a scratch image that the runner then copies into the 64 MB
+guest block. On Windows that block is allocated with `MEM_WRITE_WATCH`, which
+cannot be added later, so rollback snapshots (`guest_snapshot.c`,
+`docs/rollback-netcode.md`) can copy only the pages written since the last
+save.
+
 Memory statistics report the arena's available pages and reusable allocation
 capacity, with image, pool, stack and virtual reservations accounted for.
 Raw runtime allocations and alignment gaps stay consumed. Cache pages are
@@ -74,6 +80,10 @@ first tick; attract replays and story movies still play. The game's soft reset
 relaunches its own XBE through XLaunchNewImage (`0x2bab9d`); the runner exits
 with code 4 and `run_game.py` starts a fresh runner, so the relaunch boots
 like a cold start without its launch data.
+A null path opens the Dashboard: the Live menus' account and network prompts
+and the save-space prompts do this when the player answers Yes. The runner
+ends normally there (`xapi:dashboard`, code 0), as the desktop stands in for
+the Dashboard. A launch with reason 1 (error) still stops with code 2.
 
 The optional dedication card (`RECOMP_DEDICATION_CARD`, set by `run_game.py`
 from `private/dedication.bmp`) starts on the first guest read of the staff
@@ -82,7 +92,9 @@ at +8, and the runner finds that entry through each AFS archive's own
 directory. Track loops seek past
 the entry's start, so they do not repeat the card. At the next Swap the runner
 presents the card through the D3D8 adapter for 10 seconds and then subtracts
-the held time from the guest clock. In Kasumi's Story the track is first read
+the held time from the guest clock. A new press of any pad button or mapped
+key fades the card out early; a button still held from the fight must be
+released first. In Kasumi's Story the track is first read
 after the final KO's white flash, so the card plays just before the ending,
 which carries the staff credits over it.
 
@@ -130,7 +142,41 @@ XGetVideoFlags (0x2bb87e) returns bit 0 from this setting; game initialization
 (0x282570) retains it and requests presentation flag 0x10. The device model
 accepts that flag at creation and Reset. The game's existing camera and UI
 branches select their 16:9 behavior, and the presenter sizes the window to
-match. No game matrices or guest code are patched.
+match. No game matrices or guest code are patched for 16:9.
+
+A `W:H` value keeps the widescreen bit and renders that shape (16:10, 32:9,
+or an ultrawide such as 64:27). Every widescreen view builds its projection with
+0x34280 (cdecl matrix, fov, aspect, near, far, offset, scale), passing aspect
+1 / (9/16) from the pooled constant 0x3c2cec; FUN_00039710 and FUN_00192010
+read the same constant as unrelated thresholds, so it stays. The manual
+lookup wraps 0x34280 and replaces exactly that aspect with the shape, which
+keeps the vertical field of view and widens or narrows the view.
+Culling has its own view cone: `camera_setup_view_cone` (0x34E10) stores the
+tan, sin and cos of the horizontal half angle at 0x879BF4, 0x877C6C and
+0x87D228 from the same 9/16, and `camera_query_view_cone` (0x36490) returns
+it for a camera slot. At 16:9 a wider shape culled objects outside the
+middle 16:9, so they popped in at the sides. The manual lookup puts the
+shape's height over width in 0x3c2cec for those two calls only and restores
+it; neither reaches the threshold readers. Mirror cameras build their
+projection and cone from `g_back_buffer_width_over_height` (0x877EA0, 720/480)
+instead. Koku An's polished floor renders the mirrored stage into a 256x256
+target (`floor_mirror_setup_camera` 0x279D60 or `_at` 0x27A070, then
+`floor_mirror_begin_render` 0x27A430) and projects it onto the floor with the
+same matrix. With 1.5 the mirror covered the middle 42% of a 32:9 view, and
+the floor smeared its clamped edge texels over the rest, flickering as the
+camera moved (issue #139). Every reader of 0x877EA0, including the water
+mirror (0x26C2E0) and a plane mirror (0x280460), gets the shape for its call
+only. 16:9 keeps the game's 1.5, so its outer 8% still shows the smear. The D3D8
+adapter scales on-screen pretransformed draws narrower than the target, the
+game's 16:9 HUD and menus, about the viewport center into the screen's
+largest 16:9 area, scissor included; quads as wide as the target (fades,
+backdrops) keep filling it. A 3D draw into a viewport narrower than the
+target, such as the character select portrait in its panel, moves toward
+the center with that panel and keeps its size, since its projection already
+has the screen's shape; its scissor fits the same way, and program draws
+shift their viewport offset in c59. The projections live in guest RAM, which netplay
+sessions hash and replays must recompute exactly, so both keep 16:9: the
+session or replay sets `recomp_kernel_widescreen` from the host's flags.
 
 The Windows build includes pinned upstream SMAA shader and lookup tables.
 `RECOMP_D3D_MSAA=1/2/4/8/16/32` selects main-target samples, with GPU capability
@@ -551,16 +597,36 @@ channel. The factor uses the existing per-channel selection and does not read
 material alpha when it replaces diffuse alpha. Native pixels check sampled
 alpha times factor alpha without vertex or material alpha. Lit points admit
 texture-only RGB, optionally scaled by TFACTOR:
-the effect at `0x1f5030` keeps LIGHTING enabled, but consumes only lit alpha.
-The SDK (`0x34fc80`) takes that alpha from material diffuse alpha even with
-vertex-color sources. The adapter supplies it once through the existing
-texture-alpha multiplier, and ignores unused lighting RGB inputs. Texture-only
-alpha does not read material alpha. Lit vertex RGB, two-sided lit points,
-unscaled sizes, shaders and projections that mix eye x/y into w stay guarded.
+the effect at `0x1f5030` and the snow of Koku-An (`0x1ed3a0`) and the snowy
+White Storm (`0x1a54a0`) keep LIGHTING enabled, but consume only lit alpha. That
+alpha follows NV2A's color-material diffuse source, which
+`d3d_color_material_sources` (`0x34ee70`) builds from COLORVERTEX and
+DIFFUSEMATERIALSOURCE, dropping COLOR1 when the stream has no vertex color.
+These effects draw XYZ|DIFFUSE points with COLOR1, so the vertex alpha passes
+through and the snow's material alpha of 0 in fights is never read. With
+MATERIAL, the adapter applies the diffuse alpha that `0x34fc80` uploads, once,
+through the existing texture-alpha multiplier. Unused lighting RGB inputs are ignored. Texture-only
+alpha reads neither. Lit vertex RGB, specular alpha sources, two-sided lit
+points, unscaled sizes, shaders and projections that mix eye x/y into w stay
+guarded.
 Hardware size rounding and
 frustum culling of whole points are not modelled: a quad that crosses the
 screen edge is clipped instead.
 there is no separate guest CPU cache or direct GPU consumer of guest bytes.
+
+Fixed-function draws apply D3D8 table fog as `0x34f5f0` programs it from the
+per-stage settings `FUN_00286000` writes: FogEnable `0x3553d0`, table mode
+`0x3553d4`, start, end and density at `0x3553d8`-`0x3553e0` and color
+`0x355488`. Linear mode pushes bias `1 + end/(end - start)` and scale
+`-1/(end - start)`. The port assumes NV2A then subtracts 1, as xemu models it
+(unmeasured on hardware), which leaves `(end - d)/(end - start)` on planar eye
+depth. The presenter recovers that depth from clip w, evaluates the
+factor per pixel and blends RGB toward the fog color after specular. Koku-An
+uses linear fog from 12.3 or 35 to 90.5; the snowy White Storm moves its range
+and color during a fight. EXP and EXP2 use D3D8's density formulas,
+unchecked against the SDK's scaled encoding. Range fog, vertex fog,
+pretransformed and shader draws, and projections that mix eye x/y into w stay
+unfogged.
 
 Leaving character select, the game (0x282770) widens the old headers, persists
 the display, and Resets back to type 0x11. That Reset writes the same SDK fields
@@ -654,8 +720,12 @@ queued work, as the SDK's fence kick does. No guest report slot is written.
 Indices beyond the SDK's 64 report pages, an End without Begin, and a
 requested report timestamp stop explicitly.
 InsertCallback (`0x349e10`, stdcall type/callback/context) calls its cdecl
-callback immediately: captured commands own their bytes and the host GPU
-never writes guest memory, so READ and WRITE conditions already hold.
+callback at the second following Swap: captured commands own their bytes and
+the host GPU never writes guest memory, so READ and WRITE conditions already
+hold. The game skips a flare test while its callback is pending, so the host
+GPU can run a frame behind. Calling it at once made every next-frame poll spin
+until the GPU finished (issue #118: about 6 ms of each frame at 3x on a fast
+PC). Pending callbacks are part of the D3D8 rollback state.
 
 ## Game tasks
 
@@ -677,20 +747,104 @@ still read in place. A read issued by the main game thread still pauses
 frames until it finishes, as it would on hardware. Reads at the handle
 cursor and close both wait until no read on that handle is in flight.
 
+Stage Select also offers Tengu's boss stage (issue #117). Its list
+(`stage_select_build_rows`, `0x1354a0`) writes one-byte entry numbers into
+rows at `0xdf5f10`, indexing the 24-byte entries at `0x6e22b0`, and appends
+Random; every other read goes through `0x135410`, `0x135510` and
+`0x135580`. `stage_select.c`
+replaces those four and adds stage 18 (the Miyama his story fight loads)
+before Random in the regular list, with the game's unused Miyama name (61)
+and thumbnails (14, 36). Its entry sits in the reserved kernel page at
+`0x03ff0c00`, since other data follows the table. Random's pick
+(`0x135700`) can then choose it too. The tag list stays as it was.
+Only Sparring was played with it. The stage's season variants (ids 27, 64,
+65) load inconsistently and are left out. Random's row moves one place, so
+online players need this build on both sides, which netplay's build check
+already requires.
+
 Every costume and character is offered. The game data pointer at `0x87cfa8`
-(observed `0x7feae0`) holds one costume byte per character at +0x2ed8, in the
+(observed `0x7feae0`) points 0xf200 into the active profile's 0x12118-byte
+save slot and holds one costume byte per character at +0x2ed8, in the
 15-character order from `0x6959dc` mapped through `0x6959c0`. New saves start
 at 2; the select screen (`0x11e410`) shows `min(byte, count)` with counts from
 `0x6e0f08`. Characters 0x11, 0x18 and 0x15 need the flags at +0x2ed2, +0x2ed3
-and +0x2ed4 (`0x11e5f0`). After each Swap, the runner repeats the game's award
-loops (`0xdc640`, `0xdc100`): each costume byte becomes its count and the three
-flags become 1. Loaded profiles get the same values, and the next save stores
-them. Unlocks at +0x2ee7 to +0x2eeb (`0xdc4c0`) cover other content.
+and +0x2ed4 (`0x11e5f0`). After each Swap, `unlock_profile.c` records the
+live profile's 18 values as earned, then sets each costume byte to its count
+and the three flags to 1. The records sit in the reserved kernel page at
+`0x03ff0d00` (eight of 0x20 bytes), so rollback restores them. Every slot
+save goes through `0x21b50` or `0x21bb0` and every load through `0x21d90` or
+`0x21de0` (cdecl name, slot); the saves write the earned values and unlock
+again, and the loads drop the records of the slot they replace. The award
+entry `0xdc840` (costumes through `0xdc640` and `0xdc090`, flags through
+`0xdc100`) runs on the earned values, so awards and their notices still
+happen and are kept. A record whose profile no longer holds the unlocked
+values is taken as rewritten and recorded again. Unlocks at +0x2ee7 to
++0x2eeb (`0xdc4c0`) cover other content and are not touched.
 `--no-unlock-all` (runner and `run_game.py`) and the launchers' **Unlocks: Earn**
-(`unlockAll` in `launcher.json`) skip this step, so unlocks
-come only from the game's own award paths. Acceptance runs use it with a
-profile that has never run with the unlock on; earlier saves keep their
-unlocks.
+(`unlockAll` in `launcher.json`) turn it off: each recorded profile still
+holding the unlocked values gets its earned values back, so unlocks come only
+from the game's own award paths. Profiles saved by earlier builds keep the
+unlocks those builds saved.
+
+With `RECOMP_RANDOM_CPU_COSTUMES=1` (the launchers' **CPU Costumes: Random**,
+issue #116), `cpu_costume.c` wraps `battle_get_fighter_costume` (`0xc6b00`,
+cdecl character and opponent index). In Story, Time Attack, Survival and Team
+(battle modes 3, 4, 6, 7) a plain pick, the character's first costume group or
+the second when the player wears the first, becomes a random unlocked group
+(`0x11e410`), skipping one that matches the player's costume (`0xc5490`).
+Other callers ask again during a run, so the pick hashes a per-boot seed with
+the run's opponent lists (`0x8a3a08`, `0x8a3a24`), the character and the
+index. Story's own picks stay. Netplay and SyncTest boots leave it off.
+The hook is routed whenever it may be wanted and checks the setting itself,
+so PC Settings can switch it while the game runs.
+
+PC SETTINGS (`pc_settings.c`) is a row of the game's Options menu. The menu
+(`frontend_options_menu_update`, `0x11cfc0`) keeps a cursor per depth at
+`0xdf4ac8`, the depth at `0xdf4ad4` and the page at `0xdf4ad8`; page 0 is the
+top list, whose rows `0x11ac90` counts (7) and whose choices open pages 1 to 4
+or the Video and Warning scenes (`0x18`, `0x17`). The top list's labels are
+sprites of group 3 (`spOption`): `0x95a70` draws each through `0x97830` at x
+`0xf0`, y `0x5d` + 26 per row, the selected one also as a glow at x `0xf6`,
+y `0x56` + 26 per row, with ids per language (`0x3000d`, `0x3001b`, `0x30029`,
+`0x30045`, `0x30037`; glows 7 below), over seven bars (`0x976f0`, from y
+`0x5c`). The runner replaces page 0's input with the same calls for eight
+rows, PC SETTINGS at row 5; while `0x95a70` runs it moves Warning and Exit,
+their glows and colours down a row, adds an eighth bar and draws PC SETTINGS
+after Video. The help line (`0x91560`, messages `0xc4`-`0xca`) and the
+selected row's page preview (`0x95a10`) see the game's row for the rows
+after it.
+
+PC SETTINGS opens page 19, which no table uses. The page tables at
+`0x67af50` (reset), `0x67aff0` (draw) and `0x67afa0` (draw while leaving) get
+lookup keys for page 19's three functions, which do what page 8's do: rows
+through `0x91440`, values through `0x93270`, the cursor through `0x90f00`,
+reading the page's layout (`0x90ad0`, page 8's records 26 apart), labels and
+values (`0x910a0`, `0x91370`) and row count, all answered for page 19 by the
+runner. Its input moves through the rows (`0x11b8d0`), steps the selected
+value as the game's pages do (`0x11b9f0`) and goes back to the top list
+(`0x11bca0`). Text is UTF-16 in five languages (Japanese shows English), in
+message numbers from `0x7000`.
+
+The PC SETTINGS label is cut letter by letter from the other top-list labels
+(group 3), and its glow is that label padded 6 and 7, blurred (sigma 3.5),
+brightened 2.52 times and tinted `0x3990fa`; both were fitted to the game's
+own art. They are made in the game's language once its label art is loaded.
+The settings read and write the launchers'
+`private/launcher.json` (`pc_settings_store.cpp`; `run_game.py` names it in
+`RECOMP_LAUNCHER_SETTINGS`), keeping every key they do not own; Unlocks and
+CPU Costumes apply at once, offline only, and the others at the next launch.
+
+QUIT GAME (`menu_quit.c`) is one more carousel position after the main
+menu's unlocked entries (`0x134330` builds the list, `0x1343a0` and
+`0x1343d0` read it), with mode `0x13`, which no entry uses and the mode
+switch ignores. Its confirm opens the runner's quit prompt; keeping on plays
+the cancel sound and runs the menu's own transition cancel (`0x135ae0`).
+
+Both features' guest data lives in the runner's asset area (128 KiB at
+`0x03f00000`, below the startup stack), which `runner_assets.c` hands out at
+each boot. It also owns their sprites, a group past the game's `0x1a5`
+(`0xaa970` rectangle, `0xaa9b0` texture and palette), and their message text
+(`0x6a3e0`).
 
 ## Input API contract
 
@@ -731,9 +885,19 @@ The buffer adapter binds the 5849 descriptor and public handle layout to
 the independent cursor model, PCM/Xbox ADPCM decoding and native output.
 Owned and borrowed sample storage have separate lifetimes. Headroom changes
 adjust effective volume; API argument cleanup is verified per entry.
-Buffers pump synchronously from API polling and DoWork.
-The inherited clock drops output spans after a stall over 100 ms while
-advancing its cursor. Native endpoint consumption has an opt-in host test;
+Buffer calls that read or move playback pump that buffer first, and DoWork
+pumps them all. As the
+APU plays on its own, a host thread (after DOA3's output pump) also pumps every
+buffer about every 5 ms under the same lock, so a frame hitch delays only the
+game's refills. DoWork alone ran 35-150 ms apart in heavy scenes, past the
+50 ms output cushion, and voices dropped out (issue #69). CRI keeps its
+announcer and music rings full, 360-740 ms ahead, but a stalled game cannot
+refill them, so the pump plays a looping buffer up to the end of the game's
+last Lock, and at least 100 ms past the game thread's last pump; a longer
+stall goes quiet instead of replaying the ring's last lap as an echo. One-shot
+buffers play on. Only the game thread sets voice
+routing. A pump gap over 100 ms still drops its span while the cursor advances.
+Native endpoint consumption has an opt-in host test;
 synthetic API and backend tests remain suitable for public CI.
 
 `dsound_effects_image.c` decodes the encrypted DSP programs; CPU parameter
@@ -833,6 +997,99 @@ The 5849 GetTickCount boundary reads shared monotonic time and offers bounded
 cooperative scheduler polling. D3D BlockUntilVerticalBlank and its two CRI
 tail aliases use the native shared-vblank service. These platform seams let
 the existing worker modules run; they do not force middleware load status.
+Swap waits for the host to finish earlier frames as a guest wait, so those
+vblank threads keep their 60 Hz refills of CRI's audio rings when the GPU
+falls behind; a host-blocked Swap let the rings replay as echoes (issue #69).
+
+Movies no longer run CRI's Sofdec player. Its MPEG decoder ran on CRI's file
+server thread, and one decode burst held every other guest thread, the audio
+refills included, for up to 250 ms. `mwply_adapter.c` binds the fifteen player
+calls the game makes (creation, the function table at `0x7c6430`, frames,
+conversion, audio switch and volume, subtitles) and plays the file on a host
+thread (`sfd_movie.c`). Every disc SFD is an MPEG-1 program stream with
+MPEG-1 video, standard unencrypted ADX audio and a CRITAGS subtitle block in
+private stream 2; pl_mpeg decodes the video, `adx_decoder.c` the audio, which
+plays on host output slot 256. The four DOA2 movies are TMPGEnc encodes that
+code intra DC at 11 bits and say so only in a `TMPGEXS` user-data tag;
+`pl_mpeg_patch.cmake` patches the fetched pl_mpeg to decode them as FFmpeg's
+`mpeg12dec.c` does. A stream whose SofdecStream video entry holds 1 and 3
+at bytes 0x20-0x21, as the boot opening's two do, converts through Sofdec's
+own table (`movie_color_model.c`, built as `0x3261e0` builds it), which darkens
+and turns near-grey color grey; BT.601 showed the opening's storm green
+(issue #131). CRI also checks the header version before reading that flag;
+the port does not, since every DOA2 movie passes the check. The other movies
+convert as BT.601. Frames are due on the
+guest clock from the first status poll that finds the first frame decoded,
+and late frames are dropped as Sofdec drops them. `mwPlyInitSfdFx` still runs
+as guest code, since
+it also sets up the ADX library the music uses. The surround movie soundtrack
+(`ninja.aix`), music and voices still stream through CRI's ADX library.
+
+## Determinism checks
+
+Rollback replays frames, so a replayed frame must reproduce the first pass
+exactly. `RECOMP_FRAME_CLOCK=1` replaces the host clock with a frame-locked
+guest clock: every read inside a frame returns the frame's end, plus a 1 us
+tick per read (`RECOMP_FRAME_CLOCK_TICK_NS`) so loops that poll the counter
+reach their deadline. Each Swap advances 1/60 s. A skipped wait (a
+vblank wait, or the scheduler idling until the next timer) jumps the counter
+to its deadline; a wait that ends by the next frame's end moves time inside
+the current frame only. A wait whose deadline is more than two frames past
+the frame start moves the next frame's start to that deadline, so that Swap
+advances further. A refresh at the current time counts as reached, or
+every frame that waited for vblank would span two. The scheduler slice a
+clock read offers is gated on guest time, so a replay preempts at the same
+points.
+
+`RECOMP_SYNCTEST=1` saves state at `RECOMP_SYNCTEST_START`, replays
+`RECOMP_SYNCTEST_FRAMES` frames (default 1) and compares; `loop` keeps
+checking. It implies the frame clock unless that is set to `0`, exits 0 on a
+match, 2 on a mismatch and 3 when the saved state cannot be rewound, and in
+`loop` waits 60 frames after such a skip. `RECOMP_SYNCTEST_VERBOSE=1` dumps
+the first differing bytes.
+
+The state is a table of modules (`synctest_modules.c`): CPU and FPU, clock
+and vblank marks, XAPI fibers, guest threads, file positions and the handle
+table, kernel allocations, the guest heap cursors, input, the D3D8 device,
+frame and render-state models with completed visibility counts, and the
+DirectSound device, buffers and effects. Guest RAM rewinds through
+`guest_snapshot.c`. The compare skips host-scheduled ranges: audio worker
+counters, QPC bookkeeping, XAPI fiber and guest thread stacks, and the whole
+reserved final MiB (`0x03f00000`-`0x04000000`): the startup thread's stack,
+kernel data and the PCR page.
+
+On Windows, fibers are saved as plain data: each parked fiber's captured
+CONTEXT and the live part of its native stack, up to 64 KiB. The running
+fiber (its stack is the caller's), a converted thread's fiber and a fiber
+whose stack does not fit are not rewound. Deleted fibers stay parked and
+native fiber objects restart in place, so a saved state that still names one
+stays valid. Linux and macOS keep a parked fiber's registers on its stack,
+so they save the stack pointer and the live stack, with the same limits.
+
+Some frames cannot be rewound and are skipped rather than reported:
+
+- A Present from the display mode change (`0x28284f`) instead of the frame
+  loop (`0x282947`): the rewind resumes the host in the frame loop's native
+  continuation.
+- A frame that opened a save file for writing, creating or deleting, wrote
+  or changed one, or that ends inside a save transaction: save storage is
+  host disk, outside the snapshot.
+- A save taken on another guest thread, or before a guest thread's native
+  fiber was created or replaced.
+- A save from before the DirectSound effects image was replaced or released.
+- A frame boundary with a guest thread waiting on a host read: the worker may
+  still be writing guest RAM. SyncTest makes reads synchronous, so this
+  does not happen while it runs.
+
+On this branch a loop run from frame 600 through the scripted Story fight
+and back to the menus matched 6,295 frames with no mismatch. It skipped three
+display mode changes and one save. With asynchronous reads, 102 more frames
+were skipped.
+
+`RECOMP_ROLLBACK=loopback` keeps the same state in a ring of saves
+and rewinds it on mispredicted input; `docs/rollback-netcode.md` describes
+the run. It uses the frame clock and synchronous reads as SyncTest does.
+
 
 ## Remaining work
 

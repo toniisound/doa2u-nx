@@ -19,7 +19,7 @@
 Sister projects: [DOA3](https://github.com/NoRain211/doa3-re) ·
 [DOAXBV](https://github.com/NoRain211/doaxbv-re)
 
-<a href="https://discord.gg/dUdgUF4A"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="30"></a>
+<a href="https://discord.gg/56TGGxZnE3"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="30"></a>
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/norainsrecomps)
 
@@ -35,8 +35,8 @@ Sister projects: [DOA3](https://github.com/NoRain211/doa3-re) ·
 The DOA2 game executable on Ultimate's second disc is lifted to C with a
 static recompiler, then linked against a hand-written runtime that replaces
 the Xbox kernel imports and the game's Direct3D 8, DirectSound and input
-libraries (XDK build 5849) with native Windows equivalents: Direct3D 11,
-XAudio2 and SDL3. On macOS and Linux the same runtime renders through SDL_GPU
+libraries (XDK build 5849) with native Windows equivalents: Direct3D 11 or
+Vulkan, XAudio2 and SDL3. On macOS and Linux the same runtime renders through SDL_GPU
 (Metal or Vulkan) and plays through SDL3 audio. The rest of the game still runs
 as generated code. The plan
 is to replace game logic with readable, hand-written source while the game
@@ -50,25 +50,43 @@ keeps running.
   Apple Silicon and Intel Macs, Linux PCs and the Steam Deck, from the same
   lifted program and HLSL shaders as Windows. A gamepad settings screen works
   in Steam Game Mode. See [building on macOS and Linux](docs/building.md).
-- **Native renderer.** Direct3D 11 at 480p to 4K, the game's own 16:9
-  widescreen camera and menus, MSAA up to 32x and SMAA Ultra. Water
+- **Native renderer.** Direct3D 11, or Vulkan through SDL_GPU, at 480p to 4K, the game's own 16:9
+  widescreen camera and menus (the 3D view also widened to 16:10, ultrawide or 32:9, the HUD and menus kept 16:9), MSAA up to 32x (8x on Vulkan) and SMAA Ultra. Water
   reflections render at the output resolution; bloom and lighting follow the
   game's own passes.
 - **Xbox-like pacing.** Frames flip on the next refresh as on the Xbox, at
-  60 fps, including heavy rain-stage fights at 4K.
+  60 fps, including heavy rain-stage fights at 4K. On Windows, **VRR: On** is
+  for G-SYNC or FreeSync displays and tears on fixed-refresh ones; it is not
+  yet verified on a VRR monitor.
 - **Audio and movies.** Music and voices through XAudio2, with 3D voices
   through the game's HRTF tables and I3DL2 reverb, in stereo or the game's
   own 5.1 surround mix. The intro and story movies play.
 - **Controllers.** Xbox, PlayStation and other SDL3 controllers, and the
   keyboard for player 1.
-- **Launcher.** `Launcher.exe` picks resolution, anti-aliasing, widescreen, an
-  optional intro-movie skip, 5.1 surround and the unlock setting, and remembers them. `DOA2U.exe` plays
+- **Free camera.** Take the game's camera in fights and cutscenes and fly it
+  anywhere, freeze the scene, hide the HUD and save screenshots. Turn it on in
+  the launcher; see [free camera](docs/free-camera.md).
+- **Launcher.** `Launcher.exe` picks resolution, anti-aliasing, widescreen, the renderer, VRR, an
+  optional intro-movie skip, 5.1 surround, the unlock setting, random CPU costumes and the free camera, and remembers them. `DOA2U.exe` plays
   with the same choices. On release ZIPs after 0.1.10, the settings launcher on
   each platform can check GitHub for a newer release and install it from its
   **UPDATE** page; **Check At Start** turns the start-up check off.
+- **PC Settings in the game.** The game's own **Options** menu has a
+  **PC SETTINGS** row after **Video**, drawn and translated like the game's
+  rows, with the launcher's settings. **Unlocks**, **CPU Costumes** and
+  **Free Camera** change at once, and with the Vulkan renderer so do
+  **Resolution**, **MSAA** and **SMAA**; the others say they apply the next
+  time the game starts. Leaving the page saves them for the launcher too.
+- **Quit Game.** The main menu ends with a **QUIT GAME** entry, lettered and
+  drawn like the game's own, that asks before it closes the game.
+- **Sharper menus.** The Vulkan renderer redraws the game's 2D art (menus,
+  fonts, the HUD) at four times its size with xBRZ the first time each piece is
+  shown, so it stays smooth at high resolutions. `RECOMP_UI_UPSCALE=0` turns
+  it off.
 - **Saves.** Your profile and unlocks save to `private\play-disc`; every
-  character and costume starts unlocked unless you choose **Earn** on the
-  launcher's **GAMEPLAY** page. The game's soft reset
+  character and costume is offered unless you choose **Earn** on the
+  launcher's **GAMEPLAY** page. Your profile only ever saves what you have
+  earned, so choosing **Earn** later gives it back as it was. The game's soft reset
   (Start + Back + both triggers) restarts it.
 - **Built from your disc.** `Launcher.exe` lifts the game from your ISO and
   refuses any executable other than the one the developers tested.
@@ -76,7 +94,7 @@ keeps running.
 ## Status
 
 > [!WARNING]
-> **0.1.13 Alpha is bring-up software.** Story, Watch and the attract demo play
+> **0.3.1 Alpha is bring-up software.** Story, Watch and the attract demo play
 > in development runs on every stage, but many modes and characters have not
 > been tried. A draw the port cannot render yet stops the game with a message
 > in the log.
@@ -89,12 +107,16 @@ keeps running.
 | Story, Ayane and Gen Fu | Stages 1-6 cleared without a stop in scripted runs; the Tengu fight was lost each time |
 | Watch | Fights played, including Kasumi vs Lei Fang on The Burai Zenin at 4K and 60 fps |
 | Other characters, Versus, Tag, Survival, Time Attack, Sparring | Not yet played through |
-| Every character and costume | Unlocked by default (the launcher's **Earn** option leaves them to play); the game saves the unlocks to your profile |
-| Native 16:9 widescreen, up to 4K, MSAA up to 32x, SMAA Ultra | Working, chosen in the launcher |
+| Tengu's stage, The Miyama | In Stage Select, before Random, outside Tag; played in Sparring only, other modes not yet played through |
+| Every character and costume | Unlocked by default (the launcher's **Earn** option leaves them to play); profiles save only what was earned |
+| Native 16:9 widescreen, 16:10, ultrawide and 32:9, up to 4K, MSAA up to 32x, SMAA Ultra | Working, chosen in the launcher; 32:9 tried only in the attract demo and Story character select, on Direct3D 11 and Vulkan |
+| Vulkan renderer on Windows | Working, chosen in the launcher; not yet tested on AMD; MSAA stops at 8x; VRR is Direct3D 11 only |
 | Audio, including 3D voices and reverb | Working |
 | Intro and story movies | Play; the launcher can skip the intro ones |
 | Xbox and other SDL3 controllers, keyboard | Working; keyboard drives player 1 |
-| Xbox Live menus | Stop the game; there is no online service |
+| Free camera, scene freeze, screenshots | Working in the attract demo on macOS; a frozen stage's leaves and branches still move |
+| Xbox Live menus | Report no account; **Yes** quits to the desktop in place of the Dashboard |
+| Online Versus | Rollback netplay from the Versus menu; test build |
 | Hand-written game logic | Not started; the game runs as generated code |
 | macOS and Linux | Boot, menus and the attract demo render at 60 fps through Metal and Vulkan, with MSAA up to 8x and SMAA ([building](docs/building.md)) |
 
@@ -109,10 +131,9 @@ around bright surfaces as on the Xbox, which reads more strongly on a sharp
 On macOS and Linux, including the Steam Deck, follow
 [building on macOS and Linux](docs/building.md) instead.
 
-**Requirements:** Windows 10/11 x64,
-[Python 3.12 or newer](https://www.python.org/downloads/windows/) on PATH,
-[CMake 3.20 or newer](https://cmake.org/download/) on PATH,
-internet access for the first build, and your Disc 2 ISO with about 6 GB free.
+**Requirements:** Windows 10/11 x64, internet access for the first build, and
+your Disc 2 ISO with about 6 GB free. The ZIP carries Python (with Capstone and
+Pillow) and CMake, so there is nothing to install.
 The build downloads the pinned [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)
 compiler (190 MB) into `tools\llvm-mingw` and checks its SHA-256; it needs no
 Visual Studio or administrator approval.
@@ -120,11 +141,11 @@ Visual Studio or administrator approval.
 1. Download the ZIP from the
    [latest release](https://github.com/NoRain211/doa2u-re/releases/latest) and
    extract it into a new folder with a short path, such as `C:\DOA2U`.
-2. Open `Launcher.exe`, drag your Disc 2 ISO onto it (or choose it on the
-   **BUILD GAME** page) and choose **Build**. Wait for **Build complete**
-   (about 15 minutes). The build stops unless it reproduces the exact program
+2. Open `Launcher.exe` and drag your Disc 2 ISO onto it (or choose it on the
+   **BUILD GAME** page); the build starts at once. Wait for **Build complete**
+   (about 10 minutes). The build stops unless it reproduces the exact program
    the developers tested.
-3. Pick resolution, MSAA, SMAA and widescreen on **VIDEO SETTINGS**, stereo or
+3. Pick resolution, MSAA, SMAA, widescreen, the renderer and VRR on **VIDEO SETTINGS**, stereo or
    5.1 on **AUDIO SETTINGS**, the intro skip on **MOVIES** and **Earn** on
    **GAMEPLAY** to leave unlocks to play, then choose
    **START GAME**. A controller, the keyboard or the mouse all work. Your
@@ -138,7 +159,25 @@ pinned lifter and extractor; use the release ZIP.
 
 **Controls:** the first connected controller, or the keyboard for player 1:
 arrows are the D-pad, Enter is Start, Backspace is Back, Z/X are A/B, A/S are
-X/Y, Q/W are White/Black and E/R are the triggers.
+X/Y, Q/W are White/Black and E/R are the triggers. F3 turns on, or off again,
+a readout of the frame rate, the average frame time and the slowest frame of
+the last second; it starts off. F11 or Alt+Enter switches between a window and
+borderless fullscreen.
+
+To rebind the keyboard, create `private/keyboard.json` with the buttons to
+change, for example `{"a": "Space", "b": "Ctrl", "start": "Tab"}`. Buttons are
+up, down, left, right, start, back, a, b, x, y, white, black, ltrig and rtrig;
+keys are A-Z, 0-9, F1-F9, F12, Up, Down, Left, Right, Enter, Backspace,
+Space, Tab, Shift, Ctrl and Esc. Buttons you leave out keep their keys,
+except that a key you give to one button leaves the button that had it. F10
+is a Windows system key, and F11 and Alt+Enter are reserved for fullscreen, so
+none of them can be bound. F3 keeps its
+readout and, with the free camera turned on, F1, F12 and P keep their jobs,
+so a button bound to one of those does both. The free camera's own keys stay
+fixed, and while it flies the keyboard is the camera's.
+
+Offline, hold Back for two seconds to quit to the desktop: A quits, B keeps
+playing.
 
 ## Build from source
 
@@ -171,6 +210,7 @@ The importer extracts the disc once into `private/imported-disc` with XboxDev
 [extract-xiso](https://github.com/XboxDev/extract-xiso) (on PATH, or bundled
 in the release ZIP), selects the game executable by its SHA-256 and leaves
 the ISO unchanged. Only that hash is published, in `tools/build_game.py`.
+A different ISO is staged first and replaces that extraction and receipt only if it verifies; a wrong disc keeps the previous import.
 After a runtime change, `python tools/build_game.py --build-only` reuses the
 authenticated lift; `--lift-only` generates without building. Generated C,
 receipts and logs stay in `private/`.
@@ -189,10 +229,10 @@ decompiler output, generated C and retail bytes stay under `private/`.
 | Area | Named | Decompiled | Bound / tested | Total | Progress |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Game | 157 | 46 | 3 | 206 | 24% |
-| CRI middleware | 15 | 0 | 0 | 15 | 0% |
+| CRI middleware | 15 | 0 | 15 | 30 | 50% |
 | SDK / CRT | 138 | 131 | 4 | 273 | 49% |
 | Untagged | 521 | 131 | 1 | 653 | 20% |
-| **Total** | **831** | **308** | **8** | **1,147** | **28%** |
+| **Total** | **831** | **308** | **23** | **1,162** | **28%** |
 <!-- function-status-grid:end -->
 
 Statuses are exclusive; progress counts decompiled, bound and tested. The
@@ -215,32 +255,53 @@ accepts the registry path as its first argument. Names outside
 ```powershell
 python tools/run_game.py --play --resolution 2160 --widescreen --msaa 32 --smaa
 python tools/run_game.py --play --no-widescreen --msaa 1 --no-smaa
+python tools/run_game.py --play --resolution 1440 --screen 3440:1440
 ```
 
 The game picks its own 16:9 camera and menu layouts from the dashboard video
-setting, and the presenter shows that image at 16:9. MSAA resolves before
+setting, and the presenter shows that image at 16:9.
+`--screen W:H` (`RECOMP_D3D_WIDESCREEN=W:H`), from 4:3 to 4:1, keeps that
+widescreen mode in another shape: the runner widens the game's projection to
+it, so the 3D view fills the screen at the same height, and the presenter
+keeps the 16:9 HUD and menus in their shape in the screen's center. The
+launcher's **16:10**, **Ultrawide** (the primary monitor's own shape) and
+**32:9** choices set it. Online sessions and replays use the host's 4:3 or
+16:9 mode, fitted with black bars, as both sides must compute the same
+frames. Above 480p the Direct3D 11 window fills the screen borderless in
+any shape, with black bars around a picture of another shape; the SDL_GPU
+window is resizable and fits the picture the same way. MSAA resolves before
 SMAA, and gamma applies last; unsupported MSAA counts fall back to the
 highest count the GPU supports. Options passed to `run_game.py` bypass the settings
-window. The build fetches pinned, hash-verified copies of SDL3 and
-[upstream SMAA](https://github.com/iryoku/smaa).
+window. The build fetches pinned, hash-verified copies of SDL3,
+[upstream SMAA](https://github.com/iryoku/smaa) and
+[Dear ImGui](https://github.com/ocornut/imgui), which draws the free camera's panel.
 
 At first launch `run_game.py` builds an image from
 `private/dedication-photo.jpg` (shipped in the release ZIP) with Pillow.
 `--no-unlock-all`, or **Unlocks: Earn** on the launcher's **GAMEPLAY** page, turns
-off the automatic character and costume unlock, so unlocks come from play;
-profiles already saved with the unlock keep it.
+off the automatic character and costume unlock, so unlocks come from play.
+With the unlock on, saves and the game's awards still keep to what each
+profile earned, so turning it off gives the profile back with its own
+unlocks. Profiles saved by builds before this change keep the unlocks those
+builds saved.
+
+`--random-cpu-costumes`, or **CPU Costumes: Random** on the **GAMEPLAY** page,
+dresses CPU opponents in Story, Time Attack, Survival and Team in random
+unlocked costumes where the game would give their first one. Story's special
+picks, such as a costume about to unlock, stay. It stays off online.
 
 To package a release ZIP from a clean checkout:
 
 ```powershell
-python tools/package_test.py 0.1.13-Alpha
-python tools/package_test.py 0.1.13-Alpha --platform macos
-python tools/package_test.py 0.1.13-Alpha --platform linux
+python tools/package_test.py 0.3.1-Alpha
+python tools/package_test.py 0.3.1-Alpha --platform macos
+python tools/package_test.py 0.3.1-Alpha --platform linux
 ```
 
 It zips the files of committed HEAD that building and playing on that platform
 need, the pinned lifter's lift and licenses, and the photo from
-`private/release-assets/`. Developer notes, tests outside the build and other
+`private/release-assets/`. The Windows launchers embed `private/launcher-icon.ico`,
+and packaging stops without it. Developer notes, tests outside the build and other
 platforms' launchers and backends stay out; `tools/package_test.py` lists them.
 The Windows ZIP adds extract-xiso and its license
 with [test-release.md](docs/test-release.md) as `README.txt`; the macOS and
@@ -267,7 +328,8 @@ game C is never patched by hand. Read [bring-up](docs/bring-up.md) and
 When [reporting a bug](https://github.com/NoRain211/doa2u-re/issues), say
 what you did and what happened, and copy the `recomp stop` or crash lines
 from the end of the newest log in `private\play-logs` (or the error from the
-newest `private\build-logs` folder). Remove private paths, and never upload
+newest `private\build-logs` folder). Logs show your home folder and user name
+as `~`; remove any other private paths, and never upload
 game binaries, generated game C, assets, extracted filenames, saves or whole
 logs.
 

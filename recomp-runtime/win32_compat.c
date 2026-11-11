@@ -100,7 +100,7 @@ void SetLastError(DWORD err)
     last_error = err;
 }
 
-static void resolve_case_insensitive(char *path, size_t path_size)
+void recomp_win32_resolve_case(char *path, size_t path_size)
 {
     if (!path || path[0] == '\0') return;
     if (access(path, F_OK) == 0) return;
@@ -218,7 +218,7 @@ static void normalize_path(const char *in, char *out, size_t out_size)
     }
     out[j] = '\0';
 
-    resolve_case_insensitive(out, out_size);
+    recomp_win32_resolve_case(out, out_size);
 }
 
 static void set_last_error_from_errno(void)
@@ -728,6 +728,12 @@ DWORD GetFileAttributesA(LPCSTR lpFileName)
     return attrs;
 }
 
+/* Windows reports a directory as empty; st_size is the file system's own figure. */
+static uint64_t win32_size(const struct stat *st)
+{
+    return S_ISDIR(st->st_mode) ? 0u : (uint64_t)st->st_size;
+}
+
 BOOL GetFileAttributesExA(
     LPCSTR lpFileName,
     GET_FILEEX_INFO_LEVELS fInfoLevelId,
@@ -746,8 +752,8 @@ BOOL GetFileAttributesExA(
     timespec_to_filetime(&STAT_BTIME(st), &data->ftCreationTime);
     timespec_to_filetime(&STAT_ATIME(st), &data->ftLastAccessTime);
     timespec_to_filetime(&STAT_MTIME(st), &data->ftLastWriteTime);
-    data->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32u);
-    data->nFileSizeLow = (DWORD)((uint64_t)st.st_size & 0xffffffffu);
+    data->nFileSizeHigh = (DWORD)(win32_size(&st) >> 32u);
+    data->nFileSizeLow = (DWORD)(win32_size(&st) & 0xffffffffu);
     return TRUE;
 }
 
@@ -916,8 +922,8 @@ BOOL FindNextFileA(
         timespec_to_filetime(&STAT_BTIME(st), &lpFindFileData->ftCreationTime);
         timespec_to_filetime(&STAT_ATIME(st), &lpFindFileData->ftLastAccessTime);
         timespec_to_filetime(&STAT_MTIME(st), &lpFindFileData->ftLastWriteTime);
-        lpFindFileData->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32u);
-        lpFindFileData->nFileSizeLow = (DWORD)((uint64_t)st.st_size & 0xffffffffu);
+        lpFindFileData->nFileSizeHigh = (DWORD)(win32_size(&st) >> 32u);
+        lpFindFileData->nFileSizeLow = (DWORD)(win32_size(&st) & 0xffffffffu);
         return TRUE;
     }
     last_error = 18; // ERROR_NO_MORE_FILES

@@ -9,6 +9,11 @@ notices remain with that source. DOA2U's verified native widescreen branches
 use XC_VIDEO's widescreen bit without DOA3's extra letterbox flag. Shared-depth
 full-frame effects now retain depth under scaling/MSAA instead of inheriting
 the sister presenter's depth-disabled fallback.
+Screen shapes follow DOA3 `67e57e9` (its pull request 47): the
+`RECOMP_D3D_WIDESCREEN` `W:H` parser, the launchers' 16:10 and Ultrawide
+choices, and the Direct3D 11 window that covers the screen and fits the
+picture into it. DOA2U widens its own projection builder instead of DOA3's
+constants and fits its 16:9 2D layer, where DOA3 narrows a 4:3 one.
 The Windows launcher follows committed DOA3 `tools/launcher.cs` at
 `6c782d5`: one C# file, built by the in-box .NET Framework 4 compiler into
 `Launcher.exe` (build, settings, play) and `DOA2U.exe` (play only). It keeps
@@ -40,6 +45,18 @@ SDL_GPU presenter follows DOA2U's Direct3D 11 backend rather than DOA3's
 bias, coverage probes and visibility counts), and the SDL audio output adds
 DOA2U's voice routing and I3DL2 reverb. The reverb network is altered from
 FAudio 26.10 under its zlib license (see NOTICE).
+
+The free camera follows committed DOA3 at `c3e9163` (its PR #29):
+`free_camera.c`, `scene_freeze.c`, `screenshot.c`, `overlay_text.c`, the
+Dear ImGui overlay (`overlay_imgui_panel.cpp`, `overlay_sdl_gpu.cpp`,
+`overlay_d3d11.cpp`) and their tests come over as they are; the presenters'
+overlay and screenshot hooks, the input host's key and mouse reads and the
+launcher pages follow it. `free_camera_adapter.c` and
+`scene_freeze_adapter.c` are DOA2U's own, on DOA2U's camera objects, camera
+build, task table and bone banks (docs/free-camera.md); the camera build is
+wrapped through `recomp_lookup_manual` rather than a re-lift. DOA3's swimsuit
+controls are left out. Dear ImGui 1.91.9 is fetched hash-verified at
+configuration, as in DOA3.
 
 The frame-buffer correction follows committed DOA3 fixes `bb479cf` and
 `c10423f`: constant-alpha blend decoding and the shared host-frame flag with

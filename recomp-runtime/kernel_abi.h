@@ -58,6 +58,26 @@ static inline void kernel_call_guest(
     recomp_runtime.registers.esp = saved_esp;
 }
 
+/* Calls a lifted function directly, past the manual hooks, with cdecl
+   arguments; returns EAX. ESP is restored as in kernel_call_guest. */
+static inline uint32_t kernel_call_lifted(
+    RecompFunction function,
+    const uint32_t *arguments,
+    unsigned count)
+{
+    uint32_t saved_esp = recomp_runtime.registers.esp;
+
+    for (unsigned i = count; i > 0u; --i) {
+        recomp_runtime.registers.esp -= 4u;
+        *recomp_memory_u32(recomp_runtime.registers.esp) = arguments[i - 1u];
+    }
+    recomp_runtime.registers.esp -= 4u;
+    *recomp_memory_u32(recomp_runtime.registers.esp) = 0u;
+    function();
+    recomp_runtime.registers.esp = saved_esp;
+    return recomp_runtime.registers.eax;
+}
+
 /* Resolves an encoded kernel thunk (0x8000xxxx) to its adapter. Declare this
    wherever it is called: an implicit declaration returns int and silently
    truncates the function pointer on a 64-bit host. */
@@ -65,6 +85,8 @@ RecompFunction recomp_lookup_kernel(uint32_t guest_address);
 
 /* Filesystem root supplied by the runner for disc-file resolution. */
 extern const char *recomp_disc_root_path;
+/* Host path of a D: path on the game disc; false for other devices. */
+bool recomp_kernel_disc_host_path(const char *guest_path, char *host_path, size_t host_path_size);
 
 /* Each subsystem exposes one of these; kernel_dispatch.c chains them. */
 RecompFunction recomp_kernel_config(uint32_t ordinal);
@@ -86,10 +108,60 @@ void recomp_kernel_wait_for_vblank(uint64_t deadline_ns);
 bool recomp_kernel_wait_host(bool (*done)(void *context), void *context);
 /* Offer a scheduler slice while any recomp_kernel_wait_host is pending. */
 void recomp_kernel_poll_host_waits(void);
+/* Threads blocked on host work. A host read worker may still be writing guest
+   RAM, so a frame snapshot is not rewound across one. */
+unsigned recomp_kernel_host_waits(void);
 void recomp_kernel_thread_times(char *out, size_t size);
+/* Guest-visible scheduler state for a frame snapshot: thread records, wait
+   objects, events and armed timers. Host profiler counters stay live. */
+size_t recomp_kernel_thread_state_size(void);
+void recomp_kernel_thread_state_save(void *state);
+void recomp_kernel_thread_state_restore(const void *state);
+/* False when the frame boundary runs on another guest thread, or a thread's
+   native fiber changed since the save. */
+bool recomp_kernel_thread_state_restorable(const void *state);
+/* Each parked guest thread's native continuation, beside its guest state. */
+size_t recomp_kernel_thread_fiber_state_size(void);
+void recomp_kernel_thread_fiber_state_save(void *state);
+void recomp_kernel_thread_fiber_state_restore(const void *state);
+bool recomp_kernel_thread_fiber_state_restorable(const void *state);
+/* Guest-visible file positions, which a rewind has to put back. */
+size_t recomp_kernel_file_state_size(void);
+void recomp_kernel_file_state_save(void *state);
+void recomp_kernel_file_state_restore(const void *state);
+/* True once after a restore found a saved handle the host had closed since. */
+bool recomp_kernel_file_state_lost(void);
+/* False when a saved handle has been closed since, so a restore would lose it. */
+bool recomp_kernel_file_state_restorable(const void *state);
+/* Reads finish inside the guest call instead of on a host worker, so no read
+   is in flight at a frame boundary that a rewind may return to. */
+void recomp_kernel_file_set_synchronous_reads(bool enabled);
+/* Power-on state for an in-process reboot, run on a host fiber no guest
+   thread owns. The file reset goes first: it waits out host reads, which
+   write guest RAM and parked stacks. */
+void recomp_kernel_file_reset(void);
+void recomp_kernel_thread_reset(void);
+void recomp_kernel_memory_reset(void);
+void recomp_kernel_interrupt_reset(void);
+void recomp_kernel_video_reset(void);
+size_t recomp_kernel_memory_state_size(void);
+void recomp_kernel_memory_state_save(void *state);
+void recomp_kernel_memory_state_restore(const void *state);
+/* Guest stacks owned by live kernel threads; stack contents are scratch. */
+typedef struct RecompGuestStackRange {
+    uint32_t base;
+    uint32_t size;
+} RecompGuestStackRange;
+size_t recomp_kernel_memory_stack_ranges(RecompGuestStackRange *ranges, size_t capacity);
+/* Stack range of each live guest thread, below its TLS block. */
+size_t recomp_kernel_thread_stack_ranges(RecompGuestStackRange *ranges, size_t capacity);
 RecompFunction recomp_kernel_video(uint32_t ordinal);
 RecompFunction recomp_kernel_file(uint32_t ordinal);
 bool recomp_kernel_save_handles_closed(uint32_t owner);
+/* Counts opens, writes and metadata changes that may change save storage. */
+uint32_t recomp_kernel_profile_mutations(void);
+/* Optional host hook at each of those opens, before the host file changes. */
+extern void (*recomp_kernel_profile_mutation_hook)(void);
 /* Close native profile handles so a rollback can rebuild the tree. */
 void recomp_kernel_release_profile_handles(void);
 /* File close model shared by the import bridge and ownership checks. */
@@ -112,6 +184,16 @@ uint32_t recomp_kernel_query_nonvolatile_setting(
     uint32_t value,
     uint32_t value_length,
     uint32_t result_length);
+
+/* The game's XC_VIDEO and XC_AUDIO. Its logic reads both, so a netplay
+   session sets the host's here (1 or 0); -1 follows RECOMP_D3D_WIDESCREEN
+   and RECOMP_AUDIO_SURROUND. */
+extern int recomp_kernel_widescreen;
+extern int recomp_kernel_surround;
+uint32_t recomp_kernel_video_flags(void);
+uint32_t recomp_kernel_audio_flags(void);
+/* Width over height of a widescreen frame: RECOMP_D3D_WIDESCREEN's shape. */
+float recomp_kernel_widescreen_aspect(void);
 
 /* Plain RTL models used by their import adapters. */
 uint32_t recomp_kernel_ntstatus_to_dos_error(uint32_t status);
