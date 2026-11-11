@@ -870,7 +870,7 @@ static void buffer_call(enum Operation operation, uint32_t arguments)
         if ((operation == VOLUME && (input < -10000 || input > 0)) || volume < INT32_MIN || volume > 0) {
             result = RECOMP_DSOUND_INVALID_PARAM; break;
         }
-        pump(buffer, now, false); buffer->volume = (int32_t)volume;
+        pump_query(buffer, now); buffer->volume = (int32_t)volume;
         if (operation == HEADROOM) { buffer->headroom = value; write32(buffer->settings + 0x20u, value); }
         write32(buffer->settings + 0x1cu, (uint32_t)buffer->volume); break;
     }
