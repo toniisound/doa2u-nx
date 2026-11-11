@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 typedef void (*RecompFunction)(void);
 extern "C" void *recomp_native_fiber_current(void);
@@ -394,6 +395,107 @@ static void stallWatcher(void *)
     }
 }
 
+/* Sampling profiler of the lifted code. Once a millisecond, from core 2, the
+   guest thread is paused for an instant and its program counter read; each
+   sample is charged to the lifted function it falls in, found among the
+   program's entry points (recomp_lookup over the guest code range, built once
+   before sampling starts). Every 5 s the busiest functions are logged by guest
+   address; samples outside the program are "host" code, logged as offsets in
+   the .nro for doa2u-nx.map. Nothing that can take a lock runs while the
+   guest is paused. */
+RecompFunction recomp_lookup(uint32_t guest_address);  // generated dispatch
+extern char __start__[];                               // the .nro's first byte
+
+namespace {
+struct Entry { uintptr_t host; uint32_t guest; };
+std::vector<Entry> entries;
+Thread sampler_thread;
+
+void samplerLoop(void *)
+{
+    // Entry points: every lifted function the dispatch table knows.
+    for (uint32_t va = 0x00010000u; va < 0x00400000u; ++va) {
+        if (RecompFunction f = recomp_lookup(va)) entries.push_back({reinterpret_cast<uintptr_t>(f), va});
+    }
+    std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) { return a.host < b.host; });
+    if (entries.empty()) return;
+    const uintptr_t lifted_low = entries.front().host, lifted_high = entries.back().host + 0x10000u;
+    std::fprintf(stderr, "recomp sampler: %zu lifted functions at nro+0x%zx..0x%zx\n", entries.size(),
+        static_cast<size_t>(lifted_low - reinterpret_cast<uintptr_t>(__start__)),
+        static_cast<size_t>(lifted_high - reinterpret_cast<uintptr_t>(__start__)));
+
+    constexpr int kHot = 2048;
+    struct Hot { uintptr_t key; uint32_t count; };
+    static Hot lifted[kHot], host[kHot];
+    uint32_t total = 0, missed = 0, host_total = 0;
+    const auto charge = [](Hot *table, uintptr_t key) {
+        uint32_t h = static_cast<uint32_t>((key >> 2) * 2654435761u) & (kHot - 1);
+        for (int probe = 0; probe < 64; ++probe, h = (h + 1) & (kHot - 1)) {
+            if (table[h].count == 0) { table[h].key = key; table[h].count = 1; return; }
+            if (table[h].key == key) { ++table[h].count; return; }
+        }
+    };
+    uint64_t window_start = now();
+    const uint64_t window = armGetSystemTickFreq() * 5;
+    for (;;) {
+        svcSleepThread(1'000'000);
+        const Handle target = guest_thread;
+        if (target == INVALID_HANDLE) continue;
+        if (R_FAILED(svcSetThreadActivity(target, ThreadActivity_Paused))) { ++missed; continue; }
+        ThreadContext context;
+        const Result got = svcGetThreadContext3(&context, target);
+        svcSetThreadActivity(target, ThreadActivity_Runnable);
+        if (R_FAILED(got)) { ++missed; continue; }
+        const uintptr_t pc = context.pc.x;
+        ++total;
+        if (pc >= lifted_low && pc < lifted_high) {
+            auto it = std::upper_bound(entries.begin(), entries.end(), pc,
+                [](uintptr_t value, const Entry &e) { return value < e.host; });
+            charge(lifted, it == entries.begin() ? 0u : (it - 1)->guest);
+        } else {
+            ++host_total;
+            // 256-byte buckets of host code, as .nro offsets.
+            charge(host, (pc - reinterpret_cast<uintptr_t>(__start__)) & ~static_cast<uintptr_t>(0xff));
+        }
+        if (now() - window_start < window) continue;
+        window_start = now();
+        const auto top = [](Hot *table, int n, Hot *out) {
+            for (int i = 0; i < n; ++i) out[i] = Hot{0, 0};
+            for (int k = 0; k < kHot; ++k) {
+                if (table[k].count == 0) continue;
+                for (int i = 0; i < n; ++i) {
+                    if (table[k].count > out[i].count) {
+                        for (int j = n - 1; j > i; --j) out[j] = out[j - 1];
+                        out[i] = table[k];
+                        break;
+                    }
+                }
+            }
+            std::memset(table, 0, sizeof(Hot) * kHot);
+        };
+        Hot best[16], best_host[8];
+        top(lifted, 16, best);
+        top(host, 8, best_host);
+        char text[640];
+        int used = 0;
+        for (const Hot &h : best) {
+            if (h.count == 0 || used >= (int)sizeof text) break;
+            used += std::snprintf(text + used, sizeof text - used, " %08x=%.1f%%", (unsigned)h.key, 100.0 * h.count / total);
+        }
+        char host_text[320];
+        int host_used = 0;
+        for (const Hot &h : best_host) {
+            if (h.count == 0 || host_used >= (int)sizeof host_text) break;
+            host_used += std::snprintf(host_text + host_used, sizeof host_text - host_used, " +%zx=%.1f%%",
+                static_cast<size_t>(h.key), 100.0 * h.count / total);
+        }
+        std::fprintf(stderr, "recomp sampler: %u samples (%u missed), host %.1f%% | lifted:%s | host:%s\n",
+            total, missed, total ? 100.0 * host_total / total : 0.0, text, host_text);
+        total = missed = host_total = 0;
+    }
+}
+} // namespace
+
 // The guest runs on the thread that calls recomp_runner_main.
 void doa2u_nx_profile_start(void)
 {
@@ -404,6 +506,9 @@ void doa2u_nx_profile_start(void)
     // Core 2 hosts the audio mixer and the log flusher, both light.
     if (R_SUCCEEDED(threadCreate(&stall_thread, stallWatcher, nullptr, nullptr, 0x8000, 0x2E, 2))) {
         threadStart(&stall_thread);
+    }
+    if (R_SUCCEEDED(threadCreate(&sampler_thread, samplerLoop, nullptr, nullptr, 0x10000, 0x2D, 2))) {
+        threadStart(&sampler_thread);
     }
 }
 
