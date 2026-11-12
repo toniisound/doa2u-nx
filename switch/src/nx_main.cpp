@@ -11,6 +11,8 @@
 // The game executable is picked among disc/*.xbe by its SHA-256, as
 // build_game.py does. Saves and the hard-disk cache live in
 // disc/.recomp-storage, as private/play-disc does on PC.
+#include <cctype>
+#include <utility>
 #include <switch.h>
 
 #include <fcntl.h>
@@ -56,6 +58,9 @@ const char kLog[] = "sdmc:/switch/doa2u-nx/doa2u-nx.log";
 // one "/" component at a time, which needs the path to start at "/".
 const char kRunnerDisc[] = "/switch/doa2u-nx/disc";
 const char kShaderCache[] = "sdmc:/switch/doa2u-nx/shader-cache";
+// The launcher settings file (one flat JSON object), shared by the boot menu
+// and the game's PC Settings, as the desktop launchers share it.
+const char kSettings[] = "sdmc:/switch/doa2u-nx/settings.json";
 
 // The disc archives the game installs to its hard-disk cache (Z:) on first
 // boot, as tools/run_game.py's seed_hdd_cache copies them: the game's own
@@ -522,6 +527,75 @@ struct BootChoice {
     bool show_fps = false;
 };
 
+/* The launcher settings: a flat JSON object of key and value text, in
+   order. The boot menu reads its choices from it and writes them back, keeping
+   every key it does not own (the game's PC Settings write the same file). */
+using SettingEntries = std::vector<std::pair<std::string, std::string>>;
+
+static SettingEntries readSettings()
+{
+    SettingEntries entries;
+    FILE *file = std::fopen(kSettings, "rb");
+    if (file == nullptr) return entries;
+    std::string text;
+    char chunk[512];
+    for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, file)) > 0;) text.append(chunk, n);
+    std::fclose(file);
+    size_t at = text.find('{');
+    while (at != std::string::npos) {
+        const size_t key_open = text.find('"', at + 1u);
+        if (key_open == std::string::npos) break;
+        const size_t key_close = text.find('"', key_open + 1u);
+        const size_t colon = key_close == std::string::npos ? key_close : text.find(':', key_close);
+        if (colon == std::string::npos) break;
+        size_t value_begin = colon + 1u;
+        while (value_begin < text.size() && std::isspace(static_cast<unsigned char>(text[value_begin]))) ++value_begin;
+        size_t value_end = value_begin;
+        if (value_end < text.size() && text[value_end] == '"') {
+            value_end = text.find('"', value_end + 1u);
+            if (value_end == std::string::npos) break;
+            ++value_end;
+        } else {
+            while (value_end < text.size() && text[value_end] != ',' && text[value_end] != '}') ++value_end;
+            while (value_end > value_begin && std::isspace(static_cast<unsigned char>(text[value_end - 1u]))) --value_end;
+        }
+        entries.emplace_back(text.substr(key_open + 1u, key_close - key_open - 1u),
+            text.substr(value_begin, value_end - value_begin));
+        at = text.find(',', value_end);
+    }
+    return entries;
+}
+
+static const std::string *findSetting(const SettingEntries &entries, const char *key)
+{
+    for (const auto &entry : entries) if (entry.first == key) return &entry.second;
+    return nullptr;
+}
+
+static void putSetting(SettingEntries &entries, const char *key, const std::string &value)
+{
+    for (auto &entry : entries) {
+        if (entry.first == key) { entry.second = value; return; }
+    }
+    entries.emplace_back(key, value);
+}
+
+static void writeSettings(const SettingEntries &entries)
+{
+    std::string text = "{";
+    for (size_t i = 0; i < entries.size(); ++i)
+        text += (i ? ",\"" : "\"") + entries[i].first + "\":" + entries[i].second;
+    text += "}\n";
+    // Written beside the file and renamed over it, so a failed write keeps the old one.
+    const std::string temp = std::string(kSettings) + ".tmp";
+    FILE *file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) return;
+    const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+    if (std::fclose(file) != 0 || !written) { std::remove(temp.c_str()); return; }
+    std::remove(kSettings);
+    std::rename(temp.c_str(), kSettings);
+}
+
 static BootChoice chooseBootOptions()
 {
     consoleExit(nullptr);
@@ -536,7 +610,17 @@ static BootChoice chooseBootOptions()
     constexpr u32 kBackground = 0xff201410u, kText = 0xffffffffu, kDim = 0xffa0a0a0u;
     constexpr u32 kSelected = 0xff3060e0u;  // ABGR: orange box
     constexpr int kRows = 4;                // resolution, aspect, fps, start
+    // The last choices, from the settings file (the game's PC Settings
+    // Resolution and Screen rows write the same keys).
     BootChoice choice;
+    SettingEntries settings = readSettings();
+    if (const std::string *height = findSetting(settings, "height")) {
+        const long lines = std::strtol(height->c_str(), nullptr, 10);
+        choice.resolution = lines >= 720 ? 0 : lines > 480 ? 1 : 2;
+    }
+    if (const std::string *screen = findSetting(settings, "screen")) choice.widescreen = *screen != "\"4:3\"";
+    else if (const std::string *wide = findSetting(settings, "widescreen")) choice.widescreen = *wide != "false";
+    if (const std::string *fps = findSetting(settings, "switch_show_fps")) choice.show_fps = *fps == "true";
     int row = 0;
     bool redraw = true;
     // Ignore a press still held from the homebrew menu.
@@ -606,6 +690,12 @@ static BootChoice chooseBootOptions()
         svcSleepThread(16'000'000);
     }
     if (drawn) framebufferClose(&framebuffer);
+    static const unsigned kHeights[kResolutionCount] = {720u, 600u, 480u};
+    putSetting(settings, "height", std::to_string(kHeights[choice.resolution]));
+    putSetting(settings, "widescreen", choice.widescreen ? "true" : "false");
+    putSetting(settings, "screen", choice.widescreen ? "\"16:9\"" : "\"4:3\"");
+    putSetting(settings, "switch_show_fps", choice.show_fps ? "true" : "false");
+    writeSettings(settings);
     console_state = consoleInit(nullptr);
     console_ready = true;
     return choice;
@@ -654,6 +744,8 @@ int main(int argc, char **argv)
     // XC_VIDEO and XC_AUDIO settings follow these, as the launcher sets them
     // on PC. The console outputs stereo.
     setenv("RECOMP_D3D_WIDESCREEN", choice.widescreen ? "1" : "0", 1);
+    // The game's PC Settings read and save the same file.
+    setenv("RECOMP_LAUNCHER_SETTINGS", kSettings, 1);
     // The runtime's frame counter (F3 on PC), shown from the start.
     if (choice.show_fps) setenv("RECOMP_PERF_OVERLAY", "1", 1);
     else unsetenv("RECOMP_PERF_OVERLAY");
@@ -679,6 +771,22 @@ int main(int argc, char **argv)
     chdir(kRoot);
     const std::string runner_xbe = std::string(kRunnerDisc) + "/" + xbe;
     std::vector<std::string> arguments = {"doa2u-nx", "--xbe", runner_xbe, "--disc-root", kRunnerDisc};
+    /* The game's PC Settings rows that apply at the next start, from the
+       settings file, as the desktop launchers pass them. */
+    {
+        const SettingEntries settings = readSettings();
+        const auto flag = [&](const char *key, bool fallback) {
+            const std::string *value = findSetting(settings, key);
+            return value == nullptr ? fallback : *value == "true";
+        };
+        if (flag("skipIntro", false)) arguments.push_back("--skip-intro");
+        if (!flag("unlockAll", true)) arguments.push_back("--no-unlock-all");
+        setenv("RECOMP_RANDOM_CPU_COSTUMES", flag("randomCpuCostumes", false) ? "1" : "0", 1);
+        setenv("RECOMP_FREE_CAMERA", flag("freeCamera", false) ? "1" : "0", 1);
+        std::fprintf(stderr, "[nx] settings: skip_intro=%d unlock_all=%d cpu_costumes=%d free_camera=%d\n",
+            flag("skipIntro", false) ? 1 : 0, flag("unlockAll", true) ? 1 : 0, flag("randomCpuCostumes", false) ? 1 : 0,
+            flag("freeCamera", false) ? 1 : 0);
+    }
     std::vector<char *> runner_argv;
     for (std::string &argument : arguments) runner_argv.push_back(argument.data());
     runner_argv.push_back(nullptr);

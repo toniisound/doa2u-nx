@@ -161,6 +161,11 @@ At launch a large-print boot menu waits for the player, with three options:
 - **Show FPS**: **Yes** or **No**, a frame counter in the top left corner.
 
 Up/down picks an option, left/right changes it, and A on Start (or +) starts.
+The choices are remembered in `sdmc:/switch/doa2u-nx/settings.json`, which the
+game's own **PC Settings** menu also saves to: its Resolution and Screen rows
+preselect the boot menu, and Skip Intro, Unlock All, Random CPU Costumes and
+Free Camera take effect at the next start. MSAA, SMAA, Renderer, VRR and Audio
+Output have no effect on the Switch.
 
 The CPU is not boosted by the app, since boost mode slows the GPU; use sys-clk
 to raise the CPU clock.
